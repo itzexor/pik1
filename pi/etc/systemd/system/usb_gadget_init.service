@@ -1,0 +1,13 @@
+[Unit]
+Description=MCU bridge gadget init
+Before=klipper.service
+DefaultDependencies=no
+After=basic.target
+
+[Service]
+ExecStart=/usr/bin/setup_usb_gadget.sh
+Type=oneshot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
