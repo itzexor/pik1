@@ -1,0 +1,59 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          pik1
+# Required-Start:    $all
+# Default-Start:     S
+# Default-Stop:
+### END INIT INFO
+
+DAEMON="/usr/share/klippy-env/bin/python"
+SCRIPT="/usr/data/pik1/pik1.py"
+PID_DIR="/var/run"
+LOG_DIR="/var/log"
+OPTS_BRIDGE="k1 --mcu-tty /dev/ttyS7 --nozzle-tty /dev/ttyS1"
+OPTS_TUNNEL="k1-tunnel"
+
+PIDFILE_K1="$PID_DIR/pik1-k1.pid"
+PIDFILE_TUNNEL="$PID_DIR/pik1-tunnel.pid"
+LOG_K1="$LOG_DIR/pik1-k1.log"
+LOG_TUNNEL="$LOG_DIR/pik1-tunnel.log"
+
+start() {
+    echo "Starting pik1 instances..."
+
+    echo "  [1] K1 bridge mode"
+    start-stop-daemon --start --background --make-pidfile --pidfile "$PIDFILE_K1" \
+        --exec "$DAEMON" -- "$SCRIPT" $OPTS_BRIDGE >> "$LOG_K1" 2>&1
+
+    echo "  [2] K1 tunnel mode"
+    start-stop-daemon --start --background --make-pidfile --pidfile "$PIDFILE_TUNNEL" \
+        --exec "$DAEMON" -- "$SCRIPT" $OPTS_TUNNEL >> "$LOG_TUNNEL" 2>&1
+}
+
+stop() {
+    echo "Stopping pik1 instances..."
+
+    [ -f "$PIDFILE_K1" ] && start-stop-daemon --stop --pidfile "$PIDFILE_K1" && rm -f "$PIDFILE_K1"
+    [ -f "$PIDFILE_TUNNEL" ] && start-stop-daemon --stop --pidfile "$PIDFILE_TUNNEL" && rm -f "$PIDFILE_TUNNEL"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart|reload)
+        restart
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
