@@ -38,6 +38,7 @@ def setup_logging(log_path):
 
 def prepare_devices(init_gadget, shutdown_event):
     if init_gadget:
+        print('setting up gadget')
         setup_usb_gadget()
         return detect_gadget_ttys(init_gadget)
     else:
