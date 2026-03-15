@@ -114,7 +114,7 @@ IP configuration changes are needed on the K1.
 The following files are required. Place them as described in each section below:
 
 - `serialmux.py` -- the main daemon (runs on both K1 and Pi)
-- `S99serialmux-exporter` -- K1 init script
+- `S99pik1` -- K1 init script
 - `setup_pik1.sh` -- Pi gadget setup script
 - `pik1.service` -- Pi systemd service
 
@@ -276,10 +276,10 @@ environment -- no additional packages or tools are required.
 
 #### 4. Install the init script
 
-Copy `S99serialmux-exporter` to `/etc/init.d/S99pik1` and make it executable:
+Copy `S99pik1` to `/etc/init.d/S99pik1` and make it executable:
 
 ```sh
-cp S99serialmux-exporter /etc/init.d/S99pik1
+cp S99pik1 /etc/init.d/S99pik1
 chmod +x /etc/init.d/S99pik1
 ```
 
