@@ -1,0 +1,29 @@
+[Unit]
+Description=PiK1 gadget setup and serialmux bridge
+DefaultDependencies=no
+After=sysinit.target local-fs.target systemd-udevd.service
+Before=klipper.service mediamtx.service
+
+[Service]
+Type=simple
+
+# Gadget setup must run as root (writes to /sys/kernel/config)
+ExecStartPre=+/opt/pik1/setup_pik1.sh
+
+# Daemon runs as the klipper user so PTY devices are accessible to klipper
+User=1000
+Group=1000
+
+ExecStart=/usr/bin/python3 /opt/pik1/serialmux.py host /dev/ttyGS0 \
+    mcu:0:/tmp/klipper_mcu \
+    mcu:1:/tmp/klipper_toolhead
+
+Restart=always
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pik1
+
+[Install]
+WantedBy=multi-user.target
