@@ -14,9 +14,9 @@ ExecStartPre=+@INSTALL_DIR@/setup_pik1.sh
 User=1000
 Group=1000
 
-ExecStart=@INSTALL_DIR@/serialmux host /dev/ttyGS0 \
-    mcu:0:/tmp/klipper_mcu \
-    mcu:1:/tmp/klipper_toolhead
+ExecStart=@INSTALL_DIR@/serialmux --usb 1d6b:0104 \
+    pty:0:/tmp/klipper_mcu \
+    pty:1:/tmp/klipper_toolhead
 
 Restart=always
 RestartSec=2

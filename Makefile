@@ -2,8 +2,8 @@ CC       ?= gcc
 CFLAGS   := -O2 -std=c11 -Wall -Wextra -D_GNU_SOURCE \
              -ffunction-sections -fdata-sections
 LDFLAGS  := -Wl,--gc-sections
-SRCS     := src/serialmux.c src/channels.c
-HDRS     := src/serialmux.h
+SRCS     := src/muxd.c src/cobs.c
+HDRS     := src/cobs.h
 
 STATIC   := -static
 BUILD    := build

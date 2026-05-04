@@ -12,7 +12,7 @@ MCU_BAUD="230400"
 NOZZLE_DEV="/dev/ttyS1"
 NOZZLE_BAUD="230400"
 
-DAEMON_ARGS="exporter --usb $USB_ID mcu:0:$MCU_DEV:$MCU_BAUD mcu:1:$NOZZLE_DEV:$NOZZLE_BAUD"
+DAEMON_ARGS="--usb $USB_ID mcu:0:$MCU_DEV:$MCU_BAUD mcu:1:$NOZZLE_DEV:$NOZZLE_BAUD"
 
 case "$1" in
     start)
