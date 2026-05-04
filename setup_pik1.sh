@@ -1,22 +1,18 @@
 #!/bin/bash
-# setup_pik1.sh -- configure a single USB CDC ACM gadget via configfs.
-# Creates /dev/ttyGS0 on the host (Pi) side.
-# Idempotent: if the gadget is already bound to a UDC, exits immediately.
-
 set -e
 
-GADGET_DIR="/sys/kernel/config/usb_gadget/pik1"
-
+GADGET_NAME="pik1"
 VENDOR_ID="0x1d6b"
 PRODUCT_ID="0x0104"
-MANUFACTURER="Creality"
-PRODUCT="K1 Bridge"
-SERIALNUMBER="pik1"
+MANUFACTURER="PiK1"
+PRODUCT="PiK1 Bridge"
+SERIALNUMBER="123456"
 LANG="0x409"
+
+GADGET_DIR="/sys/kernel/config/usb_gadget/$GADGET_NAME"
 
 log() { echo "setup_pik1: $*" >&2; }
 
-# If the gadget already exists and is bound to a UDC, nothing to do.
 if [ -d "$GADGET_DIR" ]; then
     UDC="$(cat "$GADGET_DIR/UDC" 2>/dev/null || true)"
     if [ -n "$UDC" ]; then
@@ -25,7 +21,6 @@ if [ -d "$GADGET_DIR" ]; then
     fi
 fi
 
-log "loading libcomposite"
 modprobe libcomposite
 
 if ! mountpoint -q /sys/kernel/config; then
@@ -33,7 +28,6 @@ if ! mountpoint -q /sys/kernel/config; then
     mount -t configfs none /sys/kernel/config
 fi
 
-log "creating gadget at $GADGET_DIR"
 mkdir -p "$GADGET_DIR"
 
 echo "$VENDOR_ID"  > "$GADGET_DIR/idVendor"
@@ -50,10 +44,13 @@ mkdir -p "$GADGET_DIR/configs/c.1"
 echo 250 > "$GADGET_DIR/configs/c.1/MaxPower"
 
 mkdir -p "$GADGET_DIR/configs/c.1/strings/$LANG"
-echo "CDC ACM bridge" > "$GADGET_DIR/configs/c.1/strings/$LANG/configuration"
+echo "CDC ACM bridge (2-port)" > "$GADGET_DIR/configs/c.1/strings/$LANG/configuration"
 
 mkdir -p "$GADGET_DIR/functions/acm.0"
-ln -s "$GADGET_DIR/functions/acm.0" "$GADGET_DIR/configs/c.1/acm.0"
+ln -sf "$GADGET_DIR/functions/acm.0" "$GADGET_DIR/configs/c.1/acm.0"
+
+mkdir -p "$GADGET_DIR/functions/acm.1"
+ln -sf "$GADGET_DIR/functions/acm.1" "$GADGET_DIR/configs/c.1/acm.1"
 
 UDC="$(ls /sys/class/udc/ 2>/dev/null | head -1)"
 if [ -z "$UDC" ]; then
@@ -61,12 +58,4 @@ if [ -z "$UDC" ]; then
     exit 1
 fi
 
-log "binding gadget to UDC: $UDC"
 echo "$UDC" > "$GADGET_DIR/UDC"
-
-sleep 0.2
-if [ -c /dev/ttyGS0 ]; then
-    log "ttyGS0 ready"
-else
-    log "WARNING: /dev/ttyGS0 not present after bind -- check dmesg"
-fi
