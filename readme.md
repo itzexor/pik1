@@ -270,6 +270,7 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     setup_pik1: loading libcomposite
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
+    setup_pik1: ttyGS0 and ttyGS1 ready
     [pik1] mode=host channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyGS1
     [pik1] child: spawned /opt/pik1/tcpbridge pid=...
     [mux] link opened: /dev/ttyGS0

@@ -33,6 +33,33 @@ static int64_t now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static bool parse_uint8(const char *s, uint8_t *out) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno || !end || *end || v > UINT8_MAX) return false;
+    *out = (uint8_t)v;
+    return true;
+}
+
+static bool parse_port(const char *s, int *out) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || !end || *end || v <= 0 || v > 65535) return false;
+    *out = (int)v;
+    return true;
+}
+
+static bool parse_positive_int(const char *s, int *out) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || !end || *end || v <= 0 || v > INT32_MAX) return false;
+    *out = (int)v;
+    return true;
+}
+
 // ── child (tcpbridge) process management ─────────────────────────────────────
 
 static struct {
@@ -75,9 +102,10 @@ static void child_aux_cb(void) {
             }
             exit(0);
         }
-        if ((pid_t)si.ssi_pid != g_child.pid) continue;
+        if (si.ssi_signo != SIGCHLD || (pid_t)si.ssi_pid != g_child.pid) continue;
         int status;
-        waitpid(g_child.pid, &status, WNOHANG);
+        pid_t r = waitpid(g_child.pid, &status, WNOHANG);
+        if (r <= 0) continue;
         g_child.pid = -1;
         LOG("child: exited status=%d, restart in %dms", status, g_child.backoff_ms);
         g_child.restart_at_ms = now_ms() + g_child.backoff_ms;
@@ -135,26 +163,38 @@ int main(int argc, char **argv) {
     strncpy(cfg.vidpid, vidpid, sizeof(cfg.vidpid) - 1);
     cfg.aux_fd = -1;
 
-    while (argi < argc && cfg.n_channels < MAX_CHANNELS) {
+    bool seen_ch[UINT8_MAX + 1] = { false };
+    while (argi < argc) {
         char *spec = argv[argi];
         if (strncmp(spec, "tcp:", 4) == 0) break;
+        if (cfg.n_channels >= MAX_CHANNELS)
+            DIE("too many channels (max %d): %s", MAX_CHANNELS, spec);
         argi++;
 
         ch_spec_t *s = &cfg.channels[cfg.n_channels];
         memset(s, 0, sizeof(*s));
 
         if (is_mcu) {
-            char baud_str[16];
-            if (sscanf(spec, "mcu:%hhu:%127[^:]:%15s",
-                       &s->ch_id, s->dev, baud_str) != 3)
+            char ch_str[16], baud_str[16], extra;
+            if (sscanf(spec, "mcu:%15[^:]:%127[^:]:%15[^:]%c",
+                       ch_str, s->dev, baud_str, &extra) != 3)
                 DIE("bad mcu spec: %s", spec);
-            s->baud = atoi(baud_str);
+            if (!parse_uint8(ch_str, &s->ch_id))
+                DIE("bad mcu channel id: %s", spec);
+            if (!parse_positive_int(baud_str, &s->baud))
+                DIE("bad mcu baud: %s", spec);
             s->type = CH_MCU;
         } else {
-            if (sscanf(spec, "pty:%hhu:%127s", &s->ch_id, s->path) != 2)
+            char ch_str[16], extra;
+            if (sscanf(spec, "pty:%15[^:]:%127s%c", ch_str, s->path, &extra) != 2)
                 DIE("bad pty spec: %s", spec);
+            if (!parse_uint8(ch_str, &s->ch_id))
+                DIE("bad pty channel id: %s", spec);
             s->type = CH_PTY;
         }
+        if (seen_ch[s->ch_id])
+            DIE("duplicate channel id: %u", s->ch_id);
+        seen_ch[s->ch_id] = true;
         cfg.n_channels++;
     }
 
@@ -165,7 +205,9 @@ int main(int argc, char **argv) {
     if (argi < argc && strncmp(argv[argi], "tcp:", 4) == 0) {
         char addr[64];
         int  port;
-        if (sscanf(argv[argi] + 4, "%63[^:]:%d", addr, &port) != 2)
+        char port_str[16], extra;
+        if (sscanf(argv[argi] + 4, "%63[^:]:%15[^:]%c", addr, port_str, &extra) != 2 ||
+            !parse_port(port_str, &port))
             DIE("bad tcp spec: %s", argv[argi]);
         argi++;
 
@@ -204,6 +246,8 @@ int main(int argc, char **argv) {
     } else {
         LOG("mode=%s channels=%d", is_mcu ? "exporter" : "host", cfg.n_channels);
     }
+
+    if (argi != argc) DIE("unexpected argument: %s", argv[argi]);
 
     if (has_tcp) child_spawn();
     serialmux_run(&cfg);

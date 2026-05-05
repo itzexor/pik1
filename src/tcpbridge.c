@@ -130,6 +130,15 @@ static int64_t now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static bool parse_port(const char *s, int *out) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || !end || *end || v <= 0 || v > 65535) return false;
+    *out = (int)v;
+    return true;
+}
+
 // ── CRC32 ─────────────────────────────────────────────────────────────────────
 static uint32_t crc32_table[256];
 static void crc32_init(void) {
@@ -412,15 +421,20 @@ static int tcp_connect_to_target(void) {
     snprintf(port_str, sizeof(port_str), "%d", g_fwd_port);
     if (getaddrinfo(g_fwd_host, port_str, &hints, &res) != 0 || !res) return -1;
 
-    int fd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                    res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                    ai->ai_protocol);
+        if (fd < 0) continue;
 
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0 && errno != EINPROGRESS) {
-        close(fd); freeaddrinfo(res); return -1;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0 || errno == EINPROGRESS)
+            break;
+
+        close(fd);
+        fd = -1;
     }
     freeaddrinfo(res);
     return fd;
@@ -507,7 +521,6 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         return;
 
     case TB_DATA:
-        if (id >= MAX_CONNS) { LOG("TB_DATA bad id=%u drop %zu bytes", id, plen); return; }
         // ARQ sequence check
         if (seq != g_rx_next) {
             uint8_t ahead = (uint8_t)(seq - g_rx_next);
@@ -521,16 +534,36 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             }
             return;
         }
-        g_rx_next++;
-        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+        if (id >= MAX_CONNS) {
+            LOG("TB_DATA bad id=%u drop %zu bytes", id, plen);
+            g_rx_next++;
+            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+            return;
+        }
 
-        if (g_conns[id].fd < 0) { LOG("TB_DATA conn %u closed drop %zu bytes", id, plen); return; }
-        if (plen == 0) return;
+        if (g_conns[id].fd < 0) {
+            LOG("TB_DATA conn %u closed drop %zu bytes", id, plen);
+            g_rx_next++;
+            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+            enqueue_ctrl(TB_CLOSE, id, 0, NULL, 0);
+            return;
+        }
+        if (plen == 0) {
+            g_rx_next++;
+            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+            return;
+        }
+        conn_drain(&g_conns[id]);
         if (conn_space(&g_conns[id]) < plen) {
-            LOG("conn %d txbuf full drop %zu bytes", id, plen);
+            LOG("conn %d txbuf full, NAK seq=%u", id, seq);
+            enqueue_ctrl(TB_PAUSE, id, 0, NULL, 0);
+            g_conns[id].pause_sent = true;
+            enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
             return;
         }
         conn_push(&g_conns[id], payload, plen);
+        g_rx_next++;
+        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
         conn_drain(&g_conns[id]);
         conn_epoll_update(&g_conns[id]);
         {
@@ -862,8 +895,7 @@ int main(int argc, char **argv) {
     if (hlen >= sizeof(g_fwd_host)) usage(argv[0]);
     memcpy(g_fwd_host, hostport, hlen);
     g_fwd_host[hlen] = '\0';
-    g_fwd_port = atoi(colon + 1);
-    if (g_fwd_port <= 0 || g_fwd_port > 65535) usage(argv[0]);
+    if (!parse_port(colon + 1, &g_fwd_port)) usage(argv[0]);
 
     crc32_init();
     LOG("tcpbridge %s %s %s:%d",

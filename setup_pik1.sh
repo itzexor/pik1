@@ -13,14 +13,27 @@ GADGET_DIR="/sys/kernel/config/usb_gadget/$GADGET_NAME"
 
 log() { echo "setup_pik1: $*" >&2; }
 
+gadget_has_two_acm_functions() {
+    [ -d "$GADGET_DIR/functions/acm.0" ] &&
+    [ -d "$GADGET_DIR/functions/acm.1" ] &&
+    [ -e "$GADGET_DIR/configs/c.1/acm.0" ] &&
+    [ -e "$GADGET_DIR/configs/c.1/acm.1" ]
+}
+
 if [ -d "$GADGET_DIR" ]; then
     UDC="$(cat "$GADGET_DIR/UDC" 2>/dev/null || true)"
     if [ -n "$UDC" ]; then
-        log "gadget already bound to $UDC -- skipping"
-        exit 0
+        if gadget_has_two_acm_functions; then
+            log "gadget already bound to $UDC -- skipping"
+            exit 0
+        fi
+        log "ERROR: gadget already bound to $UDC but is missing acm.0/acm.1"
+        log "ERROR: unbind or remove the stale gadget before starting pik1"
+        exit 1
     fi
 fi
 
+log "loading libcomposite"
 modprobe libcomposite
 
 if ! mountpoint -q /sys/kernel/config; then
@@ -28,6 +41,7 @@ if ! mountpoint -q /sys/kernel/config; then
     mount -t configfs none /sys/kernel/config
 fi
 
+log "creating gadget at $GADGET_DIR"
 mkdir -p "$GADGET_DIR"
 
 echo "$VENDOR_ID"  > "$GADGET_DIR/idVendor"
@@ -58,4 +72,6 @@ if [ -z "$UDC" ]; then
     exit 1
 fi
 
+log "binding gadget to UDC: $UDC"
 echo "$UDC" > "$GADGET_DIR/UDC"
+log "ttyGS0 and ttyGS1 ready"
