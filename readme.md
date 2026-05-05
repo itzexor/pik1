@@ -1,19 +1,19 @@
 # Connecting a Creality K1 to a Raspberry Pi
 
-> This guide covers the current `serialmux`-based setup which replaces the
+> This guide covers the current `pik1d`-based setup which replaces the
 > earlier socat approach documented in the
 > [original guide](https://rentry.co/k1-with-pi).
 
 ## Overview
 
-`serialmux` is a C daemon that multiplexes MCU serial ports and TCP listener
-forwardings over a single USB CDC ACM link between, in this case, a Creality K1
-and Raspberry Pi (or any two Linux devices).
+`pik1d` is a small C daemon that bridges the K1 MCU serial ports to PTYs on the
+Pi over a USB CDC ACM link. It uses the `serialmux` code for the MCU channels and
+can also launch a sibling `tcpbridge` process for a second CDC ACM link used by
+the touchscreen Moonraker tunnel.
 
-The TCP tunnel option is used in the case where you need to expose a Moonraker
-listener port backwards over the tunnel to the MCU exporting machine, and should
-not be used for any high-bandwidth application that might starve the USB link of
-bandwidth for the MCU links.
+The TCP tunnel is intended for low-bandwidth Moonraker API traffic from the K1
+touchscreen to the Pi. It should not be used for high-bandwidth traffic such as
+webcam streams or file transfers.
 
 ## Prerequisites
 
@@ -67,21 +67,21 @@ bandwidth for the MCU links.
 
 The following files are involved:
 
-- `src/` -- C source for `serialmux` (runs on both K1 and Pi)
+- `src/` -- C source for `pik1d`, `tcpbridge`, and the shared serial mux code
 - `S99pik1` -- K1 init script
 - `setup_pik1.sh` -- Pi gadget setup script
 - `pik1.service.in` -- Pi systemd service template
 
 ### Building
 
-Pre-built binaries for K1 (`build/serialmux.mipsel`) and Pi
-(`build/serialmux.aarch64`) are included in the repo and are updated with each
-release. If you want to build from source:
+Pre-built binaries for K1 (`build/pik1d.mipsel`, `build/tcpbridge.mipsel`) and
+Pi (`build/pik1d.aarch64`, `build/tcpbridge.aarch64`) are included in the repo
+and are updated with each release. If you want to build from source:
 
 ```bash
 make toolchain   # one-time: downloads musl.cc cross-compilers into .toolchain/
-make mipsel      # K1 binary  → build/serialmux.mipsel
-make aarch64     # Pi binary  → build/serialmux.aarch64
+make mipsel      # K1 binaries → build/pik1d.mipsel, build/tcpbridge.mipsel
+make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
 ```
 
 ### Raspberry Pi side
@@ -132,11 +132,12 @@ make aarch64     # Pi binary  → build/serialmux.aarch64
     root, or `PI_DIR=/your/path` to override the install prefix.
 
     The service runs `setup_pik1.sh` as root first (needed for configfs access),
-    then starts the serialmux host daemon as UID 1000 so the PTY devices it creates
+    then starts `pik1d` as UID 1000 so the PTY devices it creates
     are accessible to Klipper.
 
     If there are any weird permissions errors then make sure UID 1000 (your klipper user,
-    typically `pi` or similar) is in the `dialout` group so it can open `/dev/ttyGS0`:
+    typically `pi` or similar) is in the `dialout` group so it can open `/dev/ttyGS0`
+    and `/dev/ttyGS1`:
 
     ```bash
     sudo usermod -aG dialout $(id -un 1000)
@@ -169,8 +170,9 @@ make aarch64     # Pi binary  → build/serialmux.aarch64
     make install-k1
     ```
 
-    This copies `build/serialmux.mipsel` to `/usr/data/pik1/serialmux`, installs
-    `S99pik1` to `/etc/init.d/`, and disables the services below by renaming them
+    This copies `build/pik1d.mipsel` and `build/tcpbridge.mipsel` to
+    `/usr/data/pik1/`, installs `S99pik1` to `/etc/init.d/`, and disables the
+    services below by renaming them
     with a `_` prefix so the init system skips them:
 
     | Service | Reason |
@@ -186,9 +188,10 @@ make aarch64     # Pi binary  → build/serialmux.aarch64
     If transferring via scp rather than running from a repo clone on the K1:
 
     ```sh
-    scp build/serialmux.mipsel root@<k1-ip>:/usr/data/pik1/serialmux
+    scp build/pik1d.mipsel root@<k1-ip>:/usr/data/pik1/pik1d
+    scp build/tcpbridge.mipsel root@<k1-ip>:/usr/data/pik1/tcpbridge
     scp S99pik1 root@<k1-ip>:/etc/init.d/S99pik1
-    ssh root@<k1-ip> chmod +x /usr/data/pik1/serialmux /etc/init.d/S99pik1
+    ssh root@<k1-ip> chmod +x /usr/data/pik1/pik1d /usr/data/pik1/tcpbridge /etc/init.d/S99pik1
     ```
 
     Then run the service rename loop manually on the K1.
@@ -199,10 +202,10 @@ make aarch64     # Pi binary  → build/serialmux.aarch64
     ```
     Upon start, the daemon logs to `/tmp/pik1.log`.
 
-## Optional: K1 touchscreen (TCP tunnel)
+## K1 touchscreen TCP tunnel
 
-The serialmux TCP tunnel forwards the SimpleAF K1 touchscreen's (guppyscreen) Moonraker
-requests to the Pi over the USB link. This is strongly recommended over the
+The TCP tunnel forwards the Simple AF K1 touchscreen's (guppyscreen) Moonraker
+requests to the Pi over the second USB CDC ACM link. This is strongly recommended over the
 alternative of pointing guppyscreen at the Pi's WiFi IP address -- WiFi is
 unreliable enough that you will eventually lose display functionality mid-print.
 The tunnel runs over the same wired USB link as the MCU bridge and stays up as
@@ -212,17 +215,18 @@ The tunnel is low-bandwidth and intended for Moonraker API traffic only
 (temperatures, print status, controls). Do not route webcam streams or file
 transfers through it.
 
-guppyscreen requires no configuration changes -- it continues talking to
-`localhost:7125` as normal and the tunnel forwards those connections to the Pi
-transparently.
+The included K1 init script and Pi systemd service enable this tunnel by default
+with matching `tcp:` specs. guppyscreen requires no configuration changes -- it
+continues talking to `localhost:7125` as normal and the tunnel forwards those
+connections to the Pi transparently.
 
-To enable, add a `tcp` channel spec to both sides.
-
-**K1 init script** -- edit `/etc/init.d/S99pik1` and add the tcp channel to
-`DAEMON_ARGS`:
+**K1 init script** -- `/etc/init.d/S99pik1` starts `pik1d` in MCU-exporting mode:
 
 ```sh
-DAEMON_ARGS="exporter --usb $USB_ID mcu:0:$MCU_DEV:$MCU_BAUD mcu:1:$NOZZLE_DEV:$NOZZLE_BAUD tcp:2:0.0.0.0:7125"
+DAEMON_ARGS="--usb $USB_ID \
+    mcu:0:$CH0_DEV:$CH0_BAUD \
+    mcu:1:$CH1_DEV:$CH1_BAUD \
+    tcp:$TCP_ADDR:$TCP_PORT"
 ```
 
 Also re-enable guppyscreen if you disabled it:
@@ -230,14 +234,18 @@ Also re-enable guppyscreen if you disabled it:
 mv /etc/init.d/_S99guppyscreen /etc/init.d/S99guppyscreen
 ```
 
-**Pi systemd service** -- edit `/etc/systemd/system/pik1.service` and add the
-tcp channel to `ExecStart`:
+`TCP_ADDR` is `127.0.0.1` by default so only local touchscreen requests are
+accepted on the K1. Set it to `0.0.0.0` only if you deliberately want the
+forwarded listener exposed on the K1 network interface.
+
+**Pi systemd service** -- `/etc/systemd/system/pik1.service` starts `pik1d` in
+PTY-hosting mode:
 
 ```ini
-ExecStart=/opt/pik1/serialmux host /dev/ttyGS0 \
-    mcu:0:/tmp/klipper_mcu \
-    mcu:1:/tmp/klipper_toolhead \
-    tcp:2:127.0.0.1:7125
+ExecStart=/opt/pik1/pik1d --usb 1d6b:0104 \
+    pty:0:/tmp/klipper_mcu \
+    pty:1:/tmp/klipper_toolhead \
+    tcp:127.0.0.1:7125
 ```
 
 Then reload and restart:
@@ -262,15 +270,13 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     setup_pik1: loading libcomposite
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
-    setup_pik1: ttyGS0 ready
-    Link: opened /dev/ttyGS0
-    serialmux host started
-    Link: received HELLO from peer
-    Link: handshake complete (host)
-    PTY ch0: READY -> ACTIVE
-    PTY ch0: opened /dev/pts/2 -> /tmp/klipper_mcu
-    PTY ch1: READY -> ACTIVE
-    PTY ch1: opened /dev/pts/3 -> /tmp/klipper_toolhead
+    [pik1] mode=host channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyGS1
+    [pik1] child: spawned /opt/pik1/tcpbridge pid=...
+    [mux] link opened: /dev/ttyGS0
+    [mux] link up
+    [mux] ch0 PTY /tmp/klipper_mcu -> /dev/pts/2
+    [mux] ch1 PTY /tmp/klipper_toolhead -> /dev/pts/3
+    [tcp] tcpbridge /dev/ttyGS1 forward 127.0.0.1:7125
     ```
 
 2. #### K1 log
@@ -279,16 +285,13 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     ```
     A normal startup looks like:
     ```
-    08:54:10 MCU ch0: opened /dev/ttyS7 @ 230400
-    08:54:10 MCU ch1: opened /dev/ttyS1 @ 230400
-    08:54:10 Link: opened /dev/ttyACM0
-    08:54:10 serialmux exporter started
-    08:54:10 MCU ch0: 0x7E seen at offset 13 -> ACTIVE
-    08:54:10 MCU ch0: INIT -> ACTIVE
-    08:54:10 MCU ch1: 0x7E seen at offset 13 -> ACTIVE
-    08:54:10 MCU ch1: INIT -> ACTIVE
-    08:54:28 Link: received HELLO from peer
-    08:54:28 Link: handshake complete (exporter)
+    [pik1] mode=exporter channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyACM1
+    [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
+    [mux] link opened: /dev/ttyACM0
+    [mux] link up
+    [mux] ch0 MCU active
+    [mux] ch1 MCU active
+    [tcp] tcpbridge /dev/ttyACM1 listen 127.0.0.1:7125
     ```
 
 3. #### dmesg (Pi)
@@ -330,7 +333,7 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     Revert `printer.cfg` serial paths and reconfigure cables as needed.
 
     You can run both the Pi and K1 standalone simultaneously (e.g. for camera
-    services) without conflict as long as the serialmux init script is disabled.
+    services) without conflict as long as the pik1 init script is disabled.
 
 ## Optional extras
 
