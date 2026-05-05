@@ -1,6 +1,7 @@
-// src/muxd.c — multi-MCU serial multiplexer, COBS framing, no TCP
+// src/serialmux.c — COBS serial multiplexer, library interface
 
-#include "cobs.h"
+#include "serialmux.h"
+#include "nanocobs/cobs.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,20 +28,16 @@
 #define F_PONG   0x21u
 
 // ── sizing ────────────────────────────────────────────────────────────────────
-#define MAX_CHANNELS    8
 #define MAX_PAYLOAD     4096
 
-// decoded frame: [type:1][ch:1][payload:0..4096][crc32:4]
 #define FRAME_DEC_MAX   (2 + MAX_PAYLOAD + 4)
 #define FRAME_ENC_MAX   COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
-// link TX ring: power-of-2
 #define LINK_RING_CAP   (1u << 20)
 #define LINK_RING_MASK  (LINK_RING_CAP - 1u)
 #define LINK_HIGH_WATER (LINK_RING_CAP / 2)
 #define LINK_LOW_WATER  (LINK_RING_CAP / 4)
 
-// channel TX ring: power-of-2
 #define CHAN_RING_CAP   (1u << 16)
 #define CHAN_RING_MASK  (CHAN_RING_CAP - 1u)
 
@@ -52,7 +49,6 @@
 #define RECONNECT_MAX_MS  8000
 
 // ── types ─────────────────────────────────────────────────────────────────────
-typedef enum { CH_MCU, CH_PTY } ch_type_t;
 typedef enum { MCU_INIT, MCU_ACTIVE, MCU_RESETTING } mcu_state_t;
 
 typedef struct channel {
@@ -102,12 +98,14 @@ static channel_t g_chans[MAX_CHANNELS];
 static int       g_n_chans;
 static int       g_epfd = -1;
 
+// sentinel pointer for aux_fd epoll registration
+static int g_aux_sentinel;
+
 // ── logging ───────────────────────────────────────────────────────────────────
 static void log_msg(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
+    va_list ap; va_start(ap, fmt);
+    fputs("[mux] ", stderr);
+    vfprintf(stderr, fmt, ap); va_end(ap);
     fputc('\n', stderr);
 }
 #define LOG(...)  log_msg(__VA_ARGS__)
@@ -166,7 +164,11 @@ static void chan_drain(channel_t *c) {
         uint32_t avail  = chan_avail(c);
         size_t   n      = avail < contig ? avail : contig;
         ssize_t  w      = write(c->fd, c->txbuf + off, n);
-        if (w <= 0) break;
+        if (w <= 0) {
+            if (w < 0 && errno != EAGAIN && errno != EINTR)
+                LOG("ch%u write: %s", c->ch_id, strerror(errno));
+            break;
+        }
         c->tx_head += (uint32_t)w;
     }
 }
@@ -196,7 +198,6 @@ static bool lk_push(link_t *lk, const uint8_t *src, size_t len) {
     return true;
 }
 
-// Drain link TX ring to fd; returns true if any bytes were written.
 static bool lk_drain(link_t *lk) {
     bool wrote = false;
     while (lk_avail(lk)) {
@@ -205,7 +206,11 @@ static bool lk_drain(link_t *lk) {
         uint32_t avail  = lk_avail(lk);
         size_t   n      = avail < contig ? avail : contig;
         ssize_t  w      = write(lk->fd, lk->txbuf + off, n);
-        if (w <= 0) break;
+        if (w <= 0) {
+            if (w < 0 && errno != EAGAIN && errno != EINTR)
+                LOG("link write: %s", strerror(errno));
+            break;
+        }
         lk->tx_head += (uint32_t)w;
         wrote = true;
     }
@@ -238,10 +243,11 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
     dec[2 + plen + 2] = (uint8_t)(crc >> 16);
     dec[2 + plen + 3] = (uint8_t)(crc >> 24);
 
-    // cobs_encode appends the 0x00 delimiter and includes it in enc_len
     size_t enc_len = 0;
-    if (cobs_encode(dec, 2 + plen + 4, enc, FRAME_ENC_MAX + 1, &enc_len) != COBS_RET_SUCCESS)
+    if (cobs_encode(dec, 2 + plen + 4, enc, FRAME_ENC_MAX + 1, &enc_len) != COBS_RET_SUCCESS) {
+        LOG("cobs_encode failed type=0x%02x ch=%u", type, ch_id);
         return;
+    }
 
     if (!lk_push(lk, enc, enc_len)) {
         LOG("link TX ring full, dropping frame type=0x%02x ch=%u", type, ch_id);
@@ -260,7 +266,7 @@ static void link_parse_rx(link_t *lk) {
         if (!delim) break;
         size_t frame_len = (size_t)(delim - lk->rxbuf);
         if (frame_len > 0)
-            dispatch_frame(lk, lk->rxbuf, frame_len + 1); // include 0x00: cobs_decode requires it
+            dispatch_frame(lk, lk->rxbuf, frame_len + 1);
         size_t consumed = frame_len + 1;
         lk->rxbuf_len -= consumed;
         memmove(lk->rxbuf, lk->rxbuf + consumed, lk->rxbuf_len);
@@ -306,6 +312,7 @@ static int open_serial(const char *path, int baud) {
 
 // ── USB sysfs discovery ───────────────────────────────────────────────────────
 #define SYSPATH_MAX 512
+#define MAX_USB_DEVS 16
 
 static bool sysfs_read(const char *path, char *buf, size_t cap) {
     int fd = open(path, O_RDONLY);
@@ -341,15 +348,12 @@ static void to_lower(char *s) {
         if (*s >= 'A' && *s <= 'F') *s += 32;
 }
 
-// Strip leading "0x"/"0X" and lowercase — configfs stores VID/PID as "0x1d6b".
 static const char *strip_0x(char *s) {
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
     to_lower(s);
     return s;
 }
 
-// Check configfs for a USB gadget with matching vid:pid (Pi gadget side).
-// gadget devices don't expose idVendor via the normal USB host sysfs hierarchy.
 static bool configfs_gadget_matches(const char *want_vid, const char *want_pid) {
     DIR *d = opendir("/sys/kernel/config/usb_gadget");
     if (!d) return false;
@@ -371,38 +375,44 @@ static bool configfs_gadget_matches(const char *want_vid, const char *want_pid) 
     return found;
 }
 
-// Returns static buffer with /dev/ttyXXXN path, or NULL.
-static const char *find_usb_tty(const char *vidpid) {
+static int usb_dev_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+const char *serialmux_find_dev(const char *vidpid, int n) {
     char want_vid[8], want_pid[8];
     if (sscanf(vidpid, "%7[^:]:%7s", want_vid, want_pid) != 2) return NULL;
     to_lower(want_vid);
     to_lower(want_pid);
 
     static const char *prefixes[] = { "ttyACM", "ttyGS", NULL };
+
+    // Collect all matching device names
+    static char names[MAX_USB_DEVS][256];
+    static const char *ptrs[MAX_USB_DEVS];
+    int count = 0;
+
     DIR *d = opendir("/sys/class/tty");
     if (!d) return NULL;
 
-    static char result[64];
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
+    while (count < MAX_USB_DEVS && (ent = readdir(d)) != NULL) {
         bool match = false;
         for (int i = 0; prefixes[i]; i++)
             if (strncmp(ent->d_name, prefixes[i], strlen(prefixes[i])) == 0) { match = true; break; }
         if (!match) continue;
 
-        char devlink[SYSPATH_MAX];
-        snprintf(devlink, sizeof(devlink), "/sys/class/tty/%s/device", ent->d_name);
-
-        // ttyGS (gadget) devices: fall back to configfs vid:pid check
         if (strncmp(ent->d_name, "ttyGS", 5) == 0) {
             if (configfs_gadget_matches(want_vid, want_pid)) {
-                snprintf(result, sizeof(result), "/dev/%.50s", ent->d_name);
-                closedir(d);
-                return result;
+                snprintf(names[count], sizeof(names[count]), "%s", ent->d_name);
+                ptrs[count] = names[count];
+                count++;
             }
             continue;
         }
 
+        char devlink[SYSPATH_MAX];
+        snprintf(devlink, sizeof(devlink), "/sys/class/tty/%s/device", ent->d_name);
         char usb_dir[SYSPATH_MAX];
         if (!find_usb_dir(devlink, usb_dir, sizeof(usb_dir))) continue;
 
@@ -411,17 +421,22 @@ static const char *find_usb_tty(const char *vidpid) {
         if (!sysfs_read(tmp, vid, sizeof(vid))) continue;
         snprintf(tmp, sizeof(tmp), "%s/idProduct", usb_dir);
         if (!sysfs_read(tmp, pid, sizeof(pid))) continue;
-        to_lower(vid);
-        to_lower(pid);
+        to_lower(vid); to_lower(pid);
 
         if (strcmp(vid, want_vid) == 0 && strcmp(pid, want_pid) == 0) {
-            snprintf(result, sizeof(result), "/dev/%.50s", ent->d_name);
-            closedir(d);
-            return result;
+            snprintf(names[count], sizeof(names[count]), "%s", ent->d_name);
+            ptrs[count] = names[count];
+            count++;
         }
     }
     closedir(d);
-    return NULL;
+
+    if (count == 0 || n >= count) return NULL;
+    qsort(ptrs, (size_t)count, sizeof(ptrs[0]), usb_dev_cmp);
+
+    static char result[64];
+    snprintf(result, sizeof(result), "/dev/%s", ptrs[n]);
+    return result;
 }
 
 // ── MCU channel ───────────────────────────────────────────────────────────────
@@ -621,7 +636,7 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
         LOG("COBS decode failed enc_len=%zu", enc_len);
         return;
     }
-    if (dec_len < 6) return; // type(1) + ch(1) + crc32(4)
+    if (dec_len < 6) return;
 
     uint8_t        type    = dec[0];
     uint8_t        ch_id   = dec[1];
@@ -646,7 +661,6 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
             for (int i = 0; i < g_n_chans; i++) {
                 channel_t *c = &g_chans[i];
                 if (c->type == CH_MCU) mcu_on_link_up(c, lk);
-                // PTY host waits for F_READY from exporter
             }
         }
         return;
@@ -679,7 +693,6 @@ static void link_close(link_t *lk, int64_t now) {
         for (int i = 0; i < g_n_chans; i++) {
             channel_t *c = &g_chans[i];
             if (c->type == CH_PTY) pty_close(c);
-            // MCU channels stay open on link drop
         }
     }
     lk->reconnect_deadline = now + lk->reconnect_backoff_ms;
@@ -689,7 +702,7 @@ static void link_close(link_t *lk, int64_t now) {
 }
 
 static void link_try_open(link_t *lk, int64_t now) {
-    const char *dev = find_usb_tty(lk->vidpid);
+    const char *dev = serialmux_find_dev(lk->vidpid, 0);
     if (!dev) return;
 
     lk->fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -698,8 +711,7 @@ static void link_try_open(link_t *lk, int64_t now) {
     struct termios t;
     tcgetattr(lk->fd, &t);
     cfmakeraw(&t);
-    cfsetispeed(&t, B115200);
-    cfsetospeed(&t, B115200);
+    t.c_iflag |= IGNBRK | IGNPAR;
     t.c_cflag |= CLOCAL | CREAD;
     tcsetattr(lk->fd, TCSANOW, &t);
 
@@ -717,7 +729,11 @@ static void link_try_open(link_t *lk, int64_t now) {
 
 static void link_on_readable(link_t *lk, int64_t now) {
     size_t space = sizeof(lk->rxbuf) - lk->rxbuf_len;
-    if (!space) { lk->rxbuf_len = 0; space = sizeof(lk->rxbuf); }
+    if (!space) {
+        LOG("link RX overflow, discarding %zu bytes", lk->rxbuf_len);
+        lk->rxbuf_len = 0;
+        space = sizeof(lk->rxbuf);
+    }
 
     ssize_t n = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
     if (n <= 0) {
@@ -747,7 +763,6 @@ static void link_tick(link_t *lk, int64_t now) {
             link_try_open(lk, now);
         return;
     }
-    // Retransmit HELLO until peer responds; covers race between reconnects.
     if (!lk->up && (now - lk->last_tx_ms) > 2000)
         enqueue_frame(lk, F_HELLO, 0, NULL, 0);
     if (lk->up) {
@@ -777,9 +792,39 @@ static int64_t link_deadline(const link_t *lk) {
 // ── main event loop ───────────────────────────────────────────────────────────
 #define MAX_EPOLL_EVENTS 16
 
-static void run(void) {
+void serialmux_run(const serialmux_config_t *cfg) {
+    crc32_init();
+
+    // Load config into globals
+    memset(&g_link, 0, sizeof(g_link));
+    g_link.fd = -1;
+    g_link.reconnect_backoff_ms = RECONNECT_MIN_MS;
+    memcpy(g_link.vidpid, cfg->vidpid, sizeof(g_link.vidpid));
+    g_link.vidpid[sizeof(g_link.vidpid) - 1] = '\0';
+
+    g_n_chans = cfg->n_channels;
+    for (int i = 0; i < g_n_chans; i++) {
+        const ch_spec_t *s = &cfg->channels[i];
+        channel_t *c = &g_chans[i];
+        memset(c, 0, sizeof(*c));
+        c->type     = s->type;
+        c->ch_id    = s->ch_id;
+        c->fd       = -1;
+        c->slave_fd = -1;
+        if (s->type == CH_MCU) {
+            c->baud      = s->baud;
+            c->mcu_state = MCU_INIT;
+            snprintf(c->dev,      sizeof(c->dev),      "%s", s->dev);
+        } else {
+            snprintf(c->pty_path, sizeof(c->pty_path), "%s", s->path);
+        }
+    }
+
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
     if (g_epfd < 0) DIE("epoll_create1: %s", strerror(errno));
+
+    if (cfg->aux_fd >= 0)
+        ep_set(cfg->aux_fd, EPOLLIN, &g_aux_sentinel);
 
     int64_t now = now_ms();
     link_try_open(&g_link, now);
@@ -791,6 +836,10 @@ static void run(void) {
         for (int i = 0; i < g_n_chans; i++) {
             int64_t cd = ch_deadline(&g_chans[i], now);
             if (cd < dl) dl = cd;
+        }
+        if (cfg->deadline_fn) {
+            int64_t xd = cfg->deadline_fn();
+            if (xd < dl) dl = xd;
         }
 
         int timeout = (dl <= now) ? 0 : (int)(dl - now);
@@ -813,6 +862,8 @@ static void run(void) {
                 if (ev & (EPOLLERR | EPOLLHUP)) { link_close(&g_link, now); continue; }
                 if (ev & EPOLLIN)  link_on_readable(&g_link, now);
                 if (ev & EPOLLOUT) link_on_writable(&g_link, now);
+            } else if (ptr == &g_aux_sentinel) {
+                if (cfg->aux_cb) cfg->aux_cb();
             } else {
                 channel_t *c = (channel_t *)ptr;
                 if (ev & (EPOLLERR | EPOLLHUP)) {
@@ -831,64 +882,6 @@ static void run(void) {
         link_tick(&g_link, now);
         for (int i = 0; i < g_n_chans; i++)
             ch_tick(&g_chans[i], &g_link, now);
+        if (cfg->tick_cb) cfg->tick_cb();
     }
-}
-
-// ── argument parsing ──────────────────────────────────────────────────────────
-static void usage(const char *prog) {
-    fprintf(stderr,
-        "Usage:\n"
-        "  %s --usb VID:PID  mcu:N:DEV:BAUD [mcu:N:DEV:BAUD ...]\n"
-        "  %s --usb VID:PID  pty:N:SYMLINK  [pty:N:SYMLINK  ...]\n",
-        prog, prog);
-    exit(1);
-}
-
-int main(int argc, char **argv) {
-    crc32_init();
-
-    if (argc < 4) usage(argv[0]);
-
-    int argi = 1;
-    if (strcmp(argv[argi], "--usb") != 0 || argi + 1 >= argc) usage(argv[0]);
-    strncpy(g_link.vidpid, argv[argi + 1], sizeof(g_link.vidpid) - 1);
-    argi += 2;
-
-    if (argi >= argc) usage(argv[0]);
-
-    bool is_mcu = strncmp(argv[argi], "mcu:", 4) == 0;
-    bool is_pty = strncmp(argv[argi], "pty:", 4) == 0;
-    if (!is_mcu && !is_pty) usage(argv[0]);
-
-    g_n_chans = 0;
-    g_link.fd = -1;
-    g_link.reconnect_backoff_ms = RECONNECT_MIN_MS;
-
-    while (argi < argc && g_n_chans < MAX_CHANNELS) {
-        char *spec = argv[argi++];
-        channel_t *c = &g_chans[g_n_chans];
-        memset(c, 0, sizeof(*c));
-        c->fd = -1;
-        c->slave_fd = -1;
-
-        if (is_mcu) {
-            char baud_str[16];
-            if (sscanf(spec, "mcu:%hhu:%127[^:]:%15s", &c->ch_id, c->dev, baud_str) != 3)
-                DIE("bad mcu spec: %s", spec);
-            c->baud = atoi(baud_str);
-            c->type = CH_MCU;
-            c->mcu_state = MCU_INIT;
-        } else {
-            if (sscanf(spec, "pty:%hhu:%127s", &c->ch_id, c->pty_path) != 2)
-                DIE("bad pty spec: %s", spec);
-            c->type = CH_PTY;
-        }
-        g_n_chans++;
-    }
-
-    if (!g_n_chans) usage(argv[0]);
-
-    LOG("mode=%s channels=%d", is_mcu ? "exporter" : "host", g_n_chans);
-    run();
-    return 0;
 }

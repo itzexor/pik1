@@ -2,7 +2,7 @@
 # /etc/init.d/S99pik1
 # serialmux exporter -- bridges MCU UARTs to the Pi over USB CDC ACM.
 
-BINARY="/usr/data/pik1/serialmux"
+BINARY="/usr/data/pik1/pik1d"
 PIDFILE="/var/run/pik1.pid"
 LOGFILE="/tmp/pik1.log"
 
@@ -12,7 +12,7 @@ MCU_BAUD="230400"
 NOZZLE_DEV="/dev/ttyS1"
 NOZZLE_BAUD="230400"
 
-DAEMON_ARGS="--usb $USB_ID mcu:0:$MCU_DEV:$MCU_BAUD mcu:1:$NOZZLE_DEV:$NOZZLE_BAUD"
+DAEMON_ARGS="--usb $USB_ID mcu:0:$MCU_DEV:$MCU_BAUD mcu:1:$NOZZLE_DEV:$NOZZLE_BAUD tcp:0.0.0.0:7125"
 
 case "$1" in
     start)
@@ -30,6 +30,8 @@ case "$1" in
     stop)
         echo "Stopping pik1..."
         start-stop-daemon -K -p "$PIDFILE" 2>/dev/null
+        # tcpbridge is a child of pik1d; kill any orphan in case it outlived its parent
+        killall -q tcpbridge 2>/dev/null || true
         rm -f "$PIDFILE"
         ;;
     restart|reload)

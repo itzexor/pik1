@@ -2,3 +2,5 @@ __pycache__/
 .toolchain/
 build/serialmux
 build/serialmux.armv7
+build/pik1d
+build/tcpbridge
