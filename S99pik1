@@ -1,18 +1,30 @@
 #!/bin/sh
-# /etc/init.d/S99pik1
-# serialmux exporter -- bridges MCU UARTs to the Pi over USB CDC ACM.
+# /etc/init.d/S99pik1 — pik1 exporter: bridges K1C MCU UARTs to the Pi over USB CDC ACM.
 
-BINARY="/usr/data/pik1/pik1d"
+INSTALL_DIR="/usr/data/pik1"
+BINARY="$INSTALL_DIR/pik1d"
 PIDFILE="/var/run/pik1.pid"
 LOGFILE="/tmp/pik1.log"
 
+# USB gadget VID:PID (set by setup_pik1.sh on the Pi)
 USB_ID="1d6b:0104"
-MCU_DEV="/dev/ttyS7"
-MCU_BAUD="230400"
-NOZZLE_DEV="/dev/ttyS1"
-NOZZLE_BAUD="230400"
 
-DAEMON_ARGS="--usb $USB_ID mcu:0:$MCU_DEV:$MCU_BAUD mcu:1:$NOZZLE_DEV:$NOZZLE_BAUD tcp:0.0.0.0:7125"
+# main MCU
+CH0_DEV="/dev/ttyS7"
+CH0_BAUD="230400"
+
+# toolhead MCU
+CH1_DEV="/dev/ttyS1"
+CH1_BAUD="230400"
+
+# TCP tunnel — Moonraker port forwarded to the Pi
+TCP_ADDR="127.0.0.1" # 0.0.0.0 to listen on all interfaces instead
+TCP_PORT="7125"
+
+DAEMON_ARGS="--usb $USB_ID \
+    mcu:0:$CH0_DEV:$CH0_BAUD \
+    mcu:1:$CH1_DEV:$CH1_BAUD \
+    tcp:$TCP_ADDR:$TCP_PORT"
 
 case "$1" in
     start)
@@ -21,16 +33,12 @@ case "$1" in
             exit 1
         fi
         echo "Starting pik1..."
-        # The redirect must be inside the child process, not on start-stop-daemon
-        # itself, otherwise the daemonized child inherits /dev/null for stdio.
         start-stop-daemon -S -b -m -p "$PIDFILE" \
-            -x /bin/sh -- -c \
-            "exec $BINARY $DAEMON_ARGS >> $LOGFILE 2>&1"
+            -x /bin/sh -- -c "exec $BINARY $DAEMON_ARGS >> $LOGFILE 2>&1"
         ;;
     stop)
         echo "Stopping pik1..."
         start-stop-daemon -K -p "$PIDFILE" 2>/dev/null
-        # tcpbridge is a child of pik1d; kill any orphan in case it outlived its parent
         killall -q tcpbridge 2>/dev/null || true
         rm -f "$PIDFILE"
         ;;

@@ -2,7 +2,7 @@
 Description=PiK1 gadget setup and serialmux bridge
 DefaultDependencies=no
 After=sysinit.target local-fs.target systemd-udevd.service
-Before=klipper.service mediamtx.service
+Before=klipper.service
 
 [Service]
 Type=simple
@@ -17,7 +17,7 @@ Group=1000
 ExecStart=@INSTALL_DIR@/pik1d --usb 1d6b:0104 \
     pty:0:/tmp/klipper_mcu \
     pty:1:/tmp/klipper_toolhead \
-    tcp:localhost:7125
+    tcp:127.0.0.1:7125
 
 Restart=always
 RestartSec=2
