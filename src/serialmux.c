@@ -224,11 +224,19 @@ static bool lk_drain(link_t *lk) {
 
 // ── frame I/O ────────────────────────────────────────────────────────────────
 static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len);
+static void link_close(link_t *lk, int64_t now);
+
+static bool link_can_queue_frame(const link_t *lk, size_t plen) {
+    if (plen > MAX_PAYLOAD) return false;
+    return lk_space(lk) >= COBS_ENCODE_MAX(2 + plen + 4);
+}
 
 static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
                            const uint8_t *payload, size_t plen) {
     if (!lk->up && type != F_HELLO) return;
     if (plen > MAX_PAYLOAD) return;
+    if (type == F_HELLO && lk_avail(lk) > 0) return;
+    if ((type == F_PING || type == F_PONG) && !link_can_queue_frame(lk, plen)) return;
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
@@ -468,6 +476,12 @@ static void mcu_send_data(link_t *lk, channel_t *c, const uint8_t *buf, size_t n
 }
 
 static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
+    if (!link_can_queue_frame(lk, MAX_PAYLOAD)) {
+        lk->paused = true;
+        chan_pause(c);
+        return;
+    }
+
     static uint8_t buf[MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
@@ -504,14 +518,15 @@ static void mcu_on_writable(channel_t *c) {
     chan_epoll_update(c);
 }
 
-static void mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
-    if (type != F_DATA || c->fd < 0) return;
+static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
+    if (type != F_DATA || c->fd < 0) return true;
     if (chan_space(c) < plen) {
-        LOG("ch%u MCU txbuf full, dropping %zu bytes", c->ch_id, plen);
-        return;
+        LOG("ch%u MCU txbuf full, closing link before dropping %zu bytes", c->ch_id, plen);
+        return false;
     }
     chan_push(c, payload, plen);
     chan_epoll_update(c);
+    return true;
 }
 
 static void mcu_tick(channel_t *c, link_t *lk, int64_t now) {
@@ -563,6 +578,12 @@ static void pty_close(channel_t *c) {
 }
 
 static void pty_on_readable(channel_t *c, link_t *lk) {
+    if (!link_can_queue_frame(lk, MAX_PAYLOAD)) {
+        lk->paused = true;
+        chan_pause(c);
+        return;
+    }
+
     static uint8_t buf[MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
@@ -584,13 +605,13 @@ static void pty_on_writable(channel_t *c) {
     chan_epoll_update(c);
 }
 
-static void pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
+static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
     switch (type) {
     case F_DATA:
-        if (c->fd < 0) return;
+        if (c->fd < 0) return true;
         if (chan_space(c) < plen) {
-            LOG("ch%u PTY txbuf full, dropping %zu bytes", c->ch_id, plen);
-            return;
+            LOG("ch%u PTY txbuf full, closing link before dropping %zu bytes", c->ch_id, plen);
+            return false;
         }
         chan_push(c, payload, plen);
         chan_epoll_update(c);
@@ -599,6 +620,7 @@ static void pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, siz
     case F_READY: pty_open(c);  break;
     default: break;
     }
+    return true;
 }
 
 // ── channel dispatch ──────────────────────────────────────────────────────────
@@ -675,8 +697,10 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     channel_t *c = find_channel(ch_id);
     if (!c) return;
 
-    if (c->type == CH_MCU) mcu_on_frame(c, type, payload, plen);
-    else                    pty_on_frame(c, type, payload, plen);
+    bool ok = (c->type == CH_MCU) ? mcu_on_frame(c, type, payload, plen)
+                                  : pty_on_frame(c, type, payload, plen);
+    if (!ok)
+        link_close(lk, now_ms());
 }
 
 // ── link management ───────────────────────────────────────────────────────────
@@ -763,7 +787,7 @@ static void link_tick(link_t *lk, int64_t now) {
             link_try_open(lk, now);
         return;
     }
-    if (!lk->up && (now - lk->last_tx_ms) > 2000)
+    if (!lk->up && lk_avail(lk) == 0 && (now - lk->last_tx_ms) > 2000)
         enqueue_frame(lk, F_HELLO, 0, NULL, 0);
     if (lk->up) {
         if ((now - lk->last_tx_ms) > PING_IDLE_TX_MS)

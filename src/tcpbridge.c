@@ -1,5 +1,6 @@
 // src/tcpbridge.c — multi-connection TCP-over-serial bridge with ARQ
 // Wire protocol: COBS + CRC32, frame layout: [type:1][conn_id:1][seq:1][payload][crc32:4]
+// OPEN/DATA/CLOSE/PAUSE/RESUME are sequenced and retransmitted with a small ARQ window.
 // Runs on ttyGS1 (K1C) / ttyACM1 (Pi).
 
 #include "nanocobs/cobs.h"
@@ -30,8 +31,8 @@
 #define TB_CLOSE  0x22u
 #define TB_PAUSE  0x23u
 #define TB_RESUME 0x24u
-#define TB_ACK    0x30u  // ARQ ack:  seq field = DATA seq successfully received
-#define TB_NAK    0x31u  // ARQ nak:  seq field = next DATA seq expected (retransmit from here)
+#define TB_ACK    0x30u  // ARQ ack:  seq field = reliable frame successfully received
+#define TB_NAK    0x31u  // ARQ nak:  seq field = next reliable frame expected
 
 // ── sizing ────────────────────────────────────────────────────────────────────
 #define MAX_CONNS        16
@@ -274,6 +275,11 @@ static void arq_resume_conns(void) {
 }
 
 // ── ARQ retransmit / ack / nak ────────────────────────────────────────────────
+static bool frame_is_reliable(uint8_t type) {
+    return type == TB_OPEN || type == TB_DATA || type == TB_CLOSE ||
+           type == TB_PAUSE || type == TB_RESUME;
+}
+
 static void lk_arm_epollout(void) {
     if (!(g_link.epev & EPOLLOUT) && g_link.fd >= 0) {
         g_link.epev |= EPOLLOUT;
@@ -349,7 +355,7 @@ static size_t frame_encode(uint8_t type, uint8_t conn_id, uint8_t seq,
     return enc_len;
 }
 
-// ── enqueue_ctrl: control frames (HELLO, PING, PONG, OPEN, CLOSE, PAUSE, RESUME, ACK, NAK)
+// ── enqueue_ctrl: unreliable control frames (HELLO, PING, PONG, ACK, NAK)
 // seq is meaningful for ACK/NAK; pass 0 for all others.
 static void enqueue_ctrl(uint8_t type, uint8_t conn_id, uint8_t seq,
                           const uint8_t *payload, size_t plen) {
@@ -363,9 +369,10 @@ static void enqueue_ctrl(uint8_t type, uint8_t conn_id, uint8_t seq,
     lk_arm_epollout();
 }
 
-// ── enqueue_data: DATA frames — assigns seq, saves to ARQ slot for retransmit
-// Returns false if ARQ window full (caller should stop reading TCP).
-static bool enqueue_data(uint8_t conn_id, const uint8_t *payload, size_t plen) {
+// ── enqueue_reliable: OPEN, DATA, CLOSE, PAUSE, RESUME with ARQ retransmit
+static bool enqueue_reliable(uint8_t type, uint8_t conn_id,
+                             const uint8_t *payload, size_t plen) {
+    if (!frame_is_reliable(type)) return false;
     if ((uint8_t)(g_tx_seq - g_tx_base) >= ARQ_WINDOW) {
         arq_pause_conns();
         return false;
@@ -373,9 +380,12 @@ static bool enqueue_data(uint8_t conn_id, const uint8_t *payload, size_t plen) {
     uint8_t     seq  = g_tx_seq;
     arq_slot_t *slot = &g_arq[seq % ARQ_WINDOW];
 
-    slot->enc_len = frame_encode(TB_DATA, conn_id, seq, payload, plen,
+    slot->enc_len = frame_encode(type, conn_id, seq, payload, plen,
                                   slot->enc, sizeof(slot->enc));
-    if (!slot->enc_len) { LOG("encode failed TB_DATA conn=%u", conn_id); return false; }
+    if (!slot->enc_len) {
+        LOG("encode failed reliable type=0x%02x conn=%u", type, conn_id);
+        return false;
+    }
 
     slot->used       = true;
     slot->sent_at_ms = now_ms();
@@ -404,7 +414,8 @@ static void conn_close(int id, bool send_close) {
     c->pause_sent = false;
     c->arq_paused = false;
     c->tx_head = c->tx_tail = 0;
-    if (send_close) enqueue_ctrl(TB_CLOSE, (uint8_t)id, 0, NULL, 0);
+    if (send_close && !enqueue_reliable(TB_CLOSE, (uint8_t)id, NULL, 0))
+        LOG("conn %d: unable to queue CLOSE", id);
     LOG("conn %d closed", id);
 }
 
@@ -477,6 +488,18 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         return;
     }
 
+    if (frame_is_reliable(type) && seq != g_rx_next) {
+        uint8_t ahead = (uint8_t)(seq - g_rx_next);
+        if (ahead < 128u) {
+            LOG("reliable gap type=0x%02x seq=%u expected=%u",
+                type, seq, g_rx_next);
+            enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
+        } else {
+            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+        }
+        return;
+    }
+
     switch (type) {
     case TB_HELLO:
         if (!g_link.up) {
@@ -500,15 +523,28 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         return;
 
     case TB_OPEN:
-        if (g_is_listener) return;
-        if (id >= MAX_CONNS) { enqueue_ctrl(TB_CLOSE, id, 0, NULL, 0); return; }
+        if (g_is_listener) {
+            LOG("unexpected OPEN in listener mode id=%u", id);
+            g_rx_next++;
+            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+            enqueue_reliable(TB_CLOSE, id, NULL, 0);
+            return;
+        }
+        if (id >= MAX_CONNS) {
+            g_rx_next++;
+            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+            enqueue_reliable(TB_CLOSE, id, NULL, 0);
+            return;
+        }
         if (g_conns[id].fd >= 0) conn_close(id, false);
         {
             int fd = tcp_connect_to_target();
             if (fd < 0) {
                 LOG("conn %d: connect to %s:%d failed: %s",
                     id, g_fwd_host, g_fwd_port, strerror(errno));
-                enqueue_ctrl(TB_CLOSE, id, 0, NULL, 0);
+                g_rx_next++;
+                enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+                enqueue_reliable(TB_CLOSE, id, NULL, 0);
                 return;
             }
             g_conns[id].fd        = fd;
@@ -518,22 +554,11 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             conn_epoll_update(&g_conns[id]);
             LOG("conn %d: connected to %s:%d", id, g_fwd_host, g_fwd_port);
         }
+        g_rx_next++;
+        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
         return;
 
     case TB_DATA:
-        // ARQ sequence check
-        if (seq != g_rx_next) {
-            uint8_t ahead = (uint8_t)(seq - g_rx_next);
-            if (ahead < 128u) {
-                // seq is genuinely ahead — gap; request the missing frame
-                LOG("TB_DATA gap seq=%u expected=%u", seq, g_rx_next);
-                enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
-            } else {
-                // seq is behind — retransmit of already-acked frame; re-ACK
-                enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-            }
-            return;
-        }
         if (id >= MAX_CONNS) {
             LOG("TB_DATA bad id=%u drop %zu bytes", id, plen);
             g_rx_next++;
@@ -545,7 +570,7 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             LOG("TB_DATA conn %u closed drop %zu bytes", id, plen);
             g_rx_next++;
             enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-            enqueue_ctrl(TB_CLOSE, id, 0, NULL, 0);
+            enqueue_reliable(TB_CLOSE, id, NULL, 0);
             return;
         }
         if (plen == 0) {
@@ -556,8 +581,8 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         conn_drain(&g_conns[id]);
         if (conn_space(&g_conns[id]) < plen) {
             LOG("conn %d txbuf full, NAK seq=%u", id, seq);
-            enqueue_ctrl(TB_PAUSE, id, 0, NULL, 0);
-            g_conns[id].pause_sent = true;
+            if (enqueue_reliable(TB_PAUSE, id, NULL, 0))
+                g_conns[id].pause_sent = true;
             enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
             return;
         }
@@ -570,29 +595,37 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             conn_t *c = &g_conns[id];
             uint32_t avail = conn_avail(c);
             if (!c->pause_sent && avail > CONN_HIGH_WATER) {
-                enqueue_ctrl(TB_PAUSE, id, 0, NULL, 0);
-                c->pause_sent = true;
+                if (enqueue_reliable(TB_PAUSE, id, NULL, 0))
+                    c->pause_sent = true;
             } else if (c->pause_sent && avail < CONN_LOW_WATER) {
-                enqueue_ctrl(TB_RESUME, id, 0, NULL, 0);
-                c->pause_sent = false;
+                if (enqueue_reliable(TB_RESUME, id, NULL, 0))
+                    c->pause_sent = false;
             }
         }
         return;
 
     case TB_CLOSE:
         if (id < MAX_CONNS) conn_close(id, false);
+        g_rx_next++;
+        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
         return;
 
     case TB_PAUSE:
-        if (id >= MAX_CONNS || g_conns[id].fd < 0) return;
-        g_conns[id].flow_paused = true;
-        conn_epoll_update(&g_conns[id]);
+        if (id < MAX_CONNS && g_conns[id].fd >= 0) {
+            g_conns[id].flow_paused = true;
+            conn_epoll_update(&g_conns[id]);
+        }
+        g_rx_next++;
+        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
         return;
 
     case TB_RESUME:
-        if (id >= MAX_CONNS || g_conns[id].fd < 0) return;
-        g_conns[id].flow_paused = false;
-        conn_epoll_update(&g_conns[id]);
+        if (id < MAX_CONNS && g_conns[id].fd >= 0) {
+            g_conns[id].flow_paused = false;
+            conn_epoll_update(&g_conns[id]);
+        }
+        g_rx_next++;
+        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
         return;
 
     default: return;
@@ -690,7 +723,11 @@ static void listener_accept(void) {
     g_conns[id].paused    = g_link.paused;
     g_conns[id].arq_paused = g_arq_paused;
     conn_epoll_update(&g_conns[id]);
-    enqueue_ctrl(TB_OPEN, (uint8_t)id, 0, NULL, 0);
+    if (!enqueue_reliable(TB_OPEN, (uint8_t)id, NULL, 0)) {
+        LOG("conn %d: unable to queue OPEN", id);
+        conn_close(id, false);
+        return;
+    }
     LOG("conn %d: accepted", id);
 }
 
@@ -710,7 +747,7 @@ static void conn_on_readable(int id) {
     while (off < (size_t)n) {
         size_t chunk = (size_t)n - off;
         if (chunk > MAX_PAYLOAD) chunk = MAX_PAYLOAD;
-        if (!enqueue_data((uint8_t)id, buf + off, chunk)) break;
+        if (!enqueue_reliable(TB_DATA, (uint8_t)id, buf + off, chunk)) break;
         off += chunk;
     }
     if (lk_avail() > LINK_HIGH_WATER) pause_all_conns();
@@ -829,8 +866,8 @@ static void run(void) {
                 if (c->fd >= 0 && (ev & EPOLLOUT)) {
                     conn_drain(c);
                     if (c->pause_sent && conn_avail(c) < CONN_LOW_WATER) {
-                        enqueue_ctrl(TB_RESUME, (uint8_t)id, 0, NULL, 0);
-                        c->pause_sent = false;
+                        if (enqueue_reliable(TB_RESUME, (uint8_t)id, NULL, 0))
+                            c->pause_sent = false;
                     }
                     conn_epoll_update(c);
                 }

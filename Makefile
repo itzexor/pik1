@@ -108,7 +108,11 @@ toolchain: \
 	$(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 
 # ── Install targets ───────────────────────────────────────────────────────────
-install-k1: $(BUILD)/pik1d.mipsel $(BUILD)/tcpbridge.mipsel
+install-k1:
+	@test -x $(BUILD)/pik1d.mipsel || \
+		{ echo "Missing $(BUILD)/pik1d.mipsel; run 'make mipsel' first"; exit 1; }
+	@test -x $(BUILD)/tcpbridge.mipsel || \
+		{ echo "Missing $(BUILD)/tcpbridge.mipsel; run 'make mipsel' first"; exit 1; }
 	install -d $(K1_DIR)
 	install -m 755 $(BUILD)/pik1d.mipsel    $(K1_DIR)/pik1d
 	install -m 755 $(BUILD)/tcpbridge.mipsel $(K1_DIR)/tcpbridge
@@ -130,7 +134,11 @@ uninstall-k1:
 		fi; \
 	done
 
-install-pi: $(BUILD)/pik1d.aarch64 $(BUILD)/tcpbridge.aarch64
+install-pi:
+	@test -x $(BUILD)/pik1d.aarch64 || \
+		{ echo "Missing $(BUILD)/pik1d.aarch64; run 'make aarch64' first"; exit 1; }
+	@test -x $(BUILD)/tcpbridge.aarch64 || \
+		{ echo "Missing $(BUILD)/tcpbridge.aarch64; run 'make aarch64' first"; exit 1; }
 	$(SUDO) install -d $(PI_DIR)
 	$(SUDO) install -m 755 $(BUILD)/pik1d.aarch64     $(PI_DIR)/pik1d
 	$(SUDO) install -m 755 $(BUILD)/tcpbridge.aarch64  $(PI_DIR)/tcpbridge
