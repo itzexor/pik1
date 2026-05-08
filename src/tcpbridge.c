@@ -1,9 +1,11 @@
-// src/tcpbridge.c — multi-connection TCP-over-serial bridge with ARQ
-// Wire protocol: COBS + CRC32, frame layout: [type:1][conn_id:1][seq:1][payload][crc32:4]
-// OPEN/DATA/CLOSE/PAUSE/RESUME are sequenced and retransmitted with a small ARQ window.
+// src/tcpbridge.c — multi-connection TCP-over-serial bridge
+// Wire protocol: COBS + CRC32, frame layout:
+//   [type:1][conn_id:1][seq_le:2][payload][crc32_le:4]
+// Sequencing is detection-only: any reliable-frame gap is treated as link failure.
 // Runs on ttyGS1 (K1C) / ttyACM1 (Pi).
 
 #include "nanocobs/cobs.h"
+#include "util.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -18,7 +20,6 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,32 +32,30 @@
 #define TB_CLOSE  0x22u
 #define TB_PAUSE  0x23u
 #define TB_RESUME 0x24u
-#define TB_ACK    0x30u  // ARQ ack:  seq field = reliable frame successfully received
-#define TB_NAK    0x31u  // ARQ nak:  seq field = next reliable frame expected
 
-// ── sizing ────────────────────────────────────────────────────────────────────
-#define MAX_CONNS        16
-#define MAX_PAYLOAD      4088
-#define FRAME_DEC_MAX    (3 + MAX_PAYLOAD + 4)   // type + conn_id + seq + payload + crc32
-#define FRAME_ENC_MAX    COBS_ENCODE_MAX(FRAME_DEC_MAX)
+// ── sizing / pacing ───────────────────────────────────────────────────────────
+#define MAX_CONNS         16
+#define MAX_PAYLOAD       2032
+#define FRAME_DEC_MAX     (4 + MAX_PAYLOAD + 4)  // type + conn + seq16 + payload + crc32
+#define FRAME_ENC_MAX     COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
-#define CONN_RING_CAP    (1u << 18)               // 256 KB per connection
-#define CONN_RING_MASK   (CONN_RING_CAP - 1u)
-#define CONN_HIGH_WATER  (64u  * 1024u)
-#define CONN_LOW_WATER   (16u  * 1024u)
-#define LINK_RING_CAP    (1u << 17)               // 128 KB serial TX ring
-#define LINK_RING_MASK   (LINK_RING_CAP - 1u)
-#define LINK_HIGH_WATER  (32u  * 1024u)
-#define LINK_LOW_WATER   (16u  * 1024u)
-#define LINK_RX_CAP      (1u << 14)               // 16 KB serial RX buffer
+#define CONN_RING_CAP     (1u << 18)             // 256 KB per connection
+#define CONN_RING_MASK    (CONN_RING_CAP - 1u)
+#define CONN_HIGH_WATER   (64u  * 1024u)
+#define CONN_LOW_WATER    (16u  * 1024u)
 
-#define ARQ_WINDOW       8                        // max unacked DATA frames in flight
-#define ARQ_TIMEOUT_MS   200                      // retransmit oldest unacked after this
+#define LINK_TXQ_CAP      64u                     // ~128 KB of encoded frames
+#define LINK_TX_HIGH      (32u  * 1024u)
+#define LINK_TX_LOW       (8u   * 1024u)
+#define LINK_RX_CAP       (1u << 17)              // 128 KB serial RX staging
+#define LINK_WRITE_BUDGET 4096u
+#define LINK_TX_RATE_BPS  6000000u
+#define LINK_TX_BURST     4096u
 
-#define PING_IDLE_MS    3000
-#define LINK_DEAD_MS    10000
-#define RECONNECT_MIN   500
-#define RECONNECT_MAX   8000
+#define PING_IDLE_MS      3000
+#define LINK_DEAD_MS      10000
+#define RECONNECT_MIN     500
+#define RECONNECT_MAX     8000
 
 // ── types ─────────────────────────────────────────────────────────────────────
 typedef struct {
@@ -64,21 +63,35 @@ typedef struct {
     uint32_t epev;
     uint8_t  txbuf[CONN_RING_CAP];
     uint32_t tx_head, tx_tail;
-    bool     paused;       // link TX ring high-water
+    bool     paused;       // local serial TX queue high-water
     bool     flow_paused;  // remote sent TB_PAUSE
     bool     pause_sent;   // we sent TB_PAUSE
-    bool     arq_paused;   // ARQ window full
 } conn_t;
+
+typedef struct {
+    uint8_t  enc[FRAME_ENC_MAX + 1];
+    size_t   len;
+    size_t   pos;
+} tx_frame_t;
 
 typedef struct {
     int      fd;
     bool     up;
     bool     paused;
     uint32_t epev;
-    uint8_t  txbuf[LINK_RING_CAP];
-    uint32_t tx_head, tx_tail;
+
+    tx_frame_t txq[LINK_TXQ_CAP];
+    uint32_t   tx_head, tx_tail, tx_count;
+    uint32_t   tx_bytes;
+    uint32_t   tx_tokens;
+    int64_t    tx_token_ms;
+
     uint8_t  rxbuf[LINK_RX_CAP];
     size_t   rxbuf_len;
+
+    uint16_t tx_seq;
+    uint16_t rx_seq;
+
     int64_t  last_tx_ms;
     int64_t  last_rx_ms;
     int64_t  reconnect_at;
@@ -86,33 +99,24 @@ typedef struct {
     char     dev[128];
 } link_t;
 
-typedef struct {
-    uint8_t  enc[FRAME_ENC_MAX + 2];  // encoded frame including delimiter
-    size_t   enc_len;
-    bool     used;
-    int64_t  sent_at_ms;
-} arq_slot_t;
-
 // ── globals ───────────────────────────────────────────────────────────────────
-static conn_t     g_conns[MAX_CONNS];
-static link_t     g_link;
-static int        g_listen_fd  = -1;
-static int        g_epfd       = -1;
-static bool       g_is_listener;
-static char       g_fwd_host[64];
-static int        g_fwd_port;
-
-// ARQ TX state (sender)
-static arq_slot_t g_arq[ARQ_WINDOW]; // indexed by seq % ARQ_WINDOW
-static uint8_t    g_tx_seq  = 0;     // next seq to assign
-static uint8_t    g_tx_base = 0;     // oldest unACKed seq
-// ARQ RX state (receiver)
-static uint8_t    g_rx_next = 0;     // next expected incoming DATA seq
-// window-full pause
-static bool       g_arq_paused = false;
+static conn_t g_conns[MAX_CONNS];
+static link_t g_link;
+static int    g_listen_fd = -1;
+static int    g_epfd      = -1;
+static bool   g_is_listener;
+static char   g_fwd_host[64];
+static int    g_fwd_port;
 
 static int g_link_tag;
 static int g_listen_tag;
+
+static uint64_t g_rx_frames;
+static uint64_t g_tx_frames;
+static uint64_t g_rx_reads;
+static uint64_t g_rx_bytes;
+static uint64_t g_tx_writes;
+static uint64_t g_tx_bytes;
 
 // ── logging ───────────────────────────────────────────────────────────────────
 static void log_msg(const char *fmt, ...) {
@@ -122,9 +126,9 @@ static void log_msg(const char *fmt, ...) {
     fputc('\n', stderr);
 }
 #define LOG(...) log_msg(__VA_ARGS__)
-#define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while(0)
+#define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
 
-// ── time ──────────────────────────────────────────────────────────────────────
+// ── time / parsing ────────────────────────────────────────────────────────────
 static int64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -140,21 +144,6 @@ static bool parse_port(const char *s, int *out) {
     return true;
 }
 
-// ── CRC32 ─────────────────────────────────────────────────────────────────────
-static uint32_t crc32_table[256];
-static void crc32_init(void) {
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; j++) c = (c >> 1) ^ (0xEDB88320u & -(c & 1u));
-        crc32_table[i] = c;
-    }
-}
-static uint32_t crc32(const uint8_t *p, size_t n) {
-    uint32_t c = 0xFFFFFFFFu;
-    while (n--) c = (c >> 8) ^ crc32_table[(c ^ *p++) & 0xFF];
-    return c ^ 0xFFFFFFFFu;
-}
-
 // ── epoll helpers ─────────────────────────────────────────────────────────────
 static void ep_set(int fd, uint32_t ev, void *tag) {
     struct epoll_event e = { .events = ev, .data.ptr = tag };
@@ -162,6 +151,11 @@ static void ep_set(int fd, uint32_t ev, void *tag) {
         epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &e);
 }
 static void ep_del(int fd) { epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, NULL); }
+
+// ── forward decls ─────────────────────────────────────────────────────────────
+static void link_close(int64_t now);
+static bool enqueue_frame(uint8_t type, uint8_t conn_id,
+                          const uint8_t *payload, size_t plen);
 
 // ── connection ring helpers ───────────────────────────────────────────────────
 static uint32_t conn_avail(const conn_t *c) { return c->tx_tail - c->tx_head; }
@@ -190,46 +184,12 @@ static void conn_drain(conn_t *c) {
 
 static void conn_epoll_update(conn_t *c) {
     if (c->fd < 0) return;
-    uint32_t want = ((!c->paused && !c->flow_paused && !c->arq_paused) ? EPOLLIN : 0u)
+    uint32_t want = ((!c->paused && !c->flow_paused) ? EPOLLIN : 0u)
                   | (conn_avail(c) ? EPOLLOUT : 0u);
     if (want == c->epev) return;
     c->epev = want;
     if (want) ep_set(c->fd, want, c);
     else      ep_del(c->fd);
-}
-
-// ── link ring helpers ─────────────────────────────────────────────────────────
-static uint32_t lk_avail(void) { return g_link.tx_tail - g_link.tx_head; }
-static uint32_t lk_space(void) { return LINK_RING_CAP - lk_avail(); }
-
-static bool lk_push(const uint8_t *src, size_t len) {
-    if (lk_space() < (uint32_t)len) return false;
-    for (size_t i = 0; i < len; i++)
-        g_link.txbuf[g_link.tx_tail++ & LINK_RING_MASK] = src[i];
-    return true;
-}
-
-static void lk_drain(int64_t now) {
-    link_t *lk = &g_link;
-    while (lk_avail()) {
-        uint32_t off    = lk->tx_head & LINK_RING_MASK;
-        uint32_t contig = LINK_RING_CAP - off;
-        uint32_t avail  = lk_avail();
-        size_t   n      = avail < contig ? avail : contig;
-        ssize_t  w      = write(lk->fd, lk->txbuf + off, n);
-        if (w <= 0) {
-            if (w < 0 && errno != EAGAIN && errno != EINTR)
-                LOG("link write: %s", strerror(errno));
-            break;
-        }
-        lk->tx_head += (uint32_t)w;
-        lk->last_tx_ms = now;
-    }
-    uint32_t want = EPOLLIN | (lk_avail() ? EPOLLOUT : 0u);
-    if (want != lk->epev) {
-        lk->epev = want;
-        ep_set(lk->fd, want, &g_link_tag);
-    }
 }
 
 // ── flow control ──────────────────────────────────────────────────────────────
@@ -253,151 +213,123 @@ static void resume_all_conns(void) {
     }
 }
 
-// ── ARQ window pause/resume ───────────────────────────────────────────────────
-static void arq_pause_conns(void) {
-    if (g_arq_paused) return;
-    g_arq_paused = true;
-    for (int i = 0; i < MAX_CONNS; i++) {
-        if (g_conns[i].fd < 0) continue;
-        g_conns[i].arq_paused = true;
-        conn_epoll_update(&g_conns[i]);
-    }
-}
-
-static void arq_resume_conns(void) {
-    if (!g_arq_paused) return;
-    g_arq_paused = false;
-    for (int i = 0; i < MAX_CONNS; i++) {
-        if (g_conns[i].fd < 0) continue;
-        g_conns[i].arq_paused = false;
-        conn_epoll_update(&g_conns[i]);
-    }
-}
-
-// ── ARQ retransmit / ack / nak ────────────────────────────────────────────────
+// ── link TX frame queue / pacing ──────────────────────────────────────────────
 static bool frame_is_reliable(uint8_t type) {
     return type == TB_OPEN || type == TB_DATA || type == TB_CLOSE ||
            type == TB_PAUSE || type == TB_RESUME;
 }
 
-static void lk_arm_epollout(void) {
-    if (!(g_link.epev & EPOLLOUT) && g_link.fd >= 0) {
-        g_link.epev |= EPOLLOUT;
-        ep_set(g_link.fd, g_link.epev, &g_link_tag);
+static void lk_refill_tokens(int64_t now) {
+    link_t *lk = &g_link;
+    if (!lk->tx_token_ms) lk->tx_token_ms = now;
+    int64_t elapsed = now - lk->tx_token_ms;
+    if (elapsed <= 0) return;
+    uint64_t add = (uint64_t)elapsed * LINK_TX_RATE_BPS / 1000u;
+    if (!add) return;
+    uint64_t tokens = (uint64_t)lk->tx_tokens + add;
+    lk->tx_tokens = tokens > LINK_TX_BURST ? LINK_TX_BURST : (uint32_t)tokens;
+    lk->tx_token_ms = now;
+}
+
+static void lk_update_epoll(void) {
+    link_t *lk = &g_link;
+    if (lk->fd < 0) return;
+    uint32_t want = EPOLLIN | ((lk->tx_count && lk->tx_tokens) ? EPOLLOUT : 0u);
+    if (want != lk->epev) {
+        lk->epev = want;
+        ep_set(lk->fd, want, &g_link_tag);
     }
 }
 
-static void arq_retransmit_from(uint8_t seq, int64_t now) {
-    uint8_t end = g_tx_seq;
-    for (uint8_t s = seq; s != end; s++) {
-        arq_slot_t *slot = &g_arq[s % ARQ_WINDOW];
-        if (!slot->used) continue;
-        if (!lk_push(slot->enc, slot->enc_len)) {
-            LOG("arq: TX ring full during retransmit seq=%u", s);
+static bool lk_queue_encoded(const uint8_t *enc, size_t enc_len) {
+    link_t *lk = &g_link;
+    if (lk->tx_count >= LINK_TXQ_CAP) return false;
+    tx_frame_t *f = &lk->txq[lk->tx_tail];
+    memcpy(f->enc, enc, enc_len);
+    f->len = enc_len;
+    f->pos = 0;
+    lk->tx_tail = (lk->tx_tail + 1u) % LINK_TXQ_CAP;
+    lk->tx_count++;
+    lk->tx_bytes += (uint32_t)enc_len;
+    g_tx_frames++;
+    lk_update_epoll();
+    return true;
+}
+
+static void lk_drain(int64_t now) {
+    link_t *lk = &g_link;
+    lk_refill_tokens(now);
+
+    uint32_t budget = LINK_WRITE_BUDGET;
+    if (budget > lk->tx_tokens) budget = lk->tx_tokens;
+
+    while (lk->tx_count && budget) {
+        tx_frame_t *f = &lk->txq[lk->tx_head];
+        size_t n = f->len - f->pos;
+        if (n > budget) n = budget;
+        ssize_t w = write(lk->fd, f->enc + f->pos, n);
+        if (w <= 0) {
+            if (w < 0 && errno != EAGAIN && errno != EINTR) {
+                LOG("link write: %s", strerror(errno));
+                link_close(now);
+            }
             break;
         }
-        slot->sent_at_ms = now;
+        f->pos += (size_t)w;
+        lk->tx_tokens -= (uint32_t)w;
+        budget -= (uint32_t)w;
+        lk->last_tx_ms = now;
+        g_tx_writes++;
+        g_tx_bytes += (uint64_t)w;
+
+        if (f->pos == f->len) {
+            lk->tx_bytes -= (uint32_t)f->len;
+            lk->tx_head = (lk->tx_head + 1u) % LINK_TXQ_CAP;
+            lk->tx_count--;
+        }
     }
-    lk_arm_epollout();
+    lk_update_epoll();
 }
 
-static void arq_ack(uint8_t seq) {
-    uint8_t window = (uint8_t)(g_tx_seq - g_tx_base);
-    if (window == 0) return;
-    // seq must be within [g_tx_base, g_tx_seq)
-    if ((uint8_t)(seq - g_tx_base) >= window) return;
-    uint8_t new_base = (uint8_t)(seq + 1);
-    while (g_tx_base != new_base) {
-        g_arq[g_tx_base % ARQ_WINDOW].used = false;
-        g_tx_base++;
-    }
-    if ((uint8_t)(g_tx_seq - g_tx_base) < ARQ_WINDOW)
-        arq_resume_conns();
-}
+// ── frame encode / enqueue ────────────────────────────────────────────────────
+static bool enqueue_frame(uint8_t type, uint8_t conn_id,
+                          const uint8_t *payload, size_t plen) {
+    link_t *lk = &g_link;
+    if (plen > MAX_PAYLOAD) return false;
+    if (type != TB_HELLO && !lk->up && lk->fd >= 0) return true;
+    if (type == TB_HELLO && lk->tx_count) return true;
+    if ((type == TB_PING || type == TB_PONG) && lk->tx_count >= LINK_TXQ_CAP)
+        return true;
 
-static void arq_nak(uint8_t seq, int64_t now) {
-    uint8_t window = (uint8_t)(g_tx_seq - g_tx_base);
-    if (window == 0) return;
-    if ((uint8_t)(seq - g_tx_base) >= window) return;
-    LOG("arq: NAK seq=%u retransmitting %u frames", seq, (uint8_t)(g_tx_seq - seq));
-    arq_retransmit_from(seq, now);
-}
-
-static void arq_tick(int64_t now) {
-    if ((uint8_t)(g_tx_seq - g_tx_base) == 0) return;
-    arq_slot_t *oldest = &g_arq[g_tx_base % ARQ_WINDOW];
-    if (oldest->used && (now - oldest->sent_at_ms) > ARQ_TIMEOUT_MS) {
-        LOG("arq: timeout seq=%u window=%u retransmitting",
-            g_tx_base, (uint8_t)(g_tx_seq - g_tx_base));
-        arq_retransmit_from(g_tx_base, now);
-    }
-}
-
-// ── frame encode ──────────────────────────────────────────────────────────────
-// Encodes [type][conn_id][seq][payload][crc32] into out_enc; returns enc_len or 0.
-static size_t frame_encode(uint8_t type, uint8_t conn_id, uint8_t seq,
-                            const uint8_t *payload, size_t plen,
-                            uint8_t *out_enc, size_t out_cap) {
-    if (plen > MAX_PAYLOAD) return 0;
     static uint8_t dec[FRAME_DEC_MAX];
+    static uint8_t enc[FRAME_ENC_MAX + 1];
+
+    bool reliable = frame_is_reliable(type);
+    uint16_t seq = reliable ? lk->tx_seq : 0;
+
     dec[0] = type;
     dec[1] = conn_id;
-    dec[2] = seq;
-    if (plen) memcpy(dec + 3, payload, plen);
-    uint32_t c = crc32(dec, 3 + plen);
-    dec[3 + plen + 0] = (uint8_t)(c);
-    dec[3 + plen + 1] = (uint8_t)(c >>  8);
-    dec[3 + plen + 2] = (uint8_t)(c >> 16);
-    dec[3 + plen + 3] = (uint8_t)(c >> 24);
+    dec[2] = (uint8_t)seq;
+    dec[3] = (uint8_t)(seq >> 8);
+    if (plen) memcpy(dec + 4, payload, plen);
+
+    uint32_t c = pik_crc32(dec, 4 + plen);
+    dec[4 + plen + 0] = (uint8_t)c;
+    dec[4 + plen + 1] = (uint8_t)(c >> 8);
+    dec[4 + plen + 2] = (uint8_t)(c >> 16);
+    dec[4 + plen + 3] = (uint8_t)(c >> 24);
+
     size_t enc_len = 0;
-    if (cobs_encode(dec, 3 + plen + 4, out_enc, out_cap, &enc_len) != COBS_RET_SUCCESS)
-        return 0;
-    return enc_len;
-}
-
-// ── enqueue_ctrl: unreliable control frames (HELLO, PING, PONG, ACK, NAK)
-// seq is meaningful for ACK/NAK; pass 0 for all others.
-static void enqueue_ctrl(uint8_t type, uint8_t conn_id, uint8_t seq,
-                          const uint8_t *payload, size_t plen) {
-    static uint8_t enc[FRAME_ENC_MAX + 2];
-    size_t enc_len = frame_encode(type, conn_id, seq, payload, plen, enc, sizeof(enc));
-    if (!enc_len) { LOG("encode failed type=0x%02x", type); return; }
-    if (!lk_push(enc, enc_len)) {
-        LOG("link TX full, drop ctrl type=0x%02x", type);
-        return;
-    }
-    lk_arm_epollout();
-}
-
-// ── enqueue_reliable: OPEN, DATA, CLOSE, PAUSE, RESUME with ARQ retransmit
-static bool enqueue_reliable(uint8_t type, uint8_t conn_id,
-                             const uint8_t *payload, size_t plen) {
-    if (!frame_is_reliable(type)) return false;
-    if ((uint8_t)(g_tx_seq - g_tx_base) >= ARQ_WINDOW) {
-        arq_pause_conns();
+    if (cobs_encode(dec, 4 + plen + 4, enc, sizeof(enc), &enc_len) != COBS_RET_SUCCESS) {
+        LOG("encode failed type=0x%02x", type);
         return false;
     }
-    uint8_t     seq  = g_tx_seq;
-    arq_slot_t *slot = &g_arq[seq % ARQ_WINDOW];
-
-    slot->enc_len = frame_encode(type, conn_id, seq, payload, plen,
-                                  slot->enc, sizeof(slot->enc));
-    if (!slot->enc_len) {
-        LOG("encode failed reliable type=0x%02x conn=%u", type, conn_id);
+    if (!lk_queue_encoded(enc, enc_len)) {
+        LOG("link TX frame queue full, drop type=0x%02x", type);
         return false;
     }
-
-    slot->used       = true;
-    slot->sent_at_ms = now_ms();
-    g_tx_seq++;
-
-    if (!lk_push(slot->enc, slot->enc_len))
-        LOG("arq: TX ring full, seq=%u will retransmit on timeout", seq);
-    else
-        lk_arm_epollout();
-
-    if ((uint8_t)(g_tx_seq - g_tx_base) >= ARQ_WINDOW)
-        arq_pause_conns();
+    if (reliable)
+        lk->tx_seq++;
     return true;
 }
 
@@ -412,9 +344,8 @@ static void conn_close(int id, bool send_close) {
     c->paused = false;
     c->flow_paused = false;
     c->pause_sent = false;
-    c->arq_paused = false;
     c->tx_head = c->tx_tail = 0;
-    if (send_close && !enqueue_reliable(TB_CLOSE, (uint8_t)id, NULL, 0))
+    if (send_close && !enqueue_frame(TB_CLOSE, (uint8_t)id, NULL, 0))
         LOG("conn %d: unable to queue CLOSE", id);
     LOG("conn %d closed", id);
 }
@@ -424,26 +355,54 @@ static void close_all_conns(bool send_close) {
         if (g_conns[i].fd >= 0) conn_close(i, send_close);
 }
 
-// ── TCP connect (Pi forwarder mode) ──────────────────────────────────────────
+// ── fatal link corruption diagnostics ─────────────────────────────────────────
+static void link_fail_frame(const char *reason, const uint8_t *enc, size_t enc_len,
+                            int64_t now) {
+    LOG("link failure: %s enc_len=%zu first=0x%02x rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu tx_writes=%llu tx_bytes=%llu",
+        reason, enc_len, enc_len ? enc[0] : 0,
+        (unsigned long long)g_rx_frames,
+        (unsigned long long)g_tx_frames,
+        (unsigned long long)g_rx_reads,
+        (unsigned long long)g_rx_bytes,
+        (unsigned long long)g_tx_writes,
+        (unsigned long long)g_tx_bytes);
+    size_t head = enc_len < 64 ? enc_len : 64;
+    util_log_hex_sample(log_msg, "badframe head", enc, head);
+    if (enc_len > head) {
+        size_t tail = enc_len < 64 ? enc_len : 64;
+        LOG("badframe tail starts at +%zu", enc_len - tail);
+        util_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
+    }
+    link_close(now);
+}
+
+static void link_fail_text(const char *reason, int64_t now) {
+    LOG("link failure: %s rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu",
+        reason,
+        (unsigned long long)g_rx_frames,
+        (unsigned long long)g_tx_frames,
+        (unsigned long long)g_rx_reads,
+        (unsigned long long)g_rx_bytes);
+    link_close(now);
+}
+
+// ── TCP connect (Pi forwarder mode) ───────────────────────────────────────────
 static int tcp_connect_to_target(void) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", g_fwd_port);
-    if (getaddrinfo(g_fwd_host, port_str, &hints, &res) != 0 || !res) return -1;
+    char port[8];
+    snprintf(port, sizeof(port), "%d", g_fwd_port);
+    if (getaddrinfo(g_fwd_host, port, &hints, &res) != 0 || !res) return -1;
 
     int fd = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
                     ai->ai_protocol);
         if (fd < 0) continue;
-
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
         if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0 || errno == EINPROGRESS)
             break;
-
         close(fd);
         fd = -1;
     }
@@ -451,90 +410,75 @@ static int tcp_connect_to_target(void) {
     return fd;
 }
 
-// ── link frame dispatch ───────────────────────────────────────────────────────
-static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
+// ── frame dispatch ────────────────────────────────────────────────────────────
+static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
     static uint8_t dec[FRAME_DEC_MAX];
     size_t dec_len = 0;
+    g_rx_frames++;
 
     if (enc_len > (size_t)(FRAME_ENC_MAX + 1)) {
-        LOG("frame merge: enc_len=%zu (max=%d) — NAK seq=%u",
-            enc_len, FRAME_ENC_MAX + 1, g_rx_next);
-        if (g_link.up) enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
-        return;
+        link_fail_frame("oversized frame", enc, enc_len, now);
+        return false;
     }
+
     cobs_ret_t cr = cobs_decode(enc, enc_len, dec, sizeof(dec), &dec_len);
     if (cr != COBS_RET_SUCCESS) {
-        LOG("COBS decode failed enc_len=%zu err=%s first=0x%02x — NAK seq=%u",
-            enc_len,
-            cr == COBS_RET_ERR_BAD_PAYLOAD ? "BAD_PAYLOAD" :
-            cr == COBS_RET_ERR_EXHAUSTED   ? "EXHAUSTED"   : "BAD_ARG",
-            enc[0], g_rx_next);
-        if (g_link.up) enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
-        return;
+        link_fail_frame(cr == COBS_RET_ERR_BAD_PAYLOAD ? "COBS bad payload" :
+                        cr == COBS_RET_ERR_EXHAUSTED   ? "COBS exhausted" :
+                                                         "COBS bad arg",
+                        enc, enc_len, now);
+        return false;
     }
-    if (dec_len < 7) return;  // min: type + conn_id + seq + crc32
+    if (dec_len < 8) {
+        link_fail_frame("short frame", enc, enc_len, now);
+        return false;
+    }
 
     uint8_t        type    = dec[0];
     uint8_t        id      = dec[1];
-    uint8_t        seq     = dec[2];
-    size_t         plen    = dec_len - 7;
-    const uint8_t *payload = dec + 3;
+    uint16_t       seq     = (uint16_t)dec[2] | (uint16_t)dec[3] << 8;
+    size_t         plen    = dec_len - 8;
+    const uint8_t *payload = dec + 4;
 
-    uint32_t got = (uint32_t)dec[dec_len-4] | (uint32_t)dec[dec_len-3]<<8
-                 | (uint32_t)dec[dec_len-2]<<16 | (uint32_t)dec[dec_len-1]<<24;
-    if (crc32(dec, 3 + plen) != got) {
-        LOG("CRC mismatch enc_len=%zu — NAK seq=%u", enc_len, g_rx_next);
-        if (g_link.up) enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
-        return;
+    uint32_t got = (uint32_t)dec[dec_len - 4]
+                 | (uint32_t)dec[dec_len - 3] << 8
+                 | (uint32_t)dec[dec_len - 2] << 16
+                 | (uint32_t)dec[dec_len - 1] << 24;
+    if (pik_crc32(dec, 4 + plen) != got) {
+        link_fail_frame("CRC mismatch", enc, enc_len, now);
+        return false;
     }
 
-    if (frame_is_reliable(type) && seq != g_rx_next) {
-        uint8_t ahead = (uint8_t)(seq - g_rx_next);
-        if (ahead < 128u) {
-            LOG("reliable gap type=0x%02x seq=%u expected=%u",
-                type, seq, g_rx_next);
-            enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
-        } else {
-            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
+    if (frame_is_reliable(type)) {
+        if (seq != g_link.rx_seq) {
+            LOG("link failure: seq gap type=0x%02x seq=%u expected=%u",
+                type, seq, g_link.rx_seq);
+            link_close(now);
+            return false;
         }
-        return;
+        g_link.rx_seq++;
     }
 
     switch (type) {
     case TB_HELLO:
         if (!g_link.up) {
             g_link.up = true;
+            g_link.rx_seq = 0;
+            g_link.tx_seq = 0;
             LOG("link up");
-            enqueue_ctrl(TB_HELLO, 0, 0, NULL, 0);
+            enqueue_frame(TB_HELLO, 0, NULL, 0);
         }
-        return;
+        return true;
     case TB_PING:
-        enqueue_ctrl(TB_PONG, 0, 0, NULL, 0);
-        return;
+        enqueue_frame(TB_PONG, 0, NULL, 0);
+        return true;
     case TB_PONG:
-        return;
-
-    case TB_ACK:
-        arq_ack(seq);
-        return;
-
-    case TB_NAK:
-        arq_nak(seq, now);
-        return;
+        return true;
 
     case TB_OPEN:
-        if (g_is_listener) {
-            LOG("unexpected OPEN in listener mode id=%u", id);
-            g_rx_next++;
-            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-            enqueue_reliable(TB_CLOSE, id, NULL, 0);
-            return;
-        }
-        if (id >= MAX_CONNS) {
-            g_rx_next++;
-            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-            enqueue_reliable(TB_CLOSE, id, NULL, 0);
-            return;
+        if (g_is_listener || id >= MAX_CONNS) {
+            enqueue_frame(TB_CLOSE, id, NULL, 0);
+            return true;
         }
         if (g_conns[id].fd >= 0) conn_close(id, false);
         {
@@ -542,112 +486,122 @@ static void dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             if (fd < 0) {
                 LOG("conn %d: connect to %s:%d failed: %s",
                     id, g_fwd_host, g_fwd_port, strerror(errno));
-                g_rx_next++;
-                enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-                enqueue_reliable(TB_CLOSE, id, NULL, 0);
-                return;
+                enqueue_frame(TB_CLOSE, id, NULL, 0);
+                return true;
             }
-            g_conns[id].fd        = fd;
-            g_conns[id].epev      = 0;
-            g_conns[id].paused    = g_link.paused;
-            g_conns[id].arq_paused = g_arq_paused;
+            g_conns[id].fd = fd;
+            g_conns[id].epev = 0;
+            g_conns[id].paused = g_link.paused;
+            g_conns[id].flow_paused = false;
+            g_conns[id].pause_sent = false;
             conn_epoll_update(&g_conns[id]);
             LOG("conn %d: connected to %s:%d", id, g_fwd_host, g_fwd_port);
         }
-        g_rx_next++;
-        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-        return;
+        return true;
 
     case TB_DATA:
-        if (id >= MAX_CONNS) {
-            LOG("TB_DATA bad id=%u drop %zu bytes", id, plen);
-            g_rx_next++;
-            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-            return;
-        }
-
+        if (id >= MAX_CONNS) return true;
         if (g_conns[id].fd < 0) {
-            LOG("TB_DATA conn %u closed drop %zu bytes", id, plen);
-            g_rx_next++;
-            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-            enqueue_reliable(TB_CLOSE, id, NULL, 0);
-            return;
+            enqueue_frame(TB_CLOSE, id, NULL, 0);
+            return true;
         }
-        if (plen == 0) {
-            g_rx_next++;
-            enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-            return;
-        }
+        if (!plen) return true;
         conn_drain(&g_conns[id]);
         if (conn_space(&g_conns[id]) < plen) {
-            LOG("conn %d txbuf full, NAK seq=%u", id, seq);
-            if (enqueue_reliable(TB_PAUSE, id, NULL, 0))
+            if (!g_conns[id].pause_sent && enqueue_frame(TB_PAUSE, id, NULL, 0))
                 g_conns[id].pause_sent = true;
-            enqueue_ctrl(TB_NAK, 0, g_rx_next, NULL, 0);
-            return;
+            link_fail_text("conn output buffer overflow despite PAUSE", now);
+            return false;
         }
         conn_push(&g_conns[id], payload, plen);
-        g_rx_next++;
-        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
         conn_drain(&g_conns[id]);
-        conn_epoll_update(&g_conns[id]);
         {
             conn_t *c = &g_conns[id];
             uint32_t avail = conn_avail(c);
             if (!c->pause_sent && avail > CONN_HIGH_WATER) {
-                if (enqueue_reliable(TB_PAUSE, id, NULL, 0))
+                if (enqueue_frame(TB_PAUSE, id, NULL, 0))
                     c->pause_sent = true;
             } else if (c->pause_sent && avail < CONN_LOW_WATER) {
-                if (enqueue_reliable(TB_RESUME, id, NULL, 0))
+                if (enqueue_frame(TB_RESUME, id, NULL, 0))
                     c->pause_sent = false;
             }
         }
-        return;
+        conn_epoll_update(&g_conns[id]);
+        return true;
 
     case TB_CLOSE:
         if (id < MAX_CONNS) conn_close(id, false);
-        g_rx_next++;
-        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-        return;
+        return true;
 
     case TB_PAUSE:
         if (id < MAX_CONNS && g_conns[id].fd >= 0) {
             g_conns[id].flow_paused = true;
             conn_epoll_update(&g_conns[id]);
         }
-        g_rx_next++;
-        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-        return;
+        return true;
 
     case TB_RESUME:
         if (id < MAX_CONNS && g_conns[id].fd >= 0) {
             g_conns[id].flow_paused = false;
             conn_epoll_update(&g_conns[id]);
         }
-        g_rx_next++;
-        enqueue_ctrl(TB_ACK, 0, seq, NULL, 0);
-        return;
+        return true;
 
-    default: return;
+    default:
+        return true;
     }
 }
 
-// ── link RX parse ─────────────────────────────────────────────────────────────
-static void link_parse_rx(int64_t now) {
+// ── link RX ───────────────────────────────────────────────────────────────────
+static bool link_parse_rx(int64_t now) {
     link_t *lk = &g_link;
     while (true) {
         uint8_t *delim = memchr(lk->rxbuf, COBS_FRAME_DELIMITER, lk->rxbuf_len);
         if (!delim) break;
         size_t flen = (size_t)(delim - lk->rxbuf);
-        if (flen > 0) dispatch_frame(lk->rxbuf, flen + 1, now);
+        if (flen > 0 && !dispatch_frame(lk->rxbuf, flen + 1, now))
+            return false;
         size_t consumed = flen + 1;
         lk->rxbuf_len -= consumed;
         memmove(lk->rxbuf, lk->rxbuf + consumed, lk->rxbuf_len);
     }
     if (lk->rxbuf_len >= sizeof(lk->rxbuf)) {
-        LOG("link RX overflow, discarding %zu bytes", lk->rxbuf_len);
-        lk->rxbuf_len = 0;
+        link_fail_text("RX buffer full without delimiter", now);
+        return false;
     }
+    return true;
+}
+
+static bool link_read_available(int64_t now) {
+    link_t *lk = &g_link;
+    while (lk->fd >= 0) {
+        size_t space = sizeof(lk->rxbuf) - lk->rxbuf_len;
+        if (!space) {
+            if (!link_parse_rx(now)) return false;
+            space = sizeof(lk->rxbuf) - lk->rxbuf_len;
+            if (!space) {
+                link_fail_text("RX buffer full before read", now);
+                return false;
+            }
+        }
+
+        ssize_t r = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN) return true;
+            link_close(now);
+            return false;
+        }
+        if (r == 0) return true;
+
+        lk->last_rx_ms = now;
+        g_rx_reads++;
+        g_rx_bytes += (uint64_t)r;
+        lk->rxbuf_len += (size_t)r;
+        if (!link_parse_rx(now)) return false;
+        if (lk->tx_count) lk_drain(now);
+    }
+    return false;
 }
 
 // ── link open/close ───────────────────────────────────────────────────────────
@@ -662,15 +616,18 @@ static void link_close(int64_t now) {
     if (lk->up) {
         lk->up = false;
         LOG("link down");
-        close_all_conns(false);
     }
+    close_all_conns(false);
+    lk->rxbuf_len = 0;
+    lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
+    lk->tx_seq = lk->rx_seq = 0;
+    lk->tx_tokens = LINK_TX_BURST;
+    lk->tx_token_ms = now;
+    lk->paused = false;
+
     lk->reconnect_at = now + lk->backoff_ms;
     lk->backoff_ms *= 2;
     if (lk->backoff_ms > RECONNECT_MAX) lk->backoff_ms = RECONNECT_MAX;
-    // Reset ARQ on link drop
-    for (int i = 0; i < ARQ_WINDOW; i++) g_arq[i].used = false;
-    g_tx_seq = g_tx_base = g_rx_next = 0;
-    g_arq_paused = false;
 }
 
 static void link_try_open(int64_t now) {
@@ -680,28 +637,30 @@ static void link_try_open(int64_t now) {
     int fd = open(lk->dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return;
 
-    struct termios t;
-    tcgetattr(fd, &t);
-    cfmakeraw(&t);
-    t.c_iflag |= IGNBRK | IGNPAR;
-    t.c_cflag |= CLOCAL | CREAD;
-    tcsetattr(fd, TCSANOW, &t);
+    if (tty_set_byte_raw(fd) < 0) {
+        LOG("termios setup failed on %s: %s", lk->dev, strerror(errno));
+        close(fd);
+        return;
+    }
 
     lk->fd = fd;
     lk->rxbuf_len = 0;
-    lk->tx_head = lk->tx_tail = 0;
+    lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
+    lk->tx_seq = lk->rx_seq = 0;
     lk->last_rx_ms = lk->last_tx_ms = now;
     lk->up = false;
     lk->paused = false;
     lk->backoff_ms = RECONNECT_MIN;
+    lk->tx_tokens = LINK_TX_BURST;
+    lk->tx_token_ms = now;
     lk->epev = EPOLLIN;
     ep_set(fd, EPOLLIN, &g_link_tag);
 
     LOG("link opened: %s", lk->dev);
-    enqueue_ctrl(TB_HELLO, 0, 0, NULL, 0);
+    enqueue_frame(TB_HELLO, 0, NULL, 0);
 }
 
-// ── K1C accept new TCP connection ─────────────────────────────────────────────
+// ── listener / TCP input ──────────────────────────────────────────────────────
 static void listener_accept(void) {
     struct sockaddr_storage sa;
     socklen_t sl = sizeof(sa);
@@ -718,12 +677,13 @@ static void listener_accept(void) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    g_conns[id].fd        = fd;
-    g_conns[id].epev      = 0;
-    g_conns[id].paused    = g_link.paused;
-    g_conns[id].arq_paused = g_arq_paused;
+    g_conns[id].fd = fd;
+    g_conns[id].epev = 0;
+    g_conns[id].paused = g_link.paused;
+    g_conns[id].flow_paused = false;
+    g_conns[id].pause_sent = false;
     conn_epoll_update(&g_conns[id]);
-    if (!enqueue_reliable(TB_OPEN, (uint8_t)id, NULL, 0)) {
+    if (!enqueue_frame(TB_OPEN, (uint8_t)id, NULL, 0)) {
         LOG("conn %d: unable to queue OPEN", id);
         conn_close(id, false);
         return;
@@ -731,11 +691,13 @@ static void listener_accept(void) {
     LOG("conn %d: accepted", id);
 }
 
-// ── conn readable: read TCP → send TB_DATA ────────────────────────────────────
 static void conn_on_readable(int id) {
     conn_t *c = &g_conns[id];
-    if (lk_avail() >= LINK_HIGH_WATER) { pause_all_conns(); return; }
-    if ((uint8_t)(g_tx_seq - g_tx_base) >= ARQ_WINDOW) { arq_pause_conns(); return; }
+    if (g_link.tx_bytes >= LINK_TX_HIGH || g_link.tx_count >= LINK_TXQ_CAP - 2) {
+        pause_all_conns();
+        return;
+    }
+
     static uint8_t buf[MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
@@ -743,14 +705,10 @@ static void conn_on_readable(int id) {
         conn_close(id, true);
         return;
     }
-    size_t off = 0;
-    while (off < (size_t)n) {
-        size_t chunk = (size_t)n - off;
-        if (chunk > MAX_PAYLOAD) chunk = MAX_PAYLOAD;
-        if (!enqueue_reliable(TB_DATA, (uint8_t)id, buf + off, chunk)) break;
-        off += chunk;
-    }
-    if (lk_avail() > LINK_HIGH_WATER) pause_all_conns();
+    if (!enqueue_frame(TB_DATA, (uint8_t)id, buf, (size_t)n))
+        pause_all_conns();
+    if (g_link.tx_bytes > LINK_TX_HIGH || g_link.tx_count >= LINK_TXQ_CAP - 2)
+        pause_all_conns();
 }
 
 // ── main event loop ───────────────────────────────────────────────────────────
@@ -772,14 +730,15 @@ static void run(void) {
         setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
         struct sockaddr_in6 sa6 = { .sin6_family = AF_INET6,
-                                    .sin6_port   = htons((uint16_t)g_fwd_port) };
-        struct sockaddr_in  sa4 = { .sin_family  = AF_INET,
-                                    .sin_port    = htons((uint16_t)g_fwd_port) };
+                                    .sin6_port = htons((uint16_t)g_fwd_port) };
+        struct sockaddr_in  sa4 = { .sin_family = AF_INET,
+                                    .sin_port = htons((uint16_t)g_fwd_port) };
         if (strcmp(g_fwd_host, "0.0.0.0") == 0 || strcmp(g_fwd_host, "") == 0) {
             sa6.sin6_addr = in6addr_any;
             if (bind(lfd, (struct sockaddr *)&sa6, sizeof(sa6)) < 0) {
                 close(lfd);
                 lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                if (lfd < 0) DIE("listen socket: %s", strerror(errno));
                 setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
                 sa4.sin_addr.s_addr = INADDR_ANY;
                 if (bind(lfd, (struct sockaddr *)&sa4, sizeof(sa4)) < 0)
@@ -789,16 +748,18 @@ static void run(void) {
             if (bind(lfd, (struct sockaddr *)&sa6, sizeof(sa6)) < 0)
                 DIE("bind: %s", strerror(errno));
         } else {
-            inet_pton(AF_INET, g_fwd_host, &sa4.sin_addr);
+            if (inet_pton(AF_INET, g_fwd_host, &sa4.sin_addr) != 1)
+                DIE("bad bind address: %s", g_fwd_host);
             close(lfd);
             lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (lfd < 0) DIE("listen socket: %s", strerror(errno));
             setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
             if (bind(lfd, (struct sockaddr *)&sa4, sizeof(sa4)) < 0)
                 DIE("bind: %s", strerror(errno));
         }
         if (listen(lfd, 16) < 0) DIE("listen: %s", strerror(errno));
         g_listen_fd = lfd;
-        ep_set(g_listen_fd, EPOLLIN, &g_listen_tag);
+        ep_set(lfd, EPOLLIN, &g_listen_tag);
         LOG("listening on port %d", g_fwd_port);
     }
 
@@ -807,19 +768,19 @@ static void run(void) {
 
     for (;;) {
         now = now_ms();
+        if (g_link.fd >= 0) {
+            lk_refill_tokens(now);
+            if (g_link.tx_count && g_link.tx_tokens) lk_drain(now);
+        }
 
         int64_t dl = INT64_MAX;
         if (g_link.fd < 0) {
             dl = g_link.reconnect_at;
-        } else if (g_link.up) {
-            dl = g_link.last_tx_ms + PING_IDLE_MS;
-            // Wake for ARQ timeout
-            if ((uint8_t)(g_tx_seq - g_tx_base) > 0) {
-                arq_slot_t *oldest = &g_arq[g_tx_base % ARQ_WINDOW];
-                if (oldest->used) {
-                    int64_t arq_dl = oldest->sent_at_ms + ARQ_TIMEOUT_MS;
-                    if (arq_dl < dl) dl = arq_dl;
-                }
+        } else {
+            if (g_link.up) dl = g_link.last_tx_ms + PING_IDLE_MS;
+            if (g_link.tx_count && !g_link.tx_tokens) {
+                int64_t tx_dl = now + 1;
+                if (tx_dl < dl) dl = tx_dl;
             }
         }
 
@@ -834,39 +795,27 @@ static void run(void) {
         if (n < 0) { if (errno == EINTR) continue; DIE("epoll_wait: %s", strerror(errno)); }
 
         now = now_ms();
-
         for (int i = 0; i < n; i++) {
-            void    *ptr = evs[i].data.ptr;
-            uint32_t ev  = evs[i].events;
+            void *ptr = evs[i].data.ptr;
+            uint32_t ev = evs[i].events;
 
             if (ptr == &g_link_tag) {
                 if (ev & (EPOLLERR | EPOLLHUP)) { link_close(now); continue; }
                 if (ev & EPOLLIN) {
-                    link_t *lk = &g_link;
-                    size_t space = sizeof(lk->rxbuf) - lk->rxbuf_len;
-                    if (!space) { lk->rxbuf_len = 0; space = sizeof(lk->rxbuf); }
-                    ssize_t r = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
-                    if (r <= 0) {
-                        if (r < 0 && (errno == EAGAIN || errno == EINTR)) goto skip_rx;
-                        link_close(now); continue;
-                    }
-                    lk->last_rx_ms = now;
-                    lk->rxbuf_len += (size_t)r;
-                    link_parse_rx(now);
+                    if (!link_read_available(now)) continue;
                 }
-                skip_rx:
-                if (ev & EPOLLOUT) lk_drain(now);
+                if (g_link.fd >= 0 && (ev & EPOLLOUT)) lk_drain(now);
             } else if (ptr == &g_listen_tag) {
                 listener_accept();
             } else {
-                conn_t *c  = (conn_t *)ptr;
-                int     id = (int)(c - g_conns);
+                conn_t *c = (conn_t *)ptr;
+                int id = (int)(c - g_conns);
                 if (ev & EPOLLERR) { conn_close(id, true); continue; }
-                if (ev & EPOLLIN)  conn_on_readable(id);
+                if (ev & EPOLLIN) conn_on_readable(id);
                 if (c->fd >= 0 && (ev & EPOLLOUT)) {
                     conn_drain(c);
                     if (c->pause_sent && conn_avail(c) < CONN_LOW_WATER) {
-                        if (enqueue_reliable(TB_RESUME, (uint8_t)id, NULL, 0))
+                        if (enqueue_frame(TB_RESUME, (uint8_t)id, NULL, 0))
                             c->pause_sent = false;
                     }
                     conn_epoll_update(c);
@@ -876,26 +825,25 @@ static void run(void) {
         }
 
         now = now_ms();
-
         if (g_link.fd < 0) {
             if (now >= g_link.reconnect_at) link_try_open(now);
         } else if (g_link.up) {
             if ((now - g_link.last_tx_ms) > PING_IDLE_MS)
-                enqueue_ctrl(TB_PING, 0, 0, NULL, 0);
+                enqueue_frame(TB_PING, 0, NULL, 0);
             if ((now - g_link.last_rx_ms) > LINK_DEAD_MS) {
                 LOG("link RX timeout");
                 link_close(now);
-            } else {
-                arq_tick(now);
             }
         } else {
-            if ((now - g_link.last_tx_ms) > 2000)
-                enqueue_ctrl(TB_HELLO, 0, 0, NULL, 0);
+            if (!g_link.tx_count && (now - g_link.last_tx_ms) > 2000)
+                enqueue_frame(TB_HELLO, 0, NULL, 0);
         }
 
-        if (!g_link.paused && lk_avail() > LINK_HIGH_WATER)
+        if (!g_link.paused &&
+            (g_link.tx_bytes > LINK_TX_HIGH || g_link.tx_count >= LINK_TXQ_CAP - 2))
             pause_all_conns();
-        else if (g_link.paused && lk_avail() < LINK_LOW_WATER)
+        else if (g_link.paused &&
+                 g_link.tx_bytes < LINK_TX_LOW && g_link.tx_count < LINK_TXQ_CAP / 2)
             resume_all_conns();
     }
 }
@@ -916,6 +864,7 @@ int main(int argc, char **argv) {
     strncpy(g_link.dev, argv[1], sizeof(g_link.dev) - 1);
     g_link.fd = -1;
     g_link.backoff_ms = RECONNECT_MIN;
+    g_link.tx_tokens = LINK_TX_BURST;
 
     const char *mode = argv[2];
     if (strcmp(mode, "listen") == 0)
@@ -934,7 +883,6 @@ int main(int argc, char **argv) {
     g_fwd_host[hlen] = '\0';
     if (!parse_port(colon + 1, &g_fwd_port)) usage(argv[0]);
 
-    crc32_init();
     LOG("tcpbridge %s %s %s:%d",
         g_link.dev, g_is_listener ? "listen" : "forward",
         g_fwd_host, g_fwd_port);

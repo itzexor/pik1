@@ -8,12 +8,14 @@ BUILD    := build
 
 COBS_SRCS   := src/nanocobs/cobs.c
 COBS_HDRS   := src/nanocobs/cobs.h
+COMMON_SRCS := src/util.c
+COMMON_HDRS := src/util.h
 
-PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(COBS_SRCS)
-PIK1D_HDRS  := src/serialmux.h $(COBS_HDRS)
+PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(COBS_SRCS) $(COMMON_SRCS)
+PIK1D_HDRS  := src/serialmux.h $(COBS_HDRS) $(COMMON_HDRS)
 
-TB_SRCS     := src/tcpbridge.c $(COBS_SRCS)
-TB_HDRS     := $(COBS_HDRS)
+TB_SRCS     := src/tcpbridge.c $(COBS_SRCS) $(COMMON_SRCS)
+TB_HDRS     := $(COBS_HDRS) $(COMMON_HDRS)
 
 # ── Install ───────────────────────────────────────────────────────────────────
 SUDO            ?= sudo

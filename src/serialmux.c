@@ -2,6 +2,7 @@
 
 #include "serialmux.h"
 #include "nanocobs/cobs.h"
+#include "util.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -15,7 +16,6 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -118,25 +118,6 @@ static int64_t now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-// ── CRC32 (poly 0xEDB88320) ───────────────────────────────────────────────────
-static uint32_t crc32_table[256];
-
-static void crc32_init(void) {
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; j++)
-            c = (c >> 1) ^ (0xEDB88320u & -(c & 1u));
-        crc32_table[i] = c;
-    }
-}
-
-static uint32_t crc32_calc(const uint8_t *buf, size_t len) {
-    uint32_t c = 0xFFFFFFFFu;
-    while (len--)
-        c = (c >> 8) ^ crc32_table[(c ^ *buf++) & 0xFF];
-    return c ^ 0xFFFFFFFFu;
-}
-
 // ── epoll helpers ─────────────────────────────────────────────────────────────
 static void ep_set(int fd, uint32_t events, void *ptr) {
     struct epoll_event ev = { .events = events, .data.ptr = ptr };
@@ -226,6 +207,20 @@ static bool lk_drain(link_t *lk) {
 static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len);
 static void link_close(link_t *lk, int64_t now);
 
+static void link_fail_frame(link_t *lk, const char *reason,
+                            const uint8_t *enc, size_t enc_len) {
+    LOG("link failure: %s enc_len=%zu first=0x%02x", reason, enc_len,
+        enc_len ? enc[0] : 0);
+    size_t head = enc_len < 64 ? enc_len : 64;
+    util_log_hex_sample(log_msg, "badframe head", enc, head);
+    if (enc_len > head) {
+        size_t tail = enc_len < 64 ? enc_len : 64;
+        LOG("badframe tail starts at +%zu", enc_len - tail);
+        util_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
+    }
+    link_close(lk, now_ms());
+}
+
 static bool link_can_queue_frame(const link_t *lk, size_t plen) {
     if (plen > MAX_PAYLOAD) return false;
     return lk_space(lk) >= COBS_ENCODE_MAX(2 + plen + 4);
@@ -245,7 +240,7 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
     dec[1] = ch_id;
     if (plen) memcpy(dec + 2, payload, plen);
 
-    uint32_t crc = crc32_calc(dec, 2 + plen);
+    uint32_t crc = pik_crc32(dec, 2 + plen);
     dec[2 + plen + 0] = (uint8_t)(crc);
     dec[2 + plen + 1] = (uint8_t)(crc >> 8);
     dec[2 + plen + 2] = (uint8_t)(crc >> 16);
@@ -290,31 +285,13 @@ static void set_nonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 }
 
-static int baud_const(int baud) {
-    switch (baud) {
-        case 9600:   return B9600;
-        case 19200:  return B19200;
-        case 38400:  return B38400;
-        case 57600:  return B57600;
-        case 115200: return B115200;
-        case 230400: return B230400;
-        case 460800: return B460800;
-        default:     return -1;
-    }
-}
-
 static int open_serial(const char *path, int baud) {
     int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
-    int bc = baud_const(baud);
-    if (bc < 0) { close(fd); errno = EINVAL; return -1; }
-    struct termios t;
-    tcgetattr(fd, &t);
-    cfmakeraw(&t);
-    cfsetispeed(&t, (speed_t)bc);
-    cfsetospeed(&t, (speed_t)bc);
-    t.c_cflag |= CLOCAL | CREAD;
-    tcsetattr(fd, TCSANOW, &t);
+    if (tty_set_byte_raw_baud(fd, baud) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -654,11 +631,23 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     static uint8_t dec[FRAME_DEC_MAX];
     size_t dec_len = 0;
 
-    if (cobs_decode(enc, enc_len, dec, sizeof(dec), &dec_len) != COBS_RET_SUCCESS) {
-        LOG("COBS decode failed enc_len=%zu", enc_len);
+    if (enc_len > (size_t)(FRAME_ENC_MAX + 1)) {
+        link_fail_frame(lk, "oversized frame", enc, enc_len);
         return;
     }
-    if (dec_len < 6) return;
+
+    cobs_ret_t cr = cobs_decode(enc, enc_len, dec, sizeof(dec), &dec_len);
+    if (cr != COBS_RET_SUCCESS) {
+        link_fail_frame(lk,
+            cr == COBS_RET_ERR_BAD_PAYLOAD ? "COBS bad payload" :
+            cr == COBS_RET_ERR_EXHAUSTED   ? "COBS exhausted" : "COBS bad arg",
+            enc, enc_len);
+        return;
+    }
+    if (dec_len < 6) {
+        link_fail_frame(lk, "short frame", enc, enc_len);
+        return;
+    }
 
     uint8_t        type    = dec[0];
     uint8_t        ch_id   = dec[1];
@@ -669,8 +658,8 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
                  | (uint32_t)dec[dec_len - 3] << 8
                  | (uint32_t)dec[dec_len - 2] << 16
                  | (uint32_t)dec[dec_len - 1] << 24;
-    if (crc32_calc(dec, 2 + plen) != got) {
-        LOG("CRC mismatch type=0x%02x ch=%u dec_len=%zu", type, ch_id, dec_len);
+    if (pik_crc32(dec, 2 + plen) != got) {
+        link_fail_frame(lk, "CRC mismatch", enc, enc_len);
         return;
     }
 
@@ -732,12 +721,12 @@ static void link_try_open(link_t *lk, int64_t now) {
     lk->fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (lk->fd < 0) return;
 
-    struct termios t;
-    tcgetattr(lk->fd, &t);
-    cfmakeraw(&t);
-    t.c_iflag |= IGNBRK | IGNPAR;
-    t.c_cflag |= CLOCAL | CREAD;
-    tcsetattr(lk->fd, TCSANOW, &t);
+    if (tty_set_byte_raw(lk->fd) < 0) {
+        LOG("termios setup failed on %s: %s", dev, strerror(errno));
+        close(lk->fd);
+        lk->fd = -1;
+        return;
+    }
 
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = 0;
@@ -817,7 +806,6 @@ static int64_t link_deadline(const link_t *lk) {
 #define MAX_EPOLL_EVENTS 16
 
 void serialmux_run(const serialmux_config_t *cfg) {
-    crc32_init();
 
     // Load config into globals
     memset(&g_link, 0, sizeof(g_link));
