@@ -1,779 +1,899 @@
+// src/serialmux.c — COBS serial multiplexer, library interface
+
+#include "serialmux.h"
+#include "nanocobs/cobs.h"
+#include "util.h"
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pty.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <errno.h>
-#include <time.h>
-#include <signal.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <termios.h>
 #include <sys/epoll.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
-#include "serialmux.h"
+// ── frame types ───────────────────────────────────────────────────────────────
+#define F_DATA   0x01u
+#define F_FLUSH  0x02u
+#define F_READY  0x03u
+#define F_HELLO  0x05u
+#define F_PING   0x20u
+#define F_PONG   0x21u
 
-/* ── Globals ────────────────────────────────────────────────────────────── */
-uint32_t g_crc32_tbl[256];
-static volatile sig_atomic_t g_stop = 0;
+// ── sizing ────────────────────────────────────────────────────────────────────
+#define MAX_PAYLOAD     4096
 
-/* ── CRC32 ──────────────────────────────────────────────────────────────── */
-void crc32_init(void)
-{
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; k++)
-            c = (c & 1) ? (0xEDB88320U ^ (c >> 1)) : (c >> 1);
-        g_crc32_tbl[i] = c;
-    }
+#define FRAME_DEC_MAX   (2 + MAX_PAYLOAD + 4)
+#define FRAME_ENC_MAX   COBS_ENCODE_MAX(FRAME_DEC_MAX)
+
+#define LINK_RING_CAP   (1u << 20)
+#define LINK_RING_MASK  (LINK_RING_CAP - 1u)
+#define LINK_HIGH_WATER (LINK_RING_CAP / 2)
+#define LINK_LOW_WATER  (LINK_RING_CAP / 4)
+
+#define CHAN_RING_CAP   (1u << 16)
+#define CHAN_RING_MASK  (CHAN_RING_CAP - 1u)
+
+// timing (ms)
+#define RESET_SILENCE_MS  5000
+#define PING_IDLE_TX_MS   3000
+#define LINK_DEAD_RX_MS   10000
+#define RECONNECT_MIN_MS  500
+#define RECONNECT_MAX_MS  8000
+
+// ── types ─────────────────────────────────────────────────────────────────────
+typedef enum { MCU_INIT, MCU_ACTIVE, MCU_RESETTING } mcu_state_t;
+
+typedef struct channel {
+    ch_type_t   type;
+    uint8_t     ch_id;
+    int         fd;
+    bool        paused;
+    uint32_t    epev;
+
+    uint8_t     txbuf[CHAN_RING_CAP];
+    uint32_t    tx_head, tx_tail;
+
+    // MCU
+    char        dev[128];
+    int         baud;
+    mcu_state_t mcu_state;
+    int64_t     last_byte_ms;
+
+    // PTY
+    char        pty_path[128];
+    int         slave_fd;
+} channel_t;
+
+typedef struct {
+    int         fd;
+    bool        up;
+    bool        paused;
+    uint32_t    epev;
+
+    uint8_t     txbuf[LINK_RING_CAP];
+    uint32_t    tx_head, tx_tail;
+
+    uint8_t     rxbuf[FRAME_ENC_MAX + 4];
+    size_t      rxbuf_len;
+
+    int64_t     last_tx_ms;
+    int64_t     last_rx_ms;
+    int64_t     reconnect_deadline;
+    int         reconnect_backoff_ms;
+
+    char        vidpid[16];
+} link_t;
+
+// ── globals ───────────────────────────────────────────────────────────────────
+static link_t    g_link;
+static channel_t g_chans[MAX_CHANNELS];
+static int       g_n_chans;
+static int       g_epfd = -1;
+
+// sentinel pointer for aux_fd epoll registration
+static int g_aux_sentinel;
+
+// ── logging ───────────────────────────────────────────────────────────────────
+static void log_msg(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    fputs("[mux] ", stderr);
+    vfprintf(stderr, fmt, ap); va_end(ap);
+    fputc('\n', stderr);
 }
+#define LOG(...)  log_msg(__VA_ARGS__)
+#define DIE(...)  do { log_msg(__VA_ARGS__); exit(1); } while(0)
 
-/* ── Utilities ──────────────────────────────────────────────────────────── */
-int64_t mono_now_ms(void)
-{
+// ── time ──────────────────────────────────────────────────────────────────────
+static int64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-void log_ts(const char *fmt, ...)
-{
-    time_t t = time(NULL);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    fprintf(stderr, "%02d:%02d:%02d ", tm.tm_hour, tm.tm_min, tm.tm_sec);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
-    fflush(stderr);
+// ── epoll helpers ─────────────────────────────────────────────────────────────
+static void ep_set(int fd, uint32_t events, void *ptr) {
+    struct epoll_event ev = { .events = events, .data.ptr = ptr };
+    if (epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &ev) == -1)
+        epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
 }
 
-int set_nonblock(int fd)
-{
-    int fl = fcntl(fd, F_GETFL);
-    if (fl < 0) return -1;
-    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+static void ep_del(int fd) {
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-void epoll_update(int epfd, int fd, uint32_t events, uint64_t tag, int *in_epoll)
-{
-    if (events == 0) {
-        if (*in_epoll) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-            *in_epoll = 0;
+// ── channel ring helpers ──────────────────────────────────────────────────────
+static uint32_t chan_avail(const channel_t *c) { return c->tx_tail - c->tx_head; }
+static uint32_t chan_space(const channel_t *c) { return CHAN_RING_CAP - chan_avail(c); }
+
+static void chan_push(channel_t *c, const uint8_t *src, size_t len) {
+    for (size_t i = 0; i < len; i++)
+        c->txbuf[c->tx_tail++ & CHAN_RING_MASK] = src[i];
+}
+
+static void chan_drain(channel_t *c) {
+    while (chan_avail(c)) {
+        uint32_t off    = c->tx_head & CHAN_RING_MASK;
+        uint32_t contig = CHAN_RING_CAP - off;
+        uint32_t avail  = chan_avail(c);
+        size_t   n      = avail < contig ? avail : contig;
+        ssize_t  w      = write(c->fd, c->txbuf + off, n);
+        if (w <= 0) {
+            if (w < 0 && errno != EAGAIN && errno != EINTR)
+                LOG("ch%u write: %s", c->ch_id, strerror(errno));
+            break;
         }
+        c->tx_head += (uint32_t)w;
+    }
+}
+
+static void chan_epoll_update(channel_t *c) {
+    if (c->fd < 0) return;
+    uint32_t want = (!c->paused ? EPOLLIN : 0u) | (chan_avail(c) ? EPOLLOUT : 0u);
+    if (want == c->epev) return;
+    c->epev = want;
+    if (want)
+        ep_set(c->fd, want, c);
+    else
+        ep_del(c->fd);
+}
+
+static void chan_pause(channel_t *c)  { if (!c->paused) { c->paused = true;  chan_epoll_update(c); } }
+static void chan_resume(channel_t *c) { if ( c->paused) { c->paused = false; chan_epoll_update(c); } }
+
+// ── link ring helpers ─────────────────────────────────────────────────────────
+static uint32_t lk_avail(const link_t *lk) { return lk->tx_tail - lk->tx_head; }
+static uint32_t lk_space(const link_t *lk) { return LINK_RING_CAP - lk_avail(lk); }
+
+static bool lk_push(link_t *lk, const uint8_t *src, size_t len) {
+    if (lk_space(lk) < (uint32_t)len) return false;
+    for (size_t i = 0; i < len; i++)
+        lk->txbuf[lk->tx_tail++ & LINK_RING_MASK] = src[i];
+    return true;
+}
+
+static bool lk_drain(link_t *lk) {
+    bool wrote = false;
+    while (lk_avail(lk)) {
+        uint32_t off    = lk->tx_head & LINK_RING_MASK;
+        uint32_t contig = LINK_RING_CAP - off;
+        uint32_t avail  = lk_avail(lk);
+        size_t   n      = avail < contig ? avail : contig;
+        ssize_t  w      = write(lk->fd, lk->txbuf + off, n);
+        if (w <= 0) {
+            if (w < 0 && errno != EAGAIN && errno != EINTR)
+                LOG("link write: %s", strerror(errno));
+            break;
+        }
+        lk->tx_head += (uint32_t)w;
+        wrote = true;
+    }
+    uint32_t want = EPOLLIN | (lk_avail(lk) ? EPOLLOUT : 0u);
+    if (want != lk->epev && lk->fd >= 0) {
+        lk->epev = want;
+        ep_set(lk->fd, want, lk);
+    }
+    return wrote;
+}
+
+// ── frame I/O ────────────────────────────────────────────────────────────────
+static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len);
+static void link_close(link_t *lk, int64_t now);
+
+static void link_fail_frame(link_t *lk, const char *reason,
+                            const uint8_t *enc, size_t enc_len) {
+    LOG("link failure: %s enc_len=%zu first=0x%02x", reason, enc_len,
+        enc_len ? enc[0] : 0);
+    size_t head = enc_len < 64 ? enc_len : 64;
+    util_log_hex_sample(log_msg, "badframe head", enc, head);
+    if (enc_len > head) {
+        size_t tail = enc_len < 64 ? enc_len : 64;
+        LOG("badframe tail starts at +%zu", enc_len - tail);
+        util_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
+    }
+    link_close(lk, now_ms());
+}
+
+static bool link_can_queue_frame(const link_t *lk, size_t plen) {
+    if (plen > MAX_PAYLOAD) return false;
+    return lk_space(lk) >= COBS_ENCODE_MAX(2 + plen + 4);
+}
+
+static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
+                           const uint8_t *payload, size_t plen) {
+    if (!lk->up && type != F_HELLO) return;
+    if (plen > MAX_PAYLOAD) return;
+    if (type == F_HELLO && lk_avail(lk) > 0) return;
+    if ((type == F_PING || type == F_PONG) && !link_can_queue_frame(lk, plen)) return;
+
+    static uint8_t dec[FRAME_DEC_MAX];
+    static uint8_t enc[FRAME_ENC_MAX + 1];
+
+    dec[0] = type;
+    dec[1] = ch_id;
+    if (plen) memcpy(dec + 2, payload, plen);
+
+    uint32_t crc = pik_crc32(dec, 2 + plen);
+    dec[2 + plen + 0] = (uint8_t)(crc);
+    dec[2 + plen + 1] = (uint8_t)(crc >> 8);
+    dec[2 + plen + 2] = (uint8_t)(crc >> 16);
+    dec[2 + plen + 3] = (uint8_t)(crc >> 24);
+
+    size_t enc_len = 0;
+    if (cobs_encode(dec, 2 + plen + 4, enc, FRAME_ENC_MAX + 1, &enc_len) != COBS_RET_SUCCESS) {
+        LOG("cobs_encode failed type=0x%02x ch=%u", type, ch_id);
         return;
     }
-    struct epoll_event ev = { .events = events, .data.u64 = tag };
-    if (*in_epoll)
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-    else {
-        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-        *in_epoll = 1;
+
+    if (!lk_push(lk, enc, enc_len)) {
+        LOG("link TX ring full, dropping frame type=0x%02x ch=%u", type, ch_id);
+        return;
+    }
+
+    if (!(lk->epev & EPOLLOUT) && lk->fd >= 0) {
+        lk->epev |= EPOLLOUT;
+        ep_set(lk->fd, lk->epev, lk);
     }
 }
 
-/* ── Serial port open ───────────────────────────────────────────────────── */
-speed_t baud_to_speed(int baud)
-{
-    switch (baud) {
-    case 1200:   return B1200;
-    case 2400:   return B2400;
-    case 4800:   return B4800;
-    case 9600:   return B9600;
-    case 19200:  return B19200;
-    case 38400:  return B38400;
-    case 57600:  return B57600;
-    case 115200: return B115200;
-    case 230400: return B230400;
-    case 460800: return B460800;
-    case 921600: return B921600;
-    default:     return B0;
+static void link_parse_rx(link_t *lk) {
+    while (true) {
+        uint8_t *delim = memchr(lk->rxbuf, COBS_FRAME_DELIMITER, lk->rxbuf_len);
+        if (!delim) break;
+        size_t frame_len = (size_t)(delim - lk->rxbuf);
+        if (frame_len > 0)
+            dispatch_frame(lk, lk->rxbuf, frame_len + 1);
+        size_t consumed = frame_len + 1;
+        lk->rxbuf_len -= consumed;
+        memmove(lk->rxbuf, lk->rxbuf + consumed, lk->rxbuf_len);
+    }
+    if (lk->rxbuf_len >= sizeof(lk->rxbuf)) {
+        LOG("link RX overflow, discarding");
+        lk->rxbuf_len = 0;
     }
 }
 
-int open_serial_fd(const char *dev, int baud)
-{
-    int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+// ── serial port ───────────────────────────────────────────────────────────────
+static void set_nonblock(int fd) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+}
+
+static int open_serial(const char *path, int baud) {
+    int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
-
-    speed_t sp = baud_to_speed(baud);
-    if (sp == B0) { close(fd); errno = EINVAL; return -1; }
-
-    struct termios t;
-    if (tcgetattr(fd, &t) < 0) { close(fd); return -1; }
-    t.c_iflag = 0;
-    t.c_oflag = 0;
-    t.c_cflag = CS8 | CREAD | CLOCAL;
-    t.c_lflag = 0;
-    t.c_cc[VMIN]  = 0;
-    t.c_cc[VTIME] = 0;
-    cfsetispeed(&t, sp);
-    cfsetospeed(&t, sp);
-    if (tcsetattr(fd, TCSAFLUSH, &t) < 0) { close(fd); return -1; }
+    if (tty_set_byte_raw_baud(fd, baud) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
-/* ── USB sysfs discovery ────────────────────────────────────────────────── */
-static int read_sysfs_str(const char *path, char *out, size_t outsz)
-{
+// ── USB sysfs discovery ───────────────────────────────────────────────────────
+#define SYSPATH_MAX 512
+#define MAX_USB_DEVS 16
+
+static bool sysfs_read(const char *path, char *buf, size_t cap) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    ssize_t n = read(fd, out, outsz - 1);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, buf, cap - 1);
     close(fd);
-    if (n <= 0) return -1;
-    out[n] = '\0';
-    /* strip trailing newline */
-    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r'))
-        out[--n] = '\0';
-    return 0;
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    return true;
 }
 
-char *find_acm_by_usb_id(const char *vid, const char *pid, char *out, size_t outsz)
-{
-    DIR *dir = opendir("/sys/class/tty");
-    if (!dir) return NULL;
+static bool find_usb_dir(const char *sysfs_dev_path, char *out_dir, size_t out_cap) {
+    char cur[SYSPATH_MAX];
+    if (!realpath(sysfs_dev_path, cur)) return false;
+    for (int i = 0; i < 8; i++) {
+        char test[SYSPATH_MAX + 16];
+        snprintf(test, sizeof(test), "%s/idVendor", cur);
+        if (access(test, R_OK) == 0) {
+            snprintf(out_dir, out_cap, "%s", cur);
+            return true;
+        }
+        char *slash = strrchr(cur, '/');
+        if (!slash || slash == cur) break;
+        *slash = '\0';
+    }
+    return false;
+}
+
+static void to_lower(char *s) {
+    for (; *s; s++)
+        if (*s >= 'A' && *s <= 'F') *s += 32;
+}
+
+static const char *strip_0x(char *s) {
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    to_lower(s);
+    return s;
+}
+
+static bool configfs_gadget_matches(const char *want_vid, const char *want_pid) {
+    DIR *d = opendir("/sys/kernel/config/usb_gadget");
+    if (!d) return false;
+    struct dirent *ent;
+    bool found = false;
+    while (!found && (ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char path[SYSPATH_MAX + 32], vid[16], pid[16];
+        snprintf(path, sizeof(path),
+                 "/sys/kernel/config/usb_gadget/%s/idVendor", ent->d_name);
+        if (!sysfs_read(path, vid, sizeof(vid))) continue;
+        snprintf(path, sizeof(path),
+                 "/sys/kernel/config/usb_gadget/%s/idProduct", ent->d_name);
+        if (!sysfs_read(path, pid, sizeof(pid))) continue;
+        found = strcmp(strip_0x(vid), want_vid) == 0 &&
+                strcmp(strip_0x(pid), want_pid) == 0;
+    }
+    closedir(d);
+    return found;
+}
+
+static int usb_dev_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+const char *serialmux_find_dev(const char *vidpid, int n) {
+    char want_vid[8], want_pid[8];
+    if (sscanf(vidpid, "%7[^:]:%7s", want_vid, want_pid) != 2) return NULL;
+    to_lower(want_vid);
+    to_lower(want_pid);
+
+    static const char *prefixes[] = { "ttyACM", "ttyGS", NULL };
+
+    // Collect all matching device names
+    static char names[MAX_USB_DEVS][256];
+    static const char *ptrs[MAX_USB_DEVS];
+    int count = 0;
+
+    DIR *d = opendir("/sys/class/tty");
+    if (!d) return NULL;
 
     struct dirent *ent;
-    while ((ent = readdir(dir))) {
-        if (strncmp(ent->d_name, "ttyACM", 6) != 0)
-            continue;
+    while (count < MAX_USB_DEVS && (ent = readdir(d)) != NULL) {
+        bool match = false;
+        for (int i = 0; prefixes[i]; i++)
+            if (strncmp(ent->d_name, prefixes[i], strlen(prefixes[i])) == 0) { match = true; break; }
+        if (!match) continue;
 
-        char spath[512];
-        snprintf(spath, sizeof(spath), "/sys/class/tty/%s", ent->d_name);
-
-        /* Resolve symlink to real path */
-        char real[512];
-        if (!realpath(spath, real))
-            snprintf(real, sizeof(real), "%s", spath);
-
-        /* Walk up looking for idVendor/idProduct */
-        char cur[512];
-        snprintf(cur, sizeof(cur), "%s", real);
-        for (int depth = 0; depth < 8; depth++) {
-            char vpath[600], ppath[600];
-            snprintf(vpath, sizeof(vpath), "%s/idVendor", cur);
-            snprintf(ppath, sizeof(ppath), "%s/idProduct", cur);
-
-            char v[16], p[16];
-            if (read_sysfs_str(vpath, v, sizeof(v)) == 0 &&
-                read_sysfs_str(ppath, p, sizeof(p)) == 0) {
-                if (strcmp(v, vid) == 0 && strcmp(p, pid) == 0) {
-                    snprintf(out, outsz, "/dev/%s", ent->d_name);
-                    closedir(dir);
-                    return out;
-                }
-                break;  /* found id files but no match — don't climb further */
+        if (strncmp(ent->d_name, "ttyGS", 5) == 0) {
+            if (configfs_gadget_matches(want_vid, want_pid)) {
+                snprintf(names[count], sizeof(names[count]), "%s", ent->d_name);
+                ptrs[count] = names[count];
+                count++;
             }
-            /* Go up one level */
-            char *slash = strrchr(cur, '/');
-            if (!slash || slash == cur) break;
-            *slash = '\0';
+            continue;
+        }
+
+        char devlink[SYSPATH_MAX];
+        snprintf(devlink, sizeof(devlink), "/sys/class/tty/%s/device", ent->d_name);
+        char usb_dir[SYSPATH_MAX];
+        if (!find_usb_dir(devlink, usb_dir, sizeof(usb_dir))) continue;
+
+        char vid[8], pid[8], tmp[SYSPATH_MAX + 16];
+        snprintf(tmp, sizeof(tmp), "%s/idVendor", usb_dir);
+        if (!sysfs_read(tmp, vid, sizeof(vid))) continue;
+        snprintf(tmp, sizeof(tmp), "%s/idProduct", usb_dir);
+        if (!sysfs_read(tmp, pid, sizeof(pid))) continue;
+        to_lower(vid); to_lower(pid);
+
+        if (strcmp(vid, want_vid) == 0 && strcmp(pid, want_pid) == 0) {
+            snprintf(names[count], sizeof(names[count]), "%s", ent->d_name);
+            ptrs[count] = names[count];
+            count++;
         }
     }
-    closedir(dir);
+    closedir(d);
+
+    if (count == 0 || n >= count) return NULL;
+    qsort(ptrs, (size_t)count, sizeof(ptrs[0]), usb_dev_cmp);
+
+    static char result[64];
+    snprintf(result, sizeof(result), "/dev/%s", ptrs[n]);
+    return result;
+}
+
+// ── MCU channel ───────────────────────────────────────────────────────────────
+static void mcu_on_link_up(channel_t *c, link_t *lk) {
+    if (c->mcu_state == MCU_ACTIVE)
+        enqueue_frame(lk, F_READY, c->ch_id, NULL, 0);
+    else
+        enqueue_frame(lk, F_FLUSH, c->ch_id, NULL, 0);
+}
+
+static void mcu_open(channel_t *c, link_t *lk, int64_t now) {
+    if (c->fd >= 0) return;
+    c->fd = open_serial(c->dev, c->baud);
+    if (c->fd < 0) return;
+    c->last_byte_ms = now;
+    c->epev = 0;
+    chan_epoll_update(c);
+    if (lk->up) mcu_on_link_up(c, lk);
+}
+
+static void mcu_send_data(link_t *lk, channel_t *c, const uint8_t *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        size_t chunk = n - off;
+        if (chunk > MAX_PAYLOAD) chunk = MAX_PAYLOAD;
+        enqueue_frame(lk, F_DATA, c->ch_id, buf + off, chunk);
+        off += chunk;
+    }
+}
+
+static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
+    if (!link_can_queue_frame(lk, MAX_PAYLOAD)) {
+        lk->paused = true;
+        chan_pause(c);
+        return;
+    }
+
+    static uint8_t buf[MAX_PAYLOAD];
+    ssize_t n = read(c->fd, buf, sizeof(buf));
+    if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+        LOG("ch%u UART error: %s", c->ch_id, strerror(errno));
+        ep_del(c->fd);
+        close(c->fd);
+        c->fd = -1;
+        c->epev = 0;
+        return;
+    }
+    c->last_byte_ms = now;
+
+    switch (c->mcu_state) {
+    case MCU_RESETTING:
+    case MCU_INIT:
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] != 0x7E) continue;
+            c->mcu_state = MCU_ACTIVE;
+            LOG("ch%u MCU active", c->ch_id);
+            enqueue_frame(lk, F_READY, c->ch_id, NULL, 0);
+            mcu_send_data(lk, c, buf + i, (size_t)(n - i));
+            return;
+        }
+        break;
+    case MCU_ACTIVE:
+        mcu_send_data(lk, c, buf, (size_t)n);
+        break;
+    }
+}
+
+static void mcu_on_writable(channel_t *c) {
+    chan_drain(c);
+    chan_epoll_update(c);
+}
+
+static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
+    if (type != F_DATA || c->fd < 0) return true;
+    if (chan_space(c) < plen) {
+        LOG("ch%u MCU txbuf full, closing link before dropping %zu bytes", c->ch_id, plen);
+        return false;
+    }
+    chan_push(c, payload, plen);
+    chan_epoll_update(c);
+    return true;
+}
+
+static void mcu_tick(channel_t *c, link_t *lk, int64_t now) {
+    if (c->fd < 0) {
+        mcu_open(c, lk, now);
+        return;
+    }
+    if (c->mcu_state == MCU_ACTIVE && (now - c->last_byte_ms) > RESET_SILENCE_MS) {
+        LOG("ch%u MCU silence timeout, resetting", c->ch_id);
+        c->mcu_state = MCU_RESETTING;
+        enqueue_frame(lk, F_FLUSH, c->ch_id, NULL, 0);
+    }
+}
+
+static int64_t mcu_deadline(const channel_t *c, int64_t now) {
+    if (c->fd < 0) return now + 1000;
+    if (c->mcu_state == MCU_ACTIVE) return c->last_byte_ms + RESET_SILENCE_MS;
+    return INT64_MAX;
+}
+
+// ── PTY channel ───────────────────────────────────────────────────────────────
+static void pty_open(channel_t *c) {
+    if (c->fd >= 0) return;
+    char name[64];
+    if (openpty(&c->fd, &c->slave_fd, name, NULL, NULL) < 0) {
+        LOG("ch%u openpty: %s", c->ch_id, strerror(errno));
+        return;
+    }
+    set_nonblock(c->fd);
+    unlink(c->pty_path);
+    if (symlink(name, c->pty_path) < 0)
+        LOG("ch%u symlink %s: %s", c->ch_id, c->pty_path, strerror(errno));
+    else
+        LOG("ch%u PTY %s -> %s", c->ch_id, c->pty_path, name);
+    c->epev = 0;
+    chan_epoll_update(c);
+}
+
+static void pty_close(channel_t *c) {
+    if (c->fd < 0) return;
+    ep_del(c->fd);
+    close(c->fd);
+    c->fd = -1;
+    c->epev = 0;
+    if (c->slave_fd >= 0) { close(c->slave_fd); c->slave_fd = -1; }
+    unlink(c->pty_path);
+    c->tx_head = c->tx_tail = 0;
+    LOG("ch%u PTY closed", c->ch_id);
+}
+
+static void pty_on_readable(channel_t *c, link_t *lk) {
+    if (!link_can_queue_frame(lk, MAX_PAYLOAD)) {
+        lk->paused = true;
+        chan_pause(c);
+        return;
+    }
+
+    static uint8_t buf[MAX_PAYLOAD];
+    ssize_t n = read(c->fd, buf, sizeof(buf));
+    if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+        pty_close(c);
+        return;
+    }
+    size_t off = 0;
+    while (off < (size_t)n) {
+        size_t chunk = (size_t)n - off;
+        if (chunk > MAX_PAYLOAD) chunk = MAX_PAYLOAD;
+        enqueue_frame(lk, F_DATA, c->ch_id, buf + off, chunk);
+        off += chunk;
+    }
+}
+
+static void pty_on_writable(channel_t *c) {
+    chan_drain(c);
+    chan_epoll_update(c);
+}
+
+static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
+    switch (type) {
+    case F_DATA:
+        if (c->fd < 0) return true;
+        if (chan_space(c) < plen) {
+            LOG("ch%u PTY txbuf full, closing link before dropping %zu bytes", c->ch_id, plen);
+            return false;
+        }
+        chan_push(c, payload, plen);
+        chan_epoll_update(c);
+        break;
+    case F_FLUSH: pty_close(c); break;
+    case F_READY: pty_open(c);  break;
+    default: break;
+    }
+    return true;
+}
+
+// ── channel dispatch ──────────────────────────────────────────────────────────
+static channel_t *find_channel(uint8_t ch_id) {
+    for (int i = 0; i < g_n_chans; i++)
+        if (g_chans[i].ch_id == ch_id) return &g_chans[i];
     return NULL;
 }
 
-/* ── FrameParser ────────────────────────────────────────────────────────── */
-void fp_feed(frame_parser_t *fp, struct daemon *d,
-             const uint8_t *data, size_t n)
-{
-    size_t pos = 0;
-    while (pos < n) {
-        /* Fill: copy as much input as fits, then parse all complete frames */
-        size_t space = sizeof(fp->buf) - fp->len;
-        size_t copy  = n - pos;
-        if (copy > space) copy = space;
-        memcpy(fp->buf + fp->len, data + pos, copy);
-        fp->len += copy;
-        pos     += copy;
-
-    while (fp->len >= 2) {
-        /* Find magic */
-        size_t i = 0;
-        while (i + 1 < fp->len &&
-               !(fp->buf[i] == 0xAA && fp->buf[i+1] == 0x55))
-            i++;
-
-        if (i + 1 >= fp->len) {
-            /* No complete magic found; keep last byte in case it's 0xAA */
-            fp->buf[0] = fp->buf[fp->len - 1];
-            fp->len = 1;
-            break;
-        }
-
-        if (i > 0) {
-            memmove(fp->buf, fp->buf + i, fp->len - i);
-            fp->len -= i;
-        }
-
-        if (fp->len < (size_t)HDR_SIZE)
-            break;
-
-        /* Parse header: magic(2) type(1) channel(1) length(2 LE) */
-        uint8_t  ftype   = fp->buf[2];
-        uint8_t  channel = fp->buf[3];
-        uint16_t length;
-        memcpy(&length, fp->buf + 4, 2);
-        /* le16 — we're little-endian (MIPS EL / ARM LE), but be correct */
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-        length = __builtin_bswap16(length);
-#endif
-
-        if (length > MAX_PAYLOAD) {
-            /* Bad length — skip magic and rescan */
-            memmove(fp->buf, fp->buf + 2, fp->len - 2);
-            fp->len -= 2;
-            continue;
-        }
-
-        size_t total = (size_t)HDR_SIZE + length + CRC_SIZE;
-        if (fp->len < total)
-            break;
-
-        const uint8_t *payload = fp->buf + HDR_SIZE;
-        uint32_t crc_rx;
-        memcpy(&crc_rx, fp->buf + HDR_SIZE + length, 4);
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-        crc_rx = __builtin_bswap32(crc_rx);
-#endif
-
-        if (crc32_buf(payload, length) != crc_rx) {
-            memmove(fp->buf, fp->buf + 2, fp->len - 2);
-            fp->len -= 2;
-            continue;
-        }
-
-        fp->on_frame(d, ftype, channel, payload, length);
-
-        memmove(fp->buf, fp->buf + total, fp->len - total);
-        fp->len -= total;
-    }
-    }
+static void ch_on_readable(channel_t *c, link_t *lk, int64_t now) {
+    if (c->type == CH_MCU) mcu_on_readable(c, lk, now);
+    else                    pty_on_readable(c, lk);
 }
 
-/* ── LinkTxQueue ────────────────────────────────────────────────────────── */
-int txq_push(link_txq_t *q, const uint8_t *data, size_t n)
-{
-    if (n > LINK_TXBUF_SIZE - 1 - txq_used(q))
-        return -1;  /* no space */
-
-    size_t space_to_end = LINK_TXBUF_SIZE - q->tail;
-    if (n <= space_to_end) {
-        memcpy(q->buf + q->tail, data, n);
-    } else {
-        memcpy(q->buf + q->tail, data, space_to_end);
-        memcpy(q->buf, data + space_to_end, n - space_to_end);
-    }
-    q->tail = (q->tail + n) % LINK_TXBUF_SIZE;
-    return 0;
+static void ch_on_writable(channel_t *c) {
+    if (c->type == CH_MCU) mcu_on_writable(c);
+    else                    pty_on_writable(c);
 }
 
-int txq_drain(link_txq_t *q, int fd)
-{
-    if (txq_empty(q)) return 1;
-
-    /* Write the contiguous segment from head */
-    size_t head = q->head;
-    size_t tail = q->tail;
-    size_t avail = (tail >= head)
-        ? tail - head
-        : LINK_TXBUF_SIZE - head;
-
-    ssize_t written = write(fd, q->buf + head, avail);
-    if (written < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        return -1;  /* real error */
-    }
-    q->head = (q->head + (size_t)written) % LINK_TXBUF_SIZE;
-    return txq_empty(q) ? 1 : 0;
+static void ch_tick(channel_t *c, link_t *lk, int64_t now) {
+    if (c->type == CH_MCU) mcu_tick(c, lk, now);
 }
 
-/* ── Build a frame and push onto txq ────────────────────────────────────── */
-static void enqueue_frame(daemon_t *d, uint8_t ftype, uint8_t channel,
-                           const uint8_t *payload, uint16_t plen)
-{
-    uint8_t hdr[HDR_SIZE];
-    hdr[0] = 0xAA; hdr[1] = 0x55;
-    hdr[2] = ftype;
-    hdr[3] = channel;
-    hdr[4] = (uint8_t)(plen & 0xFF);
-    hdr[5] = (uint8_t)(plen >> 8);
-
-    uint32_t crc = plen ? crc32_buf(payload, plen) : 0x00000000U;
-    uint8_t crc_b[4];
-    crc_b[0] = (uint8_t)(crc);
-    crc_b[1] = (uint8_t)(crc >> 8);
-    crc_b[2] = (uint8_t)(crc >> 16);
-    crc_b[3] = (uint8_t)(crc >> 24);
-
-    txq_push(&d->txq, hdr, HDR_SIZE);
-    if (plen) txq_push(&d->txq, payload, plen);
-    txq_push(&d->txq, crc_b, 4);
-
-    d->last_tx_ms = mono_now_ms();
-
-    if (d->link_in_epoll) {
-        epoll_update(d->epoll_fd, d->link_fd,
-                     EPOLLIN | EPOLLOUT, TAG_LINK, &d->link_in_epoll);
-    }
+static int64_t ch_deadline(const channel_t *c, int64_t now) {
+    if (c->type == CH_MCU) return mcu_deadline(c, now);
+    return INT64_MAX;
 }
 
-/* ── daemon_send (called by channels) ──────────────────────────────────── */
-void daemon_send(daemon_t *d, uint8_t ftype, uint8_t channel,
-                 const uint8_t *payload, uint16_t plen)
-{
-    if (d->disconnected) return;
+// ── frame dispatch ────────────────────────────────────────────────────────────
+static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
+    static uint8_t dec[FRAME_DEC_MAX];
+    size_t dec_len = 0;
 
-    /* Backpressure: bulk data frames only */
-    if (ftype == F_DATA || ftype == F_TDATA) {
-        if (!d->link_bp_paused && txq_used(&d->txq) >= LINK_HIGH_WATER) {
-            d->link_bp_paused = 1;
-            for (int i = 0; i < MAX_CHANNELS; i++)
-                if (d->channels[i]) ch_pause(d->channels[i]);
-        }
-    }
-    enqueue_frame(d, ftype, channel, payload, plen);
-}
-
-/* ── Frame dispatch ─────────────────────────────────────────────────────── */
-static void on_frame(daemon_t *d, uint8_t ftype, uint8_t channel,
-                     const uint8_t *payload, uint16_t plen)
-{
-    if (ftype == F_PING) {
-        enqueue_frame(d, F_PONG, 0, NULL, 0);
+    if (enc_len > (size_t)(FRAME_ENC_MAX + 1)) {
+        link_fail_frame(lk, "oversized frame", enc, enc_len);
         return;
     }
-    if (ftype == F_PONG) return;
 
-    if (ftype == F_HELLO || ftype == F_ACK) {
-        if (ftype == F_HELLO) {
-            enqueue_frame(d, F_ACK, 0, NULL, 0);
-            if (d->link_up) {
-                log_ts("Link: peer reconnected, rebroadcasting");
-                for (int i = 0; i < MAX_CHANNELS; i++)
-                    if (d->channels[i]) ch_on_link_up(d->channels[i]);
-                return;
+    cobs_ret_t cr = cobs_decode(enc, enc_len, dec, sizeof(dec), &dec_len);
+    if (cr != COBS_RET_SUCCESS) {
+        link_fail_frame(lk,
+            cr == COBS_RET_ERR_BAD_PAYLOAD ? "COBS bad payload" :
+            cr == COBS_RET_ERR_EXHAUSTED   ? "COBS exhausted" : "COBS bad arg",
+            enc, enc_len);
+        return;
+    }
+    if (dec_len < 6) {
+        link_fail_frame(lk, "short frame", enc, enc_len);
+        return;
+    }
+
+    uint8_t        type    = dec[0];
+    uint8_t        ch_id   = dec[1];
+    size_t         plen    = dec_len - 6;
+    const uint8_t *payload = dec + 2;
+
+    uint32_t got = (uint32_t)dec[dec_len - 4]
+                 | (uint32_t)dec[dec_len - 3] << 8
+                 | (uint32_t)dec[dec_len - 2] << 16
+                 | (uint32_t)dec[dec_len - 1] << 24;
+    if (pik_crc32(dec, 2 + plen) != got) {
+        link_fail_frame(lk, "CRC mismatch", enc, enc_len);
+        return;
+    }
+
+    switch (type) {
+    case F_HELLO:
+        if (!lk->up) {
+            lk->up = true;
+            LOG("link up");
+            enqueue_frame(lk, F_HELLO, 0, NULL, 0);
+            for (int i = 0; i < g_n_chans; i++) {
+                channel_t *c = &g_chans[i];
+                if (c->type == CH_MCU) mcu_on_link_up(c, lk);
             }
         }
-        if (!d->link_up) {
-            d->link_up = 1;
-            log_ts("Link: handshake complete (%s)",
-                   d->is_exporter ? "exporter" : "host");
-            for (int i = 0; i < MAX_CHANNELS; i++)
-                if (d->channels[i]) ch_on_link_up(d->channels[i]);
+        return;
+    case F_PING:
+        enqueue_frame(lk, F_PONG, 0, NULL, 0);
+        return;
+    case F_PONG:
+        return;
+    default: break;
+    }
+
+    channel_t *c = find_channel(ch_id);
+    if (!c) return;
+
+    bool ok = (c->type == CH_MCU) ? mcu_on_frame(c, type, payload, plen)
+                                  : pty_on_frame(c, type, payload, plen);
+    if (!ok)
+        link_close(lk, now_ms());
+}
+
+// ── link management ───────────────────────────────────────────────────────────
+static void link_close(link_t *lk, int64_t now) {
+    if (lk->fd >= 0) {
+        ep_del(lk->fd);
+        close(lk->fd);
+        lk->fd = -1;
+        lk->epev = 0;
+    }
+    if (lk->up) {
+        lk->up = false;
+        LOG("link down");
+        for (int i = 0; i < g_n_chans; i++) {
+            channel_t *c = &g_chans[i];
+            if (c->type == CH_PTY) pty_close(c);
         }
+    }
+    lk->reconnect_deadline = now + lk->reconnect_backoff_ms;
+    lk->reconnect_backoff_ms *= 2;
+    if (lk->reconnect_backoff_ms > RECONNECT_MAX_MS)
+        lk->reconnect_backoff_ms = RECONNECT_MAX_MS;
+}
+
+static void link_try_open(link_t *lk, int64_t now) {
+    const char *dev = serialmux_find_dev(lk->vidpid, 0);
+    if (!dev) return;
+
+    lk->fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (lk->fd < 0) return;
+
+    if (tty_set_byte_raw(lk->fd) < 0) {
+        LOG("termios setup failed on %s: %s", dev, strerror(errno));
+        close(lk->fd);
+        lk->fd = -1;
         return;
     }
 
-    channel_t *ch = d->channels[channel];
-    if (!ch) return;
-    ch_on_frame(ch, ftype, payload, plen);
+    lk->rxbuf_len = 0;
+    lk->tx_head = lk->tx_tail = 0;
+    lk->last_rx_ms = lk->last_tx_ms = now;
+    lk->reconnect_backoff_ms = RECONNECT_MIN_MS;
+    lk->up   = false;
+    lk->epev = EPOLLIN;
+    ep_set(lk->fd, EPOLLIN, lk);
+
+    LOG("link opened: %s", dev);
+    enqueue_frame(lk, F_HELLO, 0, NULL, 0);
 }
 
-/* ── Link open/close ────────────────────────────────────────────────────── */
-static int64_t g_reopen_delay_ms = 500;
+static void link_on_readable(link_t *lk, int64_t now) {
+    size_t space = sizeof(lk->rxbuf) - lk->rxbuf_len;
+    if (!space) {
+        LOG("link RX overflow, discarding %zu bytes", lk->rxbuf_len);
+        lk->rxbuf_len = 0;
+        space = sizeof(lk->rxbuf);
+    }
 
-static void schedule_reopen(daemon_t *d)
-{
-    d->reopen_at_ms = mono_now_ms() + g_reopen_delay_ms;
-    g_reopen_delay_ms = (g_reopen_delay_ms * 2 > 8000) ? 8000 : g_reopen_delay_ms * 2;
-    d->disconnected = 1;
+    ssize_t n = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
+    if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+        LOG("link read: %s", n == 0 ? "EOF" : strerror(errno));
+        link_close(lk, now);
+        return;
+    }
+    lk->last_rx_ms = now;
+    lk->rxbuf_len += (size_t)n;
+    link_parse_rx(lk);
 }
 
-static void open_link(daemon_t *d)
-{
-    char dev_buf[128];
-    const char *dev = NULL;
+static void link_on_writable(link_t *lk, int64_t now) {
+    if (lk_drain(lk))
+        lk->last_tx_ms = now;
+    if (lk->paused && lk_avail(lk) < LINK_LOW_WATER) {
+        lk->paused = false;
+        for (int i = 0; i < g_n_chans; i++)
+            chan_resume(&g_chans[i]);
+    }
+}
 
-    if (d->usb_vid[0]) {
-        dev = find_acm_by_usb_id(d->usb_vid, d->usb_pid, dev_buf, sizeof(dev_buf));
-        if (!dev) {
-            log_ts("Link: USB %s:%s not found -- retrying", d->usb_vid, d->usb_pid);
-            schedule_reopen(d);
+static void link_tick(link_t *lk, int64_t now) {
+    if (lk->fd < 0) {
+        if (now >= lk->reconnect_deadline)
+            link_try_open(lk, now);
+        return;
+    }
+    if (!lk->up && lk_avail(lk) == 0 && (now - lk->last_tx_ms) > 2000)
+        enqueue_frame(lk, F_HELLO, 0, NULL, 0);
+    if (lk->up) {
+        if ((now - lk->last_tx_ms) > PING_IDLE_TX_MS)
+            enqueue_frame(lk, F_PING, 0, NULL, 0);
+        if ((now - lk->last_rx_ms) > LINK_DEAD_RX_MS) {
+            LOG("link RX timeout");
+            link_close(lk, now);
             return;
         }
-    } else {
-        dev = d->link_dev;
     }
-
-    int fd = open_serial_fd(dev, 115200);
-    if (fd < 0) {
-        log_ts("Link: cannot open %s: %s", dev, strerror(errno));
-        schedule_reopen(d);
-        return;
-    }
-
-    g_reopen_delay_ms = 500;
-    d->link_fd      = fd;
-    d->disconnected = 0;
-    d->link_up      = 0;
-    d->link_bp_paused = 0;
-    d->last_rx_ms   = mono_now_ms();
-    d->last_tx_ms   = mono_now_ms();
-    memset(&d->txq, 0, sizeof(d->txq));
-    memset(&d->parser, 0, sizeof(d->parser));
-    d->parser.on_frame = on_frame;
-    epoll_update(d->epoll_fd, fd, EPOLLIN, TAG_LINK, &d->link_in_epoll);
-    log_ts("Link: opened %s", dev);
-    enqueue_frame(d, F_HELLO, 0, NULL, 0);
-}
-
-static void close_link(daemon_t *d, const char *reason)
-{
-    if (d->disconnected) return;
-    log_ts("Link: down -- %s", reason);
-    d->disconnected = 1;
-    d->link_up      = 0;
-
-    if (d->link_fd >= 0) {
-        epoll_update(d->epoll_fd, d->link_fd, 0, 0, &d->link_in_epoll);
-        close(d->link_fd);
-        d->link_fd = -1;
-    }
-    memset(&d->txq, 0, sizeof(d->txq));
-
-    if (d->link_bp_paused) {
-        d->link_bp_paused = 0;
-        for (int i = 0; i < MAX_CHANNELS; i++)
-            if (d->channels[i]) ch_resume(d->channels[i]);
-    }
-    for (int i = 0; i < MAX_CHANNELS; i++)
-        if (d->channels[i]) ch_on_link_down(d->channels[i]);
-
-    schedule_reopen(d);
-}
-
-/* ── Link event handler ─────────────────────────────────────────────────── */
-static void handle_link_event(daemon_t *d, uint32_t events)
-{
-    if (d->link_fd < 0) return;
-
-    if (events & EPOLLIN) {
-        static uint8_t buf[65536];
-        ssize_t n = read(d->link_fd, buf, sizeof(buf));
-        if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
-                close_link(d, strerror(errno));
-            /* fall through to drain EPOLLOUT even on EAGAIN */
-        } else if (n > 0) {
-            /* n == 0 on non-blocking TTY is not EOF */
-            d->last_rx_ms = mono_now_ms();
-            fp_feed(&d->parser, d, buf, (size_t)n);
-        }
-    }
-
-    if (d->link_fd < 0) return;  /* fp_feed may have triggered close_link */
-
-    if (events & EPOLLOUT) {
-        int rc = txq_drain(&d->txq, d->link_fd);
-        if (rc < 0) { close_link(d, strerror(errno)); return; }
-
-        if (d->link_bp_paused && txq_used(&d->txq) <= LINK_LOW_WATER) {
-            d->link_bp_paused = 0;
-            for (int i = 0; i < MAX_CHANNELS; i++)
-                if (d->channels[i]) ch_resume(d->channels[i]);
-        }
-
-        if (txq_empty(&d->txq))
-            epoll_update(d->epoll_fd, d->link_fd, EPOLLIN, TAG_LINK, &d->link_in_epoll);
+    if (!lk->paused && lk_avail(lk) > LINK_HIGH_WATER) {
+        lk->paused = true;
+        for (int i = 0; i < g_n_chans; i++)
+            chan_pause(&g_chans[i]);
     }
 }
 
-/* ── Keepalive ──────────────────────────────────────────────────────────── */
-static void tick_keepalive(daemon_t *d, int64_t now_ms)
-{
-    if (d->disconnected) return;
-    if (d->last_rx_ms > 0 && (now_ms - d->last_rx_ms) > KA_TIMEOUT_MS) {
-        close_link(d, "keepalive timeout");
-        return;
-    }
-    if (d->link_up && txq_empty(&d->txq) &&
-        d->last_tx_ms > 0 && (now_ms - d->last_tx_ms) >= KA_INTERVAL_MS) {
-        enqueue_frame(d, F_PING, 0, NULL, 0);
-    }
+static int64_t link_deadline(const link_t *lk) {
+    if (lk->fd < 0) return lk->reconnect_deadline;
+    if (!lk->up) return lk->last_tx_ms + 2000;
+    int64_t a = lk->last_tx_ms + PING_IDLE_TX_MS;
+    int64_t b = lk->last_rx_ms + LINK_DEAD_RX_MS;
+    return a < b ? a : b;
 }
 
-/* ── Timeout calculation ────────────────────────────────────────────────── */
-static int next_timeout_ms(daemon_t *d, int64_t now_ms)
-{
-    int64_t deadline = now_ms + MAX_TICK_MS;
+// ── main event loop ───────────────────────────────────────────────────────────
+#define MAX_EPOLL_EVENTS 16
 
-    if (d->disconnected) {
-        if (d->reopen_at_ms < deadline) deadline = d->reopen_at_ms;
-    } else if (d->link_up) {
-        int64_t ka_tx = d->last_tx_ms + KA_INTERVAL_MS;
-        int64_t ka_rx = d->last_rx_ms + KA_TIMEOUT_MS;
-        if (ka_tx < deadline) deadline = ka_tx;
-        if (d->last_rx_ms > 0 && ka_rx < deadline) deadline = ka_rx;
-    }
+void serialmux_run(const serialmux_config_t *cfg) {
 
-    for (int i = 0; i < MAX_CHANNELS; i++) {
-        if (!d->channels[i]) continue;
-        int64_t dl = ch_deadline(d->channels[i], now_ms);
-        if (dl > 0 && dl < deadline) deadline = dl;
-    }
+    // Load config into globals
+    memset(&g_link, 0, sizeof(g_link));
+    g_link.fd = -1;
+    g_link.reconnect_backoff_ms = RECONNECT_MIN_MS;
+    memcpy(g_link.vidpid, cfg->vidpid, sizeof(g_link.vidpid));
+    g_link.vidpid[sizeof(g_link.vidpid) - 1] = '\0';
 
-    int64_t rem = deadline - now_ms;
-    if (rem <= 0) return 0;
-    if (rem > MAX_TICK_MS) rem = MAX_TICK_MS;
-    return (int)rem;
-}
-
-/* ── Main epoll dispatch ────────────────────────────────────────────────── */
-static void dispatch_event(daemon_t *d, struct epoll_event *ev)
-{
-    uint64_t tag  = ev->data.u64;
-    uint32_t kind = TAG_KIND(tag);
-    uint32_t info = TAG_INFO(tag);
-
-    switch (kind) {
-    case 0x01:  /* link */
-        handle_link_event(d, ev->events);
-        break;
-    case 0x02:  /* mcu uart */
-    case 0x03:  /* pty master */
-    case 0x04:  /* tcp server */
-    case 0x05:  /* tcp conn */ {
-        /* Find the channel and let it handle the event */
-        int ch_id = (kind == 0x05) ? (int)((info >> 16) & 0xFF) : (int)info;
-        channel_t *ch = d->channels[ch_id];
-        if (ch) ch_handle_event(ch, kind, info, ev->events);
-        break;
-    }
-    default:
-        break;
-    }
-}
-
-/* ── Run loop ───────────────────────────────────────────────────────────── */
-static void daemon_run(daemon_t *d)
-{
-    log_ts("serialmux %s started", d->is_exporter ? "exporter" : "host");
-    open_link(d);
-
-    struct epoll_event evs[64];
-    while (!g_stop) {
-        int64_t now_ms = mono_now_ms();
-
-        if (d->disconnected && now_ms >= d->reopen_at_ms)
-            open_link(d);
-
-        tick_keepalive(d, now_ms);
-
-        for (int i = 0; i < MAX_CHANNELS; i++)
-            if (d->channels[i]) ch_tick(d->channels[i], now_ms);
-
-        int timeout_ms = next_timeout_ms(d, mono_now_ms());
-        int n = epoll_wait(d->epoll_fd, evs, 64, timeout_ms);
-        for (int i = 0; i < n; i++)
-            dispatch_event(d, &evs[i]);
-    }
-    log_ts("Shutting down");
-}
-
-/* ── Signal handler ─────────────────────────────────────────────────────── */
-static void sig_handler(int s) { (void)s; g_stop = 1; }
-
-/* ── CLI helpers ────────────────────────────────────────────────────────── */
-static const char *USAGE =
-"usage: serialmux exporter|host [--usb VID:PID] [link_dev] channel_spec...\n"
-"\n"
-"MODES\n"
-"  exporter   Runs on the MCU machine (e.g. K1). Reads UARTs, writes to link.\n"
-"  host       Runs on the Klipper machine (e.g. Pi). Exposes PTYs to Klipper.\n"
-"\n"
-"LINK DEVICE (exactly one required)\n"
-"  link_dev        Explicit device path, e.g. /dev/ttyGS0\n"
-"  --usb VID:PID   Discover CDC ACM by USB ID, e.g. --usb 1d6b:0104\n"
-"\n"
-"CHANNEL SPECS\n"
-"  mcu:<id>:<uart_device>:<baud>     exporter MCU channel\n"
-"  mcu:<id>:<pty_symlink>[:<baud>]   host MCU channel\n"
-"  tcp:<id>:<addr>:<port>            TCP tunnel channel\n"
-"\n"
-"EXAMPLES\n"
-"  serialmux exporter --usb 1d6b:0104 mcu:0:/dev/ttyS7:230400 mcu:1:/dev/ttyS1:230400\n"
-"  serialmux host /dev/ttyGS0 mcu:0:/tmp/klipper_mcu mcu:1:/tmp/klipper_toolhead\n";
-
-static void die_usage(const char *msg)
-{
-    if (msg) fprintf(stderr, "error: %s\n\n", msg);
-    fputs(USAGE, stderr);
-    exit(1);
-}
-
-static int valid_hex_str(const char *s)
-{
-    if (!s || !*s) return 0;
-    for (; *s; s++)
-        if (!((*s >= '0' && *s <= '9') || (*s >= 'a' && *s <= 'f') ||
-              (*s >= 'A' && *s <= 'F')))
-            return 0;
-    return 1;
-}
-
-static int parse_int(const char *s, int min, int max, const char *name)
-{
-    char *end;
-    long v = strtol(s, &end, 10);
-    if (*end || v < min || v > max) {
-        fprintf(stderr, "error: %s must be %d-%d, got: %s\n", name, min, max, s);
-        exit(1);
-    }
-    return (int)v;
-}
-
-static int valid_baud(int b) { return baud_to_speed(b) != B0; }
-
-/* Build channel objects from spec strings */
-static void build_channels(daemon_t *d, int is_exporter,
-                            char **specs, int n_specs)
-{
-    for (int s = 0; s < n_specs; s++) {
-        char spec[256];
-        snprintf(spec, sizeof(spec), "%s", specs[s]);
-
-        char *parts[6] = {NULL};
-        int np = 0;
-        char *tok = spec;
-        char *p;
-        while ((p = strchr(tok, ':')) && np < 5) {
-            *p = '\0';
-            parts[np++] = tok;
-            tok = p + 1;
-        }
-        parts[np++] = tok;
-
-        if (np < 3) die_usage("channel spec too short");
-
-        const char *kind = parts[0];
-        int cid = parse_int(parts[1], 0, 255, "channel id");
-        if (d->channels[cid]) {
-            fprintf(stderr, "error: duplicate channel id %d\n", cid);
-            exit(1);
-        }
-
-        channel_t *ch = calloc(1, sizeof(channel_t));
-        if (!ch) { perror("calloc"); exit(1); }
-
-        if (strcmp(kind, "mcu") == 0) {
-            if (is_exporter) {
-                if (np != 4) die_usage("exporter mcu spec: mcu:<id>:<dev>:<baud>");
-                int baud = parse_int(parts[3], 1, 999999, "baud");
-                if (!valid_baud(baud)) {
-                    fprintf(stderr, "error: unsupported baud %d\n", baud);
-                    exit(1);
-                }
-                mcu_ch_init(ch, cid, parts[2], baud, d);
-            } else {
-                if (np < 3 || np > 4) die_usage("host mcu spec: mcu:<id>:<symlink>[:<baud>]");
-                int baud = (np == 4) ? parse_int(parts[3], 1, 999999, "baud") : 230400;
-                if (!valid_baud(baud)) {
-                    fprintf(stderr, "error: unsupported baud %d\n", baud);
-                    exit(1);
-                }
-                pty_ch_init(ch, cid, parts[2], baud, d);
-            }
-        } else if (strcmp(kind, "tcp") == 0) {
-            if (np != 4) die_usage("tcp spec: tcp:<id>:<addr>:<port>");
-            int port = parse_int(parts[3], 1, 65535, "port");
-            if (is_exporter)
-                tcp_src_init(ch, cid, parts[2], port, d);
-            else
-                tcp_dst_init(ch, cid, parts[2], port, d);
+    g_n_chans = cfg->n_channels;
+    for (int i = 0; i < g_n_chans; i++) {
+        const ch_spec_t *s = &cfg->channels[i];
+        channel_t *c = &g_chans[i];
+        memset(c, 0, sizeof(*c));
+        c->type     = s->type;
+        c->ch_id    = s->ch_id;
+        c->fd       = -1;
+        c->slave_fd = -1;
+        if (s->type == CH_MCU) {
+            c->baud      = s->baud;
+            c->mcu_state = MCU_INIT;
+            snprintf(c->dev,      sizeof(c->dev),      "%s", s->dev);
         } else {
-            fprintf(stderr, "error: unknown channel type '%s'\n", kind);
-            exit(1);
+            snprintf(c->pty_path, sizeof(c->pty_path), "%s", s->path);
         }
-
-        d->channels[cid] = ch;
-    }
-}
-
-/* ── main ───────────────────────────────────────────────────────────────── */
-int main(int argc, char **argv)
-{
-    crc32_init();
-
-    if (argc < 3) die_usage(NULL);
-
-    int argi = 1;
-    const char *mode = argv[argi++];
-    int is_exporter;
-    if (strcmp(mode, "exporter") == 0)     is_exporter = 1;
-    else if (strcmp(mode, "host") == 0)    is_exporter = 0;
-    else die_usage("mode must be 'exporter' or 'host'");
-
-    char usb_vid[8] = {0}, usb_pid[8] = {0};
-    char link_dev[128] = {0};
-
-    /* Scan for --usb and link_dev before channel specs */
-    while (argi < argc && argv[argi][0] != '\0') {
-        if (strcmp(argv[argi], "--usb") == 0) {
-            argi++;
-            if (argi >= argc) die_usage("--usb requires VID:PID argument");
-            char *colon = strchr(argv[argi], ':');
-            if (!colon) die_usage("--usb VID:PID must contain a colon");
-            size_t vlen = (size_t)(colon - argv[argi]);
-            char vid[8], pid[8];
-            if (vlen == 0 || vlen >= sizeof(vid)) die_usage("invalid VID");
-            memcpy(vid, argv[argi], vlen); vid[vlen] = '\0';
-            snprintf(pid, sizeof(pid), "%s", colon + 1);
-            if (!valid_hex_str(vid) || !valid_hex_str(pid))
-                die_usage("VID and PID must be hex strings");
-            snprintf(usb_vid, sizeof(usb_vid), "%s", vid);
-            snprintf(usb_pid, sizeof(usb_pid), "%s", pid);
-            argi++;
-            continue;
-        }
-        if (argv[argi][0] == '/' && link_dev[0] == '\0') {
-            snprintf(link_dev, sizeof(link_dev), "%s", argv[argi]);
-            argi++;
-            continue;
-        }
-        /* First non-flag, non-path arg: start of channel specs */
-        break;
     }
 
-    if (!usb_vid[0] && !link_dev[0])
-        die_usage("one of link_dev or --usb is required");
-    if (usb_vid[0] && link_dev[0])
-        die_usage("link_dev and --usb are mutually exclusive");
+    g_epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (g_epfd < 0) DIE("epoll_create1: %s", strerror(errno));
 
-    if (argi >= argc) die_usage("at least one channel spec is required");
+    if (cfg->aux_fd >= 0)
+        ep_set(cfg->aux_fd, EPOLLIN, &g_aux_sentinel);
 
-    char **specs   = argv + argi;
-    int    n_specs = argc - argi;
+    int64_t now = now_ms();
+    link_try_open(&g_link, now);
 
-    int epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0) { perror("epoll_create1"); return 1; }
+    for (;;) {
+        now = now_ms();
 
-    daemon_t *d = calloc(1, sizeof(daemon_t));
-    if (!d) { perror("calloc"); return 1; }
-    d->epoll_fd    = epfd;
-    d->link_fd     = -1;
-    d->disconnected = 1;
-    d->is_exporter = is_exporter;
-    memcpy(d->usb_vid, usb_vid, sizeof(usb_vid));
-    memcpy(d->usb_pid, usb_pid, sizeof(usb_pid));
-    if (link_dev[0])
-        memcpy(d->link_dev, link_dev, sizeof(link_dev));
+        int64_t dl = link_deadline(&g_link);
+        for (int i = 0; i < g_n_chans; i++) {
+            int64_t cd = ch_deadline(&g_chans[i], now);
+            if (cd < dl) dl = cd;
+        }
+        if (cfg->deadline_fn) {
+            int64_t xd = cfg->deadline_fn();
+            if (xd < dl) dl = xd;
+        }
 
-    build_channels(d, is_exporter, specs, n_specs);
+        int timeout = (dl <= now) ? 0 : (int)(dl - now);
+        if (timeout > 5000) timeout = 5000;
 
-    struct sigaction sa = { .sa_handler = sig_handler };
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
+        struct epoll_event evs[MAX_EPOLL_EVENTS];
+        int n = epoll_wait(g_epfd, evs, MAX_EPOLL_EVENTS, timeout);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            DIE("epoll_wait: %s", strerror(errno));
+        }
 
-    daemon_run(d);
-    return 0;
+        now = now_ms();
+
+        for (int i = 0; i < n; i++) {
+            void    *ptr = evs[i].data.ptr;
+            uint32_t ev  = evs[i].events;
+
+            if (ptr == &g_link) {
+                if (ev & (EPOLLERR | EPOLLHUP)) { link_close(&g_link, now); continue; }
+                if (ev & EPOLLIN)  link_on_readable(&g_link, now);
+                if (ev & EPOLLOUT) link_on_writable(&g_link, now);
+            } else if (ptr == &g_aux_sentinel) {
+                if (cfg->aux_cb) cfg->aux_cb();
+            } else {
+                channel_t *c = (channel_t *)ptr;
+                if (ev & (EPOLLERR | EPOLLHUP)) {
+                    ep_del(c->fd);
+                    close(c->fd);
+                    c->fd = -1;
+                    c->epev = 0;
+                    continue;
+                }
+                if (ev & EPOLLIN)  ch_on_readable(c, &g_link, now);
+                if (ev & EPOLLOUT) ch_on_writable(c);
+            }
+        }
+
+        now = now_ms();
+        link_tick(&g_link, now);
+        for (int i = 0; i < g_n_chans; i++)
+            ch_tick(&g_chans[i], &g_link, now);
+        if (cfg->tick_cb) cfg->tick_cb();
+    }
 }
