@@ -633,11 +633,19 @@ static void link_try_open(int64_t now) {
     if (lk->fd >= 0) return;
 
     int fd = open(lk->dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) return;
+    if (fd < 0) {
+        lk->reconnect_at = now + lk->backoff_ms;
+        lk->backoff_ms *= 2;
+        if (lk->backoff_ms > RECONNECT_MAX) lk->backoff_ms = RECONNECT_MAX;
+        return;
+    }
 
     if (tty_set_byte_raw(fd) < 0) {
         LOG("termios setup failed on %s: %s", lk->dev, strerror(errno));
         close(fd);
+        lk->reconnect_at = now + lk->backoff_ms;
+        lk->backoff_ms *= 2;
+        if (lk->backoff_ms > RECONNECT_MAX) lk->backoff_ms = RECONNECT_MAX;
         return;
     }
 

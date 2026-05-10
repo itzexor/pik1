@@ -3,7 +3,6 @@
 #include "serialmux.h"
 #include "nanocobs/cobs.h"
 #include "util.h"
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -15,7 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -45,8 +43,6 @@
 #define RESET_SILENCE_MS  5000
 #define PING_IDLE_TX_MS   3000
 #define LINK_DEAD_RX_MS   10000
-#define RECONNECT_MIN_MS  500
-#define RECONNECT_MAX_MS  8000
 
 // ── types ─────────────────────────────────────────────────────────────────────
 typedef enum { MCU_INIT, MCU_ACTIVE, MCU_RESETTING } mcu_state_t;
@@ -86,10 +82,6 @@ typedef struct {
 
     int64_t     last_tx_ms;
     int64_t     last_rx_ms;
-    int64_t     reconnect_deadline;
-    int         reconnect_backoff_ms;
-
-    char        vidpid[16];
 } link_t;
 
 // ── globals ───────────────────────────────────────────────────────────────────
@@ -97,9 +89,7 @@ static link_t    g_link;
 static channel_t g_chans[MAX_CHANNELS];
 static int       g_n_chans;
 static int       g_epfd = -1;
-
-// sentinel pointer for aux_fd epoll registration
-static int g_aux_sentinel;
+static bool      g_session_failed;
 
 // ── logging ───────────────────────────────────────────────────────────────────
 static void log_msg(const char *fmt, ...) {
@@ -293,135 +283,6 @@ static int open_serial(const char *path, int baud) {
         return -1;
     }
     return fd;
-}
-
-// ── USB sysfs discovery ───────────────────────────────────────────────────────
-#define SYSPATH_MAX 512
-#define MAX_USB_DEVS 16
-
-static bool sysfs_read(const char *path, char *buf, size_t cap) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
-    ssize_t n = read(fd, buf, cap - 1);
-    close(fd);
-    if (n <= 0) return false;
-    buf[n] = '\0';
-    char *nl = strchr(buf, '\n');
-    if (nl) *nl = '\0';
-    return true;
-}
-
-static bool find_usb_dir(const char *sysfs_dev_path, char *out_dir, size_t out_cap) {
-    char cur[SYSPATH_MAX];
-    if (!realpath(sysfs_dev_path, cur)) return false;
-    for (int i = 0; i < 8; i++) {
-        char test[SYSPATH_MAX + 16];
-        snprintf(test, sizeof(test), "%s/idVendor", cur);
-        if (access(test, R_OK) == 0) {
-            snprintf(out_dir, out_cap, "%s", cur);
-            return true;
-        }
-        char *slash = strrchr(cur, '/');
-        if (!slash || slash == cur) break;
-        *slash = '\0';
-    }
-    return false;
-}
-
-static void to_lower(char *s) {
-    for (; *s; s++)
-        if (*s >= 'A' && *s <= 'F') *s += 32;
-}
-
-static const char *strip_0x(char *s) {
-    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-    to_lower(s);
-    return s;
-}
-
-static bool configfs_gadget_matches(const char *want_vid, const char *want_pid) {
-    DIR *d = opendir("/sys/kernel/config/usb_gadget");
-    if (!d) return false;
-    struct dirent *ent;
-    bool found = false;
-    while (!found && (ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
-        char path[SYSPATH_MAX + 32], vid[16], pid[16];
-        snprintf(path, sizeof(path),
-                 "/sys/kernel/config/usb_gadget/%s/idVendor", ent->d_name);
-        if (!sysfs_read(path, vid, sizeof(vid))) continue;
-        snprintf(path, sizeof(path),
-                 "/sys/kernel/config/usb_gadget/%s/idProduct", ent->d_name);
-        if (!sysfs_read(path, pid, sizeof(pid))) continue;
-        found = strcmp(strip_0x(vid), want_vid) == 0 &&
-                strcmp(strip_0x(pid), want_pid) == 0;
-    }
-    closedir(d);
-    return found;
-}
-
-static int usb_dev_cmp(const void *a, const void *b) {
-    return strcmp(*(const char *const *)a, *(const char *const *)b);
-}
-
-const char *serialmux_find_dev(const char *vidpid, int n) {
-    char want_vid[8], want_pid[8];
-    if (sscanf(vidpid, "%7[^:]:%7s", want_vid, want_pid) != 2) return NULL;
-    to_lower(want_vid);
-    to_lower(want_pid);
-
-    static const char *prefixes[] = { "ttyACM", "ttyGS", NULL };
-
-    // Collect all matching device names
-    static char names[MAX_USB_DEVS][256];
-    static const char *ptrs[MAX_USB_DEVS];
-    int count = 0;
-
-    DIR *d = opendir("/sys/class/tty");
-    if (!d) return NULL;
-
-    struct dirent *ent;
-    while (count < MAX_USB_DEVS && (ent = readdir(d)) != NULL) {
-        bool match = false;
-        for (int i = 0; prefixes[i]; i++)
-            if (strncmp(ent->d_name, prefixes[i], strlen(prefixes[i])) == 0) { match = true; break; }
-        if (!match) continue;
-
-        if (strncmp(ent->d_name, "ttyGS", 5) == 0) {
-            if (configfs_gadget_matches(want_vid, want_pid)) {
-                snprintf(names[count], sizeof(names[count]), "%s", ent->d_name);
-                ptrs[count] = names[count];
-                count++;
-            }
-            continue;
-        }
-
-        char devlink[SYSPATH_MAX];
-        snprintf(devlink, sizeof(devlink), "/sys/class/tty/%s/device", ent->d_name);
-        char usb_dir[SYSPATH_MAX];
-        if (!find_usb_dir(devlink, usb_dir, sizeof(usb_dir))) continue;
-
-        char vid[8], pid[8], tmp[SYSPATH_MAX + 16];
-        snprintf(tmp, sizeof(tmp), "%s/idVendor", usb_dir);
-        if (!sysfs_read(tmp, vid, sizeof(vid))) continue;
-        snprintf(tmp, sizeof(tmp), "%s/idProduct", usb_dir);
-        if (!sysfs_read(tmp, pid, sizeof(pid))) continue;
-        to_lower(vid); to_lower(pid);
-
-        if (strcmp(vid, want_vid) == 0 && strcmp(pid, want_pid) == 0) {
-            snprintf(names[count], sizeof(names[count]), "%s", ent->d_name);
-            ptrs[count] = names[count];
-            count++;
-        }
-    }
-    closedir(d);
-
-    if (count == 0 || n >= count) return NULL;
-    qsort(ptrs, (size_t)count, sizeof(ptrs[0]), usb_dev_cmp);
-
-    static char result[64];
-    snprintf(result, sizeof(result), "/dev/%s", ptrs[n]);
-    return result;
 }
 
 // ── MCU channel ───────────────────────────────────────────────────────────────
@@ -694,6 +555,8 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
 
 // ── link management ───────────────────────────────────────────────────────────
 static void link_close(link_t *lk, int64_t now) {
+    (void)now;
+    g_session_failed = true;
     if (lk->fd >= 0) {
         ep_del(lk->fd);
         close(lk->fd);
@@ -708,36 +571,34 @@ static void link_close(link_t *lk, int64_t now) {
             if (c->type == CH_PTY) pty_close(c);
         }
     }
-    lk->reconnect_deadline = now + lk->reconnect_backoff_ms;
-    lk->reconnect_backoff_ms *= 2;
-    if (lk->reconnect_backoff_ms > RECONNECT_MAX_MS)
-        lk->reconnect_backoff_ms = RECONNECT_MAX_MS;
 }
 
-static void link_try_open(link_t *lk, int64_t now) {
-    const char *dev = serialmux_find_dev(lk->vidpid, 0);
-    if (!dev) return;
-
+static bool link_open(link_t *lk, const char *dev, int64_t now) {
     lk->fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (lk->fd < 0) return;
+    if (lk->fd < 0) {
+        LOG("link open %s: %s", dev, strerror(errno));
+        g_session_failed = true;
+        return false;
+    }
 
     if (tty_set_byte_raw(lk->fd) < 0) {
         LOG("termios setup failed on %s: %s", dev, strerror(errno));
         close(lk->fd);
         lk->fd = -1;
-        return;
+        g_session_failed = true;
+        return false;
     }
 
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = 0;
     lk->last_rx_ms = lk->last_tx_ms = now;
-    lk->reconnect_backoff_ms = RECONNECT_MIN_MS;
     lk->up   = false;
     lk->epev = EPOLLIN;
     ep_set(lk->fd, EPOLLIN, lk);
 
     LOG("link opened: %s", dev);
     enqueue_frame(lk, F_HELLO, 0, NULL, 0);
+    return true;
 }
 
 static void link_on_readable(link_t *lk, int64_t now) {
@@ -771,11 +632,7 @@ static void link_on_writable(link_t *lk, int64_t now) {
 }
 
 static void link_tick(link_t *lk, int64_t now) {
-    if (lk->fd < 0) {
-        if (now >= lk->reconnect_deadline)
-            link_try_open(lk, now);
-        return;
-    }
+    if (lk->fd < 0) return;
     if (!lk->up && lk_avail(lk) == 0 && (now - lk->last_tx_ms) > 2000)
         enqueue_frame(lk, F_HELLO, 0, NULL, 0);
     if (lk->up) {
@@ -795,24 +652,19 @@ static void link_tick(link_t *lk, int64_t now) {
 }
 
 static int64_t link_deadline(const link_t *lk) {
-    if (lk->fd < 0) return lk->reconnect_deadline;
+    if (lk->fd < 0) return INT64_MAX;
     if (!lk->up) return lk->last_tx_ms + 2000;
     int64_t a = lk->last_tx_ms + PING_IDLE_TX_MS;
     int64_t b = lk->last_rx_ms + LINK_DEAD_RX_MS;
     return a < b ? a : b;
 }
 
-// ── main event loop ───────────────────────────────────────────────────────────
-#define MAX_EPOLL_EVENTS 16
-
-void serialmux_run(const serialmux_config_t *cfg) {
-
-    // Load config into globals
+// ── component API ─────────────────────────────────────────────────────────────
+void serialmux_init(const serialmux_config_t *cfg, int epfd) {
+    g_epfd = epfd;
+    g_session_failed = false;
     memset(&g_link, 0, sizeof(g_link));
     g_link.fd = -1;
-    g_link.reconnect_backoff_ms = RECONNECT_MIN_MS;
-    memcpy(g_link.vidpid, cfg->vidpid, sizeof(g_link.vidpid));
-    g_link.vidpid[sizeof(g_link.vidpid) - 1] = '\0';
 
     g_n_chans = cfg->n_channels;
     for (int i = 0; i < g_n_chans; i++) {
@@ -831,69 +683,99 @@ void serialmux_run(const serialmux_config_t *cfg) {
             snprintf(c->pty_path, sizeof(c->pty_path), "%s", s->path);
         }
     }
+}
 
-    g_epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (g_epfd < 0) DIE("epoll_create1: %s", strerror(errno));
-
-    if (cfg->aux_fd >= 0)
-        ep_set(cfg->aux_fd, EPOLLIN, &g_aux_sentinel);
-
-    int64_t now = now_ms();
-    link_try_open(&g_link, now);
-
-    for (;;) {
-        now = now_ms();
-
-        int64_t dl = link_deadline(&g_link);
-        for (int i = 0; i < g_n_chans; i++) {
-            int64_t cd = ch_deadline(&g_chans[i], now);
-            if (cd < dl) dl = cd;
+bool serialmux_start(const char *link_dev, int64_t now) {
+    memset(&g_link, 0, sizeof(g_link));
+    g_link.fd = -1;
+    g_session_failed = false;
+    for (int i = 0; i < g_n_chans; i++) {
+        channel_t *c = &g_chans[i];
+        c->paused = false;
+        c->epev = 0;
+        c->tx_head = c->tx_tail = 0;
+        if (c->type == CH_MCU) {
+            c->mcu_state = MCU_INIT;
+            c->last_byte_ms = now;
         }
-        if (cfg->deadline_fn) {
-            int64_t xd = cfg->deadline_fn();
-            if (xd < dl) dl = xd;
-        }
-
-        int timeout = (dl <= now) ? 0 : (int)(dl - now);
-        if (timeout > 5000) timeout = 5000;
-
-        struct epoll_event evs[MAX_EPOLL_EVENTS];
-        int n = epoll_wait(g_epfd, evs, MAX_EPOLL_EVENTS, timeout);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            DIE("epoll_wait: %s", strerror(errno));
-        }
-
-        now = now_ms();
-
-        for (int i = 0; i < n; i++) {
-            void    *ptr = evs[i].data.ptr;
-            uint32_t ev  = evs[i].events;
-
-            if (ptr == &g_link) {
-                if (ev & (EPOLLERR | EPOLLHUP)) { link_close(&g_link, now); continue; }
-                if (ev & EPOLLIN)  link_on_readable(&g_link, now);
-                if (ev & EPOLLOUT) link_on_writable(&g_link, now);
-            } else if (ptr == &g_aux_sentinel) {
-                if (cfg->aux_cb) cfg->aux_cb();
-            } else {
-                channel_t *c = (channel_t *)ptr;
-                if (ev & (EPOLLERR | EPOLLHUP)) {
-                    ep_del(c->fd);
-                    close(c->fd);
-                    c->fd = -1;
-                    c->epev = 0;
-                    continue;
-                }
-                if (ev & EPOLLIN)  ch_on_readable(c, &g_link, now);
-                if (ev & EPOLLOUT) ch_on_writable(c);
-            }
-        }
-
-        now = now_ms();
-        link_tick(&g_link, now);
-        for (int i = 0; i < g_n_chans; i++)
-            ch_tick(&g_chans[i], &g_link, now);
-        if (cfg->tick_cb) cfg->tick_cb();
     }
+    return link_open(&g_link, link_dev, now);
+}
+
+bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
+    if (g_session_failed) return false;
+    if (ptr == &g_link) {
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            link_close(&g_link, now);
+            return false;
+        }
+        if (events & EPOLLIN) link_on_readable(&g_link, now);
+        if (!g_session_failed && (events & EPOLLOUT)) link_on_writable(&g_link, now);
+        return !g_session_failed;
+    }
+
+    channel_t *c = (channel_t *)ptr;
+    if (events & (EPOLLERR | EPOLLHUP)) {
+        ep_del(c->fd);
+        close(c->fd);
+        c->fd = -1;
+        c->epev = 0;
+        return true;
+    }
+    if (events & EPOLLIN) ch_on_readable(c, &g_link, now);
+    if (!g_session_failed && (events & EPOLLOUT)) ch_on_writable(c);
+    return !g_session_failed;
+}
+
+bool serialmux_tick(int64_t now) {
+    if (g_session_failed) return false;
+    link_tick(&g_link, now);
+    for (int i = 0; i < g_n_chans && !g_session_failed; i++)
+        ch_tick(&g_chans[i], &g_link, now);
+    return !g_session_failed;
+}
+
+bool serialmux_link_up(void) {
+    return g_link.up;
+}
+
+int64_t serialmux_deadline(int64_t now) {
+    int64_t dl = link_deadline(&g_link);
+    for (int i = 0; i < g_n_chans; i++) {
+        int64_t cd = ch_deadline(&g_chans[i], now);
+        if (cd < dl) dl = cd;
+    }
+    return dl;
+}
+
+void serialmux_cleanup(void) {
+    if (g_link.fd >= 0) {
+        ep_del(g_link.fd);
+        close(g_link.fd);
+        g_link.fd = -1;
+        g_link.epev = 0;
+    }
+    g_link.up = false;
+    g_link.paused = false;
+    g_link.tx_head = g_link.tx_tail = 0;
+    g_link.rxbuf_len = 0;
+
+    for (int i = 0; i < g_n_chans; i++) {
+        channel_t *c = &g_chans[i];
+        if (c->fd >= 0) {
+            ep_del(c->fd);
+            close(c->fd);
+            c->fd = -1;
+        }
+        if (c->slave_fd >= 0) {
+            close(c->slave_fd);
+            c->slave_fd = -1;
+        }
+        if (c->type == CH_PTY)
+            unlink(c->pty_path);
+        c->paused = false;
+        c->epev = 0;
+        c->tx_head = c->tx_tail = 0;
+    }
+    g_session_failed = false;
 }

@@ -10,9 +10,11 @@ COBS_SRCS   := src/nanocobs/cobs.c
 COBS_HDRS   := src/nanocobs/cobs.h
 COMMON_SRCS := src/util.c
 COMMON_HDRS := src/util.h
+USB_SRCS    := src/usb_discovery.c
+USB_HDRS    := src/usb_discovery.h
 
-PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(COBS_SRCS) $(COMMON_SRCS)
-PIK1D_HDRS  := src/serialmux.h $(COBS_HDRS) $(COMMON_HDRS)
+PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(USB_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
+PIK1D_HDRS  := src/serialmux.h $(USB_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
 
 TB_SRCS     := src/tcpbridge.c $(COBS_SRCS) $(COMMON_SRCS)
 TB_HDRS     := $(COBS_HDRS) $(COMMON_HDRS)

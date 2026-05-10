@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 
 #define MAX_CHANNELS 8
@@ -14,21 +15,14 @@ typedef struct {
 } ch_spec_t;
 
 typedef struct {
-    char       vidpid[16];
     ch_spec_t  channels[MAX_CHANNELS];
     int        n_channels;
-
-    // Optional hooks for pik1d child-process management.
-    // Set unused fields to -1 / NULL.
-    int        aux_fd;           // signalfd to watch in epoll, or -1
-    void     (*aux_cb)(void);    // called when aux_fd fires
-    void     (*tick_cb)(void);   // called every event-loop iteration
-    int64_t  (*deadline_fn)(void); // extra deadline contribution, or NULL
 } serialmux_config_t;
 
-// Find the nth (0-indexed) USB serial device matching vidpid ("VID:PID").
-// Returns a pointer to a static buffer, or NULL if not found.
-const char *serialmux_find_dev(const char *vidpid, int n);
-
-// Run the mux event loop forever using the given config.
-void serialmux_run(const serialmux_config_t *cfg);
+void serialmux_init(const serialmux_config_t *cfg, int epfd);
+bool serialmux_start(const char *link_dev, int64_t now);
+bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now);
+bool serialmux_tick(int64_t now);
+bool serialmux_link_up(void);
+int64_t serialmux_deadline(int64_t now);
+void serialmux_cleanup(void);
