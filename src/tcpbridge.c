@@ -347,7 +347,6 @@ static void conn_close(int id, bool send_close) {
     c->tx_head = c->tx_tail = 0;
     if (send_close && !enqueue_frame(TB_CLOSE, (uint8_t)id, NULL, 0))
         LOG("conn %d: unable to queue CLOSE", id);
-    LOG("conn %d closed", id);
 }
 
 static void close_all_conns(bool send_close) {
@@ -495,7 +494,6 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             g_conns[id].flow_paused = false;
             g_conns[id].pause_sent = false;
             conn_epoll_update(&g_conns[id]);
-            LOG("conn %d: connected to %s:%d", id, g_fwd_host, g_fwd_port);
         }
         return true;
 
@@ -688,7 +686,6 @@ static void listener_accept(void) {
         conn_close(id, false);
         return;
     }
-    LOG("conn %d: accepted", id);
 }
 
 static void conn_on_readable(int id) {
