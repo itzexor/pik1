@@ -68,15 +68,17 @@ webcam streams or file transfers.
 The following files are involved:
 
 - `src/` -- C source for `pik1d`, `tcpbridge`, and the shared serial mux code
-- `S99pik1` -- K1 init script
+- `S99pik1.in` -- K1 init script template, rendered to `build/S99pik1`
 - `setup_pik1.sh` -- Pi gadget setup script
 - `pik1.service.in` -- Pi systemd service template
 
-### Building
+### Binaries
 
 Pre-built binaries for K1 (`build/pik1d.mipsel`, `build/tcpbridge.mipsel`) and
 Pi (`build/pik1d.aarch64`, `build/tcpbridge.aarch64`) are included in the repo
-and are updated with each release. If you want to build from source:
+and are updated with each release. Normal installs use these included files.
+On a development machine, you can optionally rebuild them from source with the
+cross-compiler targets:
 
 ```bash
 make toolchain   # one-time: downloads musl.cc cross-compilers into .toolchain/
@@ -121,13 +123,13 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
     > Pi configurations require the mode to be set explicitly.
 
 3. #### Install pik1
-    From the repo directory on the Pi (pre-built binary included):
+    From the repo directory on the Pi, using the included pre-built binaries:
 
     ```bash
     make install-pi
     ```
 
-    This copies the binary and setup script to `/opt/pik1/`, installs and enables
+    This copies the binaries and setup script to `/opt/pik1/`, installs and enables
     `pik1.service`, and runs `systemctl daemon-reload`. Pass `SUDO=` if running as
     root, or `PI_DIR=/your/path` to override the install prefix.
 
@@ -164,16 +166,22 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
     Install [Simple AF](https://pellcorp.github.io/creality-wiki/) on the K1.
 
 2. #### Install pik1
-    From the repo directory on the K1 (pre-built binary included):
+    From a slim repo clone on the K1, such as `/root/pik1`:
 
     ```bash
     make install-k1
     ```
 
     This copies `build/pik1d.mipsel` and `build/tcpbridge.mipsel` to
-    `/usr/data/pik1/`, installs `S99pik1` to `/etc/init.d/`, and disables the
-    services below by renaming them
-    with a `_` prefix so the init system skips them:
+    `/usr/data/pik1/`, renders and installs `/etc/init.d/S99pik1`, and
+    disables the services below by renaming them with a `_` prefix so the init
+    system skips them. To use a different install directory, pass the same
+    `K1_DIR` value at install and uninstall time:
+
+    ```bash
+    make install-k1 K1_DIR=/your/install/path
+    make uninstall-k1 K1_DIR=/your/install/path
+    ```
 
     | Service | Reason |
     |---|---|
@@ -185,22 +193,49 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
     | `S50webcam` | Camera can be moved to the Pi |
     | `S99guppyscreen` | See optional TCP tunnel section below |
 
-    If transferring via scp rather than running from a repo clone on the K1:
+    If transferring via scp rather than running from a repo clone on the K1,
+    render the init script locally with the same install path you will use on
+    the printer:
 
     ```sh
-    scp build/pik1d.mipsel root@<k1-ip>:/usr/data/pik1/pik1d
-    scp build/tcpbridge.mipsel root@<k1-ip>:/usr/data/pik1/tcpbridge
-    scp S99pik1 root@<k1-ip>:/etc/init.d/S99pik1
-    ssh root@<k1-ip> chmod +x /usr/data/pik1/pik1d /usr/data/pik1/tcpbridge /etc/init.d/S99pik1
+    K1_DIR=/usr/data/pik1
+    make render-k1-init K1_DIR="$K1_DIR"
+    ssh root@<k1-ip> "mkdir -p $K1_DIR"
+    scp build/pik1d.mipsel root@<k1-ip>:$K1_DIR/pik1d
+    scp build/tcpbridge.mipsel root@<k1-ip>:$K1_DIR/tcpbridge
+    scp build/S99pik1 root@<k1-ip>:/etc/init.d/S99pik1
+    ssh root@<k1-ip> "chmod +x $K1_DIR/pik1d $K1_DIR/tcpbridge /etc/init.d/S99pik1"
     ```
 
-    Then run the service rename loop manually on the K1.
+    Then disable the K1-side services that should not start in bridge mode:
 
-3. #### Restart the K1
+    ```sh
+    ssh root@<k1-ip> '
+    for svc in S50nginx_service S50unslung S50webcam \
+        S55klipper_mcu S55klipper_service S56moonraker_service S99guppyscreen; do
+        if [ -f /etc/init.d/$svc ]; then
+            mv /etc/init.d/$svc /etc/init.d/_$svc
+        fi
+    done
+    '
+    ```
+
+3. #### Reboot both devices
+    Reboot the K1 so the renamed init scripts take effect. Reboot the Pi as well
+    so the USB gadget and `pik1.service` start from a clean boot sequence.
+
+    On the K1:
+
     ```sh
     reboot
     ```
-    Upon start, the daemon logs to `/tmp/pik1.log`.
+
+    On the Pi:
+
+    ```bash
+    sudo reboot
+    ```
+    Upon start, the K1 daemon logs to `/tmp/pik1.log`.
 
 ## K1 touchscreen TCP tunnel
 
@@ -265,40 +300,53 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     sudo systemctl status pik1
     journalctl -u pik1 -f
     ```
-    Should show `active (running)`. A normal startup looks like:
+    After rebooting both devices, it should show `active (running)`. Journal
+    lines include systemd timestamps and process
+    metadata, and `pik1d`/`tcpbridge` messages may appear in a slightly different
+    order. The message text should look like:
     ```
     setup_pik1: loading libcomposite
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
-    setup_pik1: ttyGS0 and ttyGS1 ready
+    setup_pik1: ttyGS0 ready
+    setup_pik1: ttyGS1 ready
     [pik1] mode=host channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyGS1
     [pik1] child: spawned /opt/pik1/tcpbridge pid=...
     [mux] link opened: /dev/ttyGS0
+    [tcp] tcpbridge /dev/ttyGS1 forward 127.0.0.1:7125
+    [tcp] link opened: /dev/ttyGS1
     [mux] link up
+    [tcp] link up
     [mux] ch0 PTY /tmp/klipper_mcu -> /dev/pts/2
     [mux] ch1 PTY /tmp/klipper_toolhead -> /dev/pts/3
-    [tcp] tcpbridge /dev/ttyGS1 forward 127.0.0.1:7125
     ```
 
 2. #### K1 log
     ```bash
     cat /tmp/pik1.log
     ```
-    A normal startup looks like:
+    A normal startup looks like. Because `pik1d` and `tcpbridge` write to the
+    same log, adjacent lines may occasionally interleave:
     ```
     [pik1] mode=exporter channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyACM1
     [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
     [mux] link opened: /dev/ttyACM0
+    [tcp] tcpbridge /dev/ttyACM1 listen 127.0.0.1:7125
+    [tcp] listening on port 7125
+    [tcp] link opened: /dev/ttyACM1
     [mux] link up
+    [tcp] link up
     [mux] ch0 MCU active
     [mux] ch1 MCU active
-    [tcp] tcpbridge /dev/ttyACM1 listen 127.0.0.1:7125
     ```
+    If you changed `TCP_ADDR` in `/etc/init.d/S99pik1`, the logged TCP address
+    will match that configured value.
 
 3. #### dmesg (Pi)
     ```
     [    7.614279] dwc2 fe980000.usb: bound driver configfs-gadget.pik1
     [    7.846025] dwc2 fe980000.usb: new device is high-speed
+    [    7.900000] dwc2 fe980000.usb: new address ...
     ```
 
 4. #### Klipper behaviour
@@ -315,7 +363,7 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     ```sh
     make uninstall-k1
     ```
-    This removes the init script and binary and restores all disabled services.
+    This removes the init script and binaries and restores all disabled services.
     Alternatively:
     ```sh
     mv /etc/init.d/S99pik1 /etc/init.d/_S99pik1

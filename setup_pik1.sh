@@ -74,4 +74,5 @@ fi
 
 log "binding gadget to UDC: $UDC"
 echo "$UDC" > "$GADGET_DIR/UDC"
-log "ttyGS0 and ttyGS1 ready"
+log "ttyGS0 ready"
+log "ttyGS1 ready"

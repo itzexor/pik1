@@ -1,7 +1,7 @@
 #!/bin/sh
 # /etc/init.d/S99pik1 — pik1 exporter: bridges K1C MCU UARTs to the Pi over USB CDC ACM.
 
-INSTALL_DIR="/usr/data/pik1"
+INSTALL_DIR="@INSTALL_DIR@"
 BINARY="$INSTALL_DIR/pik1d"
 PIDFILE="/var/run/pik1.pid"
 LOGFILE="/tmp/pik1.log"

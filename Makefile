@@ -20,7 +20,7 @@ TB_HDRS     := $(COBS_HDRS) $(COMMON_HDRS)
 # ── Install ───────────────────────────────────────────────────────────────────
 SUDO            ?= sudo
 
-K1_DIR          := /usr/data/pik1
+K1_DIR          ?= /usr/data/pik1
 K1_INIT_DIR     := /etc/init.d
 K1_DISABLE_SVCS := S50nginx_service S50unslung S50webcam \
                    S55klipper_mcu S55klipper_service \
@@ -45,7 +45,7 @@ ARMV7_CC     ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 ARMV7_STRIP  ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-strip
 
 .PHONY: all native mipsel aarch64 armv7 toolchain clean distclean \
-        install-k1 uninstall-k1 install-pi uninstall-pi
+        render-k1-init install-k1 uninstall-k1 install-pi uninstall-pi FORCE
 
 all: native
 
@@ -94,6 +94,13 @@ $(BUILD)/tcpbridge.armv7: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
 $(BUILD):
 	mkdir -p $@
 
+$(BUILD)/S99pik1: S99pik1.in FORCE | $(BUILD)
+	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
+
+FORCE:
+
+render-k1-init: $(BUILD)/S99pik1
+
 # ── Toolchain download ────────────────────────────────────────────────────────
 define fetch_toolchain
 $(TOOLCHAIN_DIR)/$(1)-cross/bin/$(1)-gcc:
@@ -110,7 +117,7 @@ toolchain: \
 	$(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 
 # ── Install targets ───────────────────────────────────────────────────────────
-install-k1:
+install-k1: $(BUILD)/S99pik1
 	@test -x $(BUILD)/pik1d.mipsel || \
 		{ echo "Missing $(BUILD)/pik1d.mipsel; run 'make mipsel' first"; exit 1; }
 	@test -x $(BUILD)/tcpbridge.mipsel || \
@@ -118,7 +125,7 @@ install-k1:
 	install -d $(K1_DIR)
 	install -m 755 $(BUILD)/pik1d.mipsel    $(K1_DIR)/pik1d
 	install -m 755 $(BUILD)/tcpbridge.mipsel $(K1_DIR)/tcpbridge
-	install -m 755 S99pik1 $(K1_INIT_DIR)/S99pik1
+	install -m 755 $(BUILD)/S99pik1 $(K1_INIT_DIR)/S99pik1
 	@for svc in $(K1_DISABLE_SVCS); do \
 		if [ -f $(K1_INIT_DIR)/$$svc ]; then \
 			echo "Disabling $$svc"; \
