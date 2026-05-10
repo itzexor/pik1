@@ -1,35 +1,35 @@
 CC       ?= gcc
 CFLAGS   := -O2 -std=c11 -Wall -Wextra -D_GNU_SOURCE \
-             -ffunction-sections -fdata-sections
+             -ffunction-sections -fdata-sections -Isrc/nanocobs
 LDFLAGS  := -Wl,--gc-sections
-SRCS     := src/serialmux.c src/channels.c
-HDRS     := src/serialmux.h
 
 STATIC   := -static
 BUILD    := build
 
+COBS_SRCS   := src/nanocobs/cobs.c
+COBS_HDRS   := src/nanocobs/cobs.h
+COMMON_SRCS := src/util.c
+COMMON_HDRS := src/util.h
+
+PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(COBS_SRCS) $(COMMON_SRCS)
+PIK1D_HDRS  := src/serialmux.h $(COBS_HDRS) $(COMMON_HDRS)
+
+TB_SRCS     := src/tcpbridge.c $(COBS_SRCS) $(COMMON_SRCS)
+TB_HDRS     := $(COBS_HDRS) $(COMMON_HDRS)
+
 # ── Install ───────────────────────────────────────────────────────────────────
-# Pi install commands that touch system paths run under $(SUDO).
-# Default: sudo (prompts as needed). Override with SUDO= if already root.
-# K1 needs no SUDO — target system runs entirely as root.
 SUDO            ?= sudo
 
-# K1: fixed install path (embedded target)
-K1_DIR          := /usr/data/pik1
+K1_DIR          ?= /usr/data/pik1
 K1_INIT_DIR     := /etc/init.d
-# Services disabled in the installed state (S* -> _S*).
-# install-k1 disables them; uninstall-k1 restores them.
 K1_DISABLE_SVCS := S50nginx_service S50unslung S50webcam \
                    S55klipper_mcu S55klipper_service \
                    S56moonraker_service S99guppyscreen
 
-# Pi: overridable
 PI_DIR          ?= /opt/pik1
 PI_SYSTEMD_DIR  ?= /etc/systemd/system
 
 # ── Cross toolchains ─────────────────────────────────────────────────────────
-# 'make toolchain' downloads musl.cc prebuilts into .toolchain/.
-# Override any *_CC / *_STRIP on the command line to use a different compiler.
 TOOLCHAIN_DIR  := $(CURDIR)/.toolchain
 MUSL_CC_BASE   := https://musl.cc
 
@@ -45,35 +45,63 @@ ARMV7_CC     ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 ARMV7_STRIP  ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-strip
 
 .PHONY: all native mipsel aarch64 armv7 toolchain clean distclean \
-        install-k1 uninstall-k1 install-pi uninstall-pi
+        render-k1-init install-k1 uninstall-k1 install-pi uninstall-pi FORCE
 
 all: native
 
-native: $(BUILD)/serialmux
+native: $(BUILD)/pik1d $(BUILD)/tcpbridge
 
-$(BUILD)/serialmux: $(SRCS) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS)
+# ── Native builds ─────────────────────────────────────────────────────────────
+$(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(PIK1D_SRCS)
 
-mipsel: $(BUILD)/serialmux.mipsel
-$(BUILD)/serialmux.mipsel: $(SRCS) $(HDRS) | $(BUILD)
-	$(MIPSEL_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(SRCS)
+$(BUILD)/tcpbridge: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TB_SRCS)
+
+# ── MIPSEL ────────────────────────────────────────────────────────────────────
+mipsel: $(BUILD)/pik1d.mipsel $(BUILD)/tcpbridge.mipsel
+
+$(BUILD)/pik1d.mipsel: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
+	$(MIPSEL_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
 	-$(MIPSEL_STRIP) $@
 
-aarch64: $(BUILD)/serialmux.aarch64
-$(BUILD)/serialmux.aarch64: $(SRCS) $(HDRS) | $(BUILD)
-	$(AARCH64_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(SRCS)
+$(BUILD)/tcpbridge.mipsel: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
+	$(MIPSEL_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(TB_SRCS)
+	-$(MIPSEL_STRIP) $@
+
+# ── AARCH64 ──────────────────────────────────────────────────────────────────
+aarch64: $(BUILD)/pik1d.aarch64 $(BUILD)/tcpbridge.aarch64
+
+$(BUILD)/pik1d.aarch64: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
+	$(AARCH64_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
 	-$(AARCH64_STRIP) $@
 
-armv7: $(BUILD)/serialmux.armv7
-$(BUILD)/serialmux.armv7: $(SRCS) $(HDRS) | $(BUILD)
-	$(ARMV7_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(SRCS)
+$(BUILD)/tcpbridge.aarch64: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
+	$(AARCH64_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(TB_SRCS)
+	-$(AARCH64_STRIP) $@
+
+# ── ARMV7 ─────────────────────────────────────────────────────────────────────
+armv7: $(BUILD)/pik1d.armv7 $(BUILD)/tcpbridge.armv7
+
+$(BUILD)/pik1d.armv7: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
+	$(ARMV7_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
+	-$(ARMV7_STRIP) $@
+
+$(BUILD)/tcpbridge.armv7: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
+	$(ARMV7_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(TB_SRCS)
 	-$(ARMV7_STRIP) $@
 
 $(BUILD):
 	mkdir -p $@
 
-# Download toolchain tarballs from musl.cc into .toolchain/
-# (GNU Make pattern rules only allow one %, so these are explicit)
+$(BUILD)/S99pik1: S99pik1.in FORCE | $(BUILD)
+	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
+
+FORCE:
+
+render-k1-init: $(BUILD)/S99pik1
+
+# ── Toolchain download ────────────────────────────────────────────────────────
 define fetch_toolchain
 $(TOOLCHAIN_DIR)/$(1)-cross/bin/$(1)-gcc:
 	mkdir -p $(TOOLCHAIN_DIR)
@@ -88,10 +116,16 @@ toolchain: \
 	$(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-gcc \
 	$(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 
-install-k1: $(BUILD)/serialmux.mipsel
+# ── Install targets ───────────────────────────────────────────────────────────
+install-k1: $(BUILD)/S99pik1
+	@test -x $(BUILD)/pik1d.mipsel || \
+		{ echo "Missing $(BUILD)/pik1d.mipsel; run 'make mipsel' first"; exit 1; }
+	@test -x $(BUILD)/tcpbridge.mipsel || \
+		{ echo "Missing $(BUILD)/tcpbridge.mipsel; run 'make mipsel' first"; exit 1; }
 	install -d $(K1_DIR)
-	install -m 755 $(BUILD)/serialmux.mipsel $(K1_DIR)/serialmux
-	install -m 755 S99pik1 $(K1_INIT_DIR)/S99pik1
+	install -m 755 $(BUILD)/pik1d.mipsel    $(K1_DIR)/pik1d
+	install -m 755 $(BUILD)/tcpbridge.mipsel $(K1_DIR)/tcpbridge
+	install -m 755 $(BUILD)/S99pik1 $(K1_INIT_DIR)/S99pik1
 	@for svc in $(K1_DISABLE_SVCS); do \
 		if [ -f $(K1_INIT_DIR)/$$svc ]; then \
 			echo "Disabling $$svc"; \
@@ -101,7 +135,7 @@ install-k1: $(BUILD)/serialmux.mipsel
 
 uninstall-k1:
 	rm -f $(K1_INIT_DIR)/S99pik1
-	rm -f $(K1_DIR)/serialmux
+	rm -f $(K1_DIR)/pik1d $(K1_DIR)/tcpbridge
 	@for svc in $(K1_DISABLE_SVCS); do \
 		if [ -f $(K1_INIT_DIR)/_$$svc ]; then \
 			echo "Restoring $$svc"; \
@@ -109,9 +143,14 @@ uninstall-k1:
 		fi; \
 	done
 
-install-pi: $(BUILD)/serialmux.aarch64
+install-pi:
+	@test -x $(BUILD)/pik1d.aarch64 || \
+		{ echo "Missing $(BUILD)/pik1d.aarch64; run 'make aarch64' first"; exit 1; }
+	@test -x $(BUILD)/tcpbridge.aarch64 || \
+		{ echo "Missing $(BUILD)/tcpbridge.aarch64; run 'make aarch64' first"; exit 1; }
 	$(SUDO) install -d $(PI_DIR)
-	$(SUDO) install -m 755 $(BUILD)/serialmux.aarch64 $(PI_DIR)/serialmux
+	$(SUDO) install -m 755 $(BUILD)/pik1d.aarch64     $(PI_DIR)/pik1d
+	$(SUDO) install -m 755 $(BUILD)/tcpbridge.aarch64  $(PI_DIR)/tcpbridge
 	$(SUDO) install -m 755 setup_pik1.sh $(PI_DIR)/setup_pik1.sh
 	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1.service > /dev/null
