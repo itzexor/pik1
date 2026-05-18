@@ -2,6 +2,9 @@
 
 #include "serialmux.h"
 #include "nanocobs/cobs.h"
+#include "crc32.h"
+#include "logging.h"
+#include "tty.h"
 #include "util.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -14,7 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
-#include <time.h>
 #include <unistd.h>
 
 // ── frame types ───────────────────────────────────────────────────────────────
@@ -100,13 +102,6 @@ static void log_msg(const char *fmt, ...) {
 }
 #define LOG(...)  log_msg(__VA_ARGS__)
 #define DIE(...)  do { log_msg(__VA_ARGS__); exit(1); } while(0)
-
-// ── time ──────────────────────────────────────────────────────────────────────
-static int64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 // ── epoll helpers ─────────────────────────────────────────────────────────────
 static void ep_set(int fd, uint32_t events, void *ptr) {
@@ -202,13 +197,13 @@ static void link_fail_frame(link_t *lk, const char *reason,
     LOG("link failure: %s enc_len=%zu first=0x%02x", reason, enc_len,
         enc_len ? enc[0] : 0);
     size_t head = enc_len < 64 ? enc_len : 64;
-    util_log_hex_sample(log_msg, "badframe head", enc, head);
+    pik_log_hex_sample(log_msg, "badframe head", enc, head);
     if (enc_len > head) {
         size_t tail = enc_len < 64 ? enc_len : 64;
         LOG("badframe tail starts at +%zu", enc_len - tail);
-        util_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
+        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
     }
-    link_close(lk, now_ms());
+    link_close(lk, pik_now_ms());
 }
 
 static bool link_can_queue_frame(const link_t *lk, size_t plen) {
@@ -550,7 +545,7 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     bool ok = (c->type == CH_MCU) ? mcu_on_frame(c, type, payload, plen)
                                   : pty_on_frame(c, type, payload, plen);
     if (!ok)
-        link_close(lk, now_ms());
+        link_close(lk, pik_now_ms());
 }
 
 // ── link management ───────────────────────────────────────────────────────────

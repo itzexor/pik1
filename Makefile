@@ -8,8 +8,8 @@ BUILD    := build
 
 COBS_SRCS   := src/nanocobs/cobs.c
 COBS_HDRS   := src/nanocobs/cobs.h
-COMMON_SRCS := src/util.c
-COMMON_HDRS := src/util.h
+COMMON_SRCS := src/util.c src/logging.c src/tty.c src/crc32.c
+COMMON_HDRS := src/util.h src/logging.h src/tty.h src/crc32.h
 USB_SRCS    := src/usb_discovery.c
 USB_HDRS    := src/usb_discovery.h
 

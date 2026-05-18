@@ -1,13 +1,12 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-typedef void (*util_log_fn)(const char *fmt, ...);
+int64_t pik_now_ms(void);
+int pik_backoff_next(int *backoff_ms, int max_ms);
 
-uint32_t pik_crc32(const uint8_t *buf, size_t len);
-void util_log_hex_sample(util_log_fn log_fn, const char *label,
-                         const uint8_t *buf, size_t len);
-
-int tty_set_byte_raw(int fd);
-int tty_set_byte_raw_baud(int fd, int baud);
+bool pik_parse_uint8(const char *s, uint8_t *out);
+bool pik_parse_port(const char *s, int *out);
+bool pik_parse_positive_int(const char *s, int *out);

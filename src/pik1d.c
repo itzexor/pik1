@@ -1,6 +1,7 @@
 // src/pik1d.c - daemon supervisor: USB discovery, child management, mux session loop
 
 #include "serialmux.h"
+#include "util.h"
 #include "usb_discovery.h"
 
 #include <errno.h>
@@ -16,7 +17,6 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
 #define RETRY_MIN_MS 1000
@@ -31,46 +31,6 @@ static void log_msg(const char *fmt, ...) {
 }
 #define LOG(...) log_msg(__VA_ARGS__)
 #define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
-
-static int64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static int backoff_next(int *backoff_ms) {
-    int cur = *backoff_ms;
-    *backoff_ms *= 2;
-    if (*backoff_ms > RETRY_MAX_MS) *backoff_ms = RETRY_MAX_MS;
-    return cur;
-}
-
-static bool parse_uint8(const char *s, uint8_t *out) {
-    char *end = NULL;
-    errno = 0;
-    unsigned long v = strtoul(s, &end, 10);
-    if (errno || !end || *end || v > UINT8_MAX) return false;
-    *out = (uint8_t)v;
-    return true;
-}
-
-static bool parse_port(const char *s, int *out) {
-    char *end = NULL;
-    errno = 0;
-    long v = strtol(s, &end, 10);
-    if (errno || !end || *end || v <= 0 || v > 65535) return false;
-    *out = (int)v;
-    return true;
-}
-
-static bool parse_positive_int(const char *s, int *out) {
-    char *end = NULL;
-    errno = 0;
-    long v = strtol(s, &end, 10);
-    if (errno || !end || *end || v <= 0 || v > INT32_MAX) return false;
-    *out = (int)v;
-    return true;
-}
 
 static void ep_set(int epfd, int fd, uint32_t events, void *ptr) {
     struct epoll_event ev = { .events = events, .data.ptr = ptr };
@@ -94,7 +54,7 @@ static struct {
 };
 
 static void child_schedule_restart(int64_t now) {
-    g_child.restart_at_ms = now + backoff_next(&g_child.backoff_ms);
+    g_child.restart_at_ms = now + pik_backoff_next(&g_child.backoff_ms, RETRY_MAX_MS);
 }
 
 static void child_spawn(const char *tunnel_dev, int64_t now) {
@@ -258,16 +218,16 @@ int main(int argc, char **argv) {
             if (sscanf(spec, "mcu:%15[^:]:%127[^:]:%15[^:]%c",
                        ch_str, s->dev, baud_str, &extra) != 3)
                 DIE("bad mcu spec: %s", spec);
-            if (!parse_uint8(ch_str, &s->ch_id))
+            if (!pik_parse_uint8(ch_str, &s->ch_id))
                 DIE("bad mcu channel id: %s", spec);
-            if (!parse_positive_int(baud_str, &s->baud))
+            if (!pik_parse_positive_int(baud_str, &s->baud))
                 DIE("bad mcu baud: %s", spec);
             s->type = CH_MCU;
         } else {
             char ch_str[16], extra;
             if (sscanf(spec, "pty:%15[^:]:%127s%c", ch_str, s->path, &extra) != 2)
                 DIE("bad pty spec: %s", spec);
-            if (!parse_uint8(ch_str, &s->ch_id))
+            if (!pik_parse_uint8(ch_str, &s->ch_id))
                 DIE("bad pty channel id: %s", spec);
             s->type = CH_PTY;
         }
@@ -287,7 +247,7 @@ int main(int argc, char **argv) {
         char port_str[16], extra;
         if (sscanf(argv[argi] + 4, "%63[^:]:%15[^:]%c",
                    tcp_addr, port_str, &extra) != 2 ||
-            !parse_port(port_str, &tcp_port))
+            !pik_parse_port(port_str, &tcp_port))
             DIE("bad tcp spec: %s", argv[argi]);
         argi++;
 
@@ -331,13 +291,13 @@ int main(int argc, char **argv) {
     bool session_active = false;
     bool session_confirmed = false;
     int usb_backoff_ms = RETRY_MIN_MS;
-    int64_t usb_retry_at = now_ms();
+    int64_t usb_retry_at = pik_now_ms();
     usb_wait_state_t last_usb_state = USB_WAIT_UNKNOWN;
     char main_dev[64] = "";
     char tunnel_dev[64] = "";
 
     while (!shutdown) {
-        int64_t now = now_ms();
+        int64_t now = pik_now_ms();
 
         if (!session_active && now >= usb_retry_at) {
             usb_wait_state_t state = usb_resolve(vidpid, has_tcp,
@@ -360,10 +320,10 @@ int main(int argc, char **argv) {
                         child_spawn(tunnel_dev, now);
                 } else {
                     serialmux_cleanup();
-                    usb_retry_at = now + backoff_next(&usb_backoff_ms);
+                    usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
                 }
             } else {
-                usb_retry_at = now + backoff_next(&usb_backoff_ms);
+                usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
             }
         }
 
@@ -384,7 +344,7 @@ int main(int argc, char **argv) {
             DIE("epoll_wait: %s", strerror(errno));
         }
 
-        now = now_ms();
+        now = pik_now_ms();
         for (int i = 0; i < n; i++) {
             void *ptr = evs[i].data.ptr;
             uint32_t ev = evs[i].events;
@@ -407,21 +367,21 @@ int main(int argc, char **argv) {
                 session_confirmed = false;
                 child_stop();
                 serialmux_cleanup();
-                usb_retry_at = now + backoff_next(&usb_backoff_ms);
+                usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
                 last_usb_state = USB_WAIT_UNKNOWN;
             }
         }
 
         if (shutdown) break;
 
-        now = now_ms();
+        now = pik_now_ms();
         if (session_active && !serialmux_tick(now)) {
             LOG("session failed, restarting USB link");
             session_active = false;
             session_confirmed = false;
             child_stop();
             serialmux_cleanup();
-            usb_retry_at = now + backoff_next(&usb_backoff_ms);
+            usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
             last_usb_state = USB_WAIT_UNKNOWN;
         }
 

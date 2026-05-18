@@ -5,6 +5,9 @@
 // Runs on ttyGS1 (K1C) / ttyACM1 (Pi).
 
 #include "nanocobs/cobs.h"
+#include "crc32.h"
+#include "logging.h"
+#include "tty.h"
 #include "util.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -20,7 +23,6 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
 // ── frame types ───────────────────────────────────────────────────────────────
@@ -127,22 +129,6 @@ static void log_msg(const char *fmt, ...) {
 }
 #define LOG(...) log_msg(__VA_ARGS__)
 #define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
-
-// ── time / parsing ────────────────────────────────────────────────────────────
-static int64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static bool parse_port(const char *s, int *out) {
-    char *end = NULL;
-    errno = 0;
-    long v = strtol(s, &end, 10);
-    if (errno || !end || *end || v <= 0 || v > 65535) return false;
-    *out = (int)v;
-    return true;
-}
 
 // ── epoll helpers ─────────────────────────────────────────────────────────────
 static void ep_set(int fd, uint32_t ev, void *tag) {
@@ -366,11 +352,11 @@ static void link_fail_frame(const char *reason, const uint8_t *enc, size_t enc_l
         (unsigned long long)g_tx_writes,
         (unsigned long long)g_tx_bytes);
     size_t head = enc_len < 64 ? enc_len : 64;
-    util_log_hex_sample(log_msg, "badframe head", enc, head);
+    pik_log_hex_sample(log_msg, "badframe head", enc, head);
     if (enc_len > head) {
         size_t tail = enc_len < 64 ? enc_len : 64;
         LOG("badframe tail starts at +%zu", enc_len - tail);
-        util_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
+        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
     }
     link_close(now);
 }
@@ -768,11 +754,11 @@ static void run(void) {
         LOG("listening on port %d", g_fwd_port);
     }
 
-    int64_t now = now_ms();
+    int64_t now = pik_now_ms();
     link_try_open(now);
 
     for (;;) {
-        now = now_ms();
+        now = pik_now_ms();
         if (g_link.fd >= 0) {
             lk_refill_tokens(now);
             if (g_link.tx_count && g_link.tx_tokens) lk_drain(now);
@@ -799,7 +785,7 @@ static void run(void) {
         int n = epoll_wait(g_epfd, evs, MAX_EVENTS, timeout);
         if (n < 0) { if (errno == EINTR) continue; DIE("epoll_wait: %s", strerror(errno)); }
 
-        now = now_ms();
+        now = pik_now_ms();
         for (int i = 0; i < n; i++) {
             void *ptr = evs[i].data.ptr;
             uint32_t ev = evs[i].events;
@@ -829,7 +815,7 @@ static void run(void) {
             }
         }
 
-        now = now_ms();
+        now = pik_now_ms();
         if (g_link.fd < 0) {
             if (now >= g_link.reconnect_at) link_try_open(now);
         } else if (g_link.up) {
@@ -886,7 +872,7 @@ int main(int argc, char **argv) {
     if (hlen >= sizeof(g_fwd_host)) usage(argv[0]);
     memcpy(g_fwd_host, hostport, hlen);
     g_fwd_host[hlen] = '\0';
-    if (!parse_port(colon + 1, &g_fwd_port)) usage(argv[0]);
+    if (!pik_parse_port(colon + 1, &g_fwd_port)) usage(argv[0]);
 
     LOG("tcpbridge %s %s %s:%d",
         g_link.dev, g_is_listener ? "listen" : "forward",
