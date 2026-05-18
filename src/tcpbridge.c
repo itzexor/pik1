@@ -5,7 +5,8 @@
 // Runs on ttyGS1 (K1C) / ttyACM1 (Pi).
 
 #include "nanocobs/cobs.h"
-#include "crc32.h"
+#include "fd.h"
+#include "frame.h"
 #include "logging.h"
 #include "tty.h"
 #include "util.h"
@@ -132,16 +133,15 @@ static void log_msg(const char *fmt, ...) {
 
 // ── epoll helpers ─────────────────────────────────────────────────────────────
 static void ep_set(int fd, uint32_t ev, void *tag) {
-    struct epoll_event e = { .events = ev, .data.ptr = tag };
-    if (epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &e) == -1)
-        epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &e);
+    pik_epoll_set(g_epfd, fd, ev, tag);
 }
-static void ep_del(int fd) { epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, NULL); }
+static void ep_del(int fd) { pik_epoll_del(g_epfd, fd); }
 
 // ── forward decls ─────────────────────────────────────────────────────────────
 static void link_close(int64_t now);
 static bool enqueue_frame(uint8_t type, uint8_t conn_id,
                           const uint8_t *payload, size_t plen);
+static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len);
 
 // ── connection ring helpers ───────────────────────────────────────────────────
 static uint32_t conn_avail(const conn_t *c) { return c->tx_tail - c->tx_head; }
@@ -289,24 +289,19 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
+    uint8_t header[4];
 
     bool reliable = frame_is_reliable(type);
     uint16_t seq = reliable ? lk->tx_seq : 0;
 
-    dec[0] = type;
-    dec[1] = conn_id;
-    dec[2] = (uint8_t)seq;
-    dec[3] = (uint8_t)(seq >> 8);
-    if (plen) memcpy(dec + 4, payload, plen);
-
-    uint32_t c = pik_crc32(dec, 4 + plen);
-    dec[4 + plen + 0] = (uint8_t)c;
-    dec[4 + plen + 1] = (uint8_t)(c >> 8);
-    dec[4 + plen + 2] = (uint8_t)(c >> 16);
-    dec[4 + plen + 3] = (uint8_t)(c >> 24);
+    header[0] = type;
+    header[1] = conn_id;
+    header[2] = (uint8_t)seq;
+    header[3] = (uint8_t)(seq >> 8);
 
     size_t enc_len = 0;
-    if (cobs_encode(dec, 4 + plen + 4, enc, sizeof(enc), &enc_len) != COBS_RET_SUCCESS) {
+    if (pik_frame_encode(header, sizeof(header), payload, plen,
+                         dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
         LOG("encode failed type=0x%02x", type);
         return false;
     }
@@ -398,41 +393,21 @@ static int tcp_connect_to_target(void) {
 // ── frame dispatch ────────────────────────────────────────────────────────────
 static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
     static uint8_t dec[FRAME_DEC_MAX];
-    size_t dec_len = 0;
+    pik_frame_t frame;
     g_rx_frames++;
 
-    if (enc_len > (size_t)(FRAME_ENC_MAX + 1)) {
-        link_fail_frame("oversized frame", enc, enc_len, now);
+    pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
+                                             4, dec, sizeof(dec), &frame);
+    if (st != PIK_FRAME_OK) {
+        link_fail_frame(pik_frame_status_text(st), enc, enc_len, now);
         return false;
     }
 
-    cobs_ret_t cr = cobs_decode(enc, enc_len, dec, sizeof(dec), &dec_len);
-    if (cr != COBS_RET_SUCCESS) {
-        link_fail_frame(cr == COBS_RET_ERR_BAD_PAYLOAD ? "COBS bad payload" :
-                        cr == COBS_RET_ERR_EXHAUSTED   ? "COBS exhausted" :
-                                                         "COBS bad arg",
-                        enc, enc_len, now);
-        return false;
-    }
-    if (dec_len < 8) {
-        link_fail_frame("short frame", enc, enc_len, now);
-        return false;
-    }
-
-    uint8_t        type    = dec[0];
-    uint8_t        id      = dec[1];
-    uint16_t       seq     = (uint16_t)dec[2] | (uint16_t)dec[3] << 8;
-    size_t         plen    = dec_len - 8;
-    const uint8_t *payload = dec + 4;
-
-    uint32_t got = (uint32_t)dec[dec_len - 4]
-                 | (uint32_t)dec[dec_len - 3] << 8
-                 | (uint32_t)dec[dec_len - 2] << 16
-                 | (uint32_t)dec[dec_len - 1] << 24;
-    if (pik_crc32(dec, 4 + plen) != got) {
-        link_fail_frame("CRC mismatch", enc, enc_len, now);
-        return false;
-    }
+    uint8_t        type    = frame.header[0];
+    uint8_t        id      = frame.header[1];
+    uint16_t       seq     = (uint16_t)frame.header[2] | (uint16_t)frame.header[3] << 8;
+    size_t         plen    = frame.payload_len;
+    const uint8_t *payload = frame.payload;
 
     if (frame_is_reliable(type)) {
         if (seq != g_link.rx_seq) {
@@ -539,21 +514,21 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
 // ── link RX ───────────────────────────────────────────────────────────────────
 static bool link_parse_rx(int64_t now) {
     link_t *lk = &g_link;
-    while (true) {
-        uint8_t *delim = memchr(lk->rxbuf, COBS_FRAME_DELIMITER, lk->rxbuf_len);
-        if (!delim) break;
-        size_t flen = (size_t)(delim - lk->rxbuf);
-        if (flen > 0 && !dispatch_frame(lk->rxbuf, flen + 1, now))
-            return false;
-        size_t consumed = flen + 1;
-        lk->rxbuf_len -= consumed;
-        memmove(lk->rxbuf, lk->rxbuf + consumed, lk->rxbuf_len);
-    }
-    if (lk->rxbuf_len >= sizeof(lk->rxbuf)) {
+    pik_frame_status_t st = pik_frame_rx_consume(lk->rxbuf, &lk->rxbuf_len,
+                                                 sizeof(lk->rxbuf),
+                                                 dispatch_rx_frame, &now);
+    if (st == PIK_FRAME_CALLBACK_FAILED)
+        return false;
+    if (st == PIK_FRAME_RX_OVERFLOW) {
         link_fail_text("RX buffer full without delimiter", now);
         return false;
     }
     return true;
+}
+
+static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len) {
+    int64_t now = *(int64_t *)ctx;
+    return dispatch_frame(enc, enc_len, now);
 }
 
 static bool link_read_available(int64_t now) {

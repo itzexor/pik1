@@ -2,7 +2,8 @@
 
 #include "serialmux.h"
 #include "nanocobs/cobs.h"
-#include "crc32.h"
+#include "fd.h"
+#include "frame.h"
 #include "logging.h"
 #include "tty.h"
 #include "util.h"
@@ -105,13 +106,11 @@ static void log_msg(const char *fmt, ...) {
 
 // ── epoll helpers ─────────────────────────────────────────────────────────────
 static void ep_set(int fd, uint32_t events, void *ptr) {
-    struct epoll_event ev = { .events = events, .data.ptr = ptr };
-    if (epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &ev) == -1)
-        epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
+    pik_epoll_set(g_epfd, fd, events, ptr);
 }
 
 static void ep_del(int fd) {
-    epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, NULL);
+    pik_epoll_del(g_epfd, fd);
 }
 
 // ── channel ring helpers ──────────────────────────────────────────────────────
@@ -190,6 +189,7 @@ static bool lk_drain(link_t *lk) {
 
 // ── frame I/O ────────────────────────────────────────────────────────────────
 static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len);
+static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len);
 static void link_close(link_t *lk, int64_t now);
 
 static void link_fail_frame(link_t *lk, const char *reason,
@@ -220,19 +220,14 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
+    uint8_t header[2];
 
-    dec[0] = type;
-    dec[1] = ch_id;
-    if (plen) memcpy(dec + 2, payload, plen);
-
-    uint32_t crc = pik_crc32(dec, 2 + plen);
-    dec[2 + plen + 0] = (uint8_t)(crc);
-    dec[2 + plen + 1] = (uint8_t)(crc >> 8);
-    dec[2 + plen + 2] = (uint8_t)(crc >> 16);
-    dec[2 + plen + 3] = (uint8_t)(crc >> 24);
+    header[0] = type;
+    header[1] = ch_id;
 
     size_t enc_len = 0;
-    if (cobs_encode(dec, 2 + plen + 4, enc, FRAME_ENC_MAX + 1, &enc_len) != COBS_RET_SUCCESS) {
+    if (pik_frame_encode(header, sizeof(header), payload, plen,
+                         dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
         LOG("cobs_encode failed type=0x%02x ch=%u", type, ch_id);
         return;
     }
@@ -249,27 +244,16 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
 }
 
 static void link_parse_rx(link_t *lk) {
-    while (true) {
-        uint8_t *delim = memchr(lk->rxbuf, COBS_FRAME_DELIMITER, lk->rxbuf_len);
-        if (!delim) break;
-        size_t frame_len = (size_t)(delim - lk->rxbuf);
-        if (frame_len > 0)
-            dispatch_frame(lk, lk->rxbuf, frame_len + 1);
-        size_t consumed = frame_len + 1;
-        lk->rxbuf_len -= consumed;
-        memmove(lk->rxbuf, lk->rxbuf + consumed, lk->rxbuf_len);
-    }
-    if (lk->rxbuf_len >= sizeof(lk->rxbuf)) {
+    pik_frame_status_t st = pik_frame_rx_consume(lk->rxbuf, &lk->rxbuf_len,
+                                                 sizeof(lk->rxbuf),
+                                                 dispatch_rx_frame, lk);
+    if (st == PIK_FRAME_RX_OVERFLOW) {
         LOG("link RX overflow, discarding");
         lk->rxbuf_len = 0;
     }
 }
 
 // ── serial port ───────────────────────────────────────────────────────────────
-static void set_nonblock(int fd) {
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-}
-
 static int open_serial(const char *path, int baud) {
     int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
@@ -388,7 +372,7 @@ static void pty_open(channel_t *c) {
         LOG("ch%u openpty: %s", c->ch_id, strerror(errno));
         return;
     }
-    set_nonblock(c->fd);
+    pik_fd_set_nonblock(c->fd);
     unlink(c->pty_path);
     if (symlink(name, c->pty_path) < 0)
         LOG("ch%u symlink %s: %s", c->ch_id, c->pty_path, strerror(errno));
@@ -485,39 +469,19 @@ static int64_t ch_deadline(const channel_t *c, int64_t now) {
 // ── frame dispatch ────────────────────────────────────────────────────────────
 static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     static uint8_t dec[FRAME_DEC_MAX];
-    size_t dec_len = 0;
+    pik_frame_t frame;
 
-    if (enc_len > (size_t)(FRAME_ENC_MAX + 1)) {
-        link_fail_frame(lk, "oversized frame", enc, enc_len);
+    pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
+                                             2, dec, sizeof(dec), &frame);
+    if (st != PIK_FRAME_OK) {
+        link_fail_frame(lk, pik_frame_status_text(st), enc, enc_len);
         return;
     }
 
-    cobs_ret_t cr = cobs_decode(enc, enc_len, dec, sizeof(dec), &dec_len);
-    if (cr != COBS_RET_SUCCESS) {
-        link_fail_frame(lk,
-            cr == COBS_RET_ERR_BAD_PAYLOAD ? "COBS bad payload" :
-            cr == COBS_RET_ERR_EXHAUSTED   ? "COBS exhausted" : "COBS bad arg",
-            enc, enc_len);
-        return;
-    }
-    if (dec_len < 6) {
-        link_fail_frame(lk, "short frame", enc, enc_len);
-        return;
-    }
-
-    uint8_t        type    = dec[0];
-    uint8_t        ch_id   = dec[1];
-    size_t         plen    = dec_len - 6;
-    const uint8_t *payload = dec + 2;
-
-    uint32_t got = (uint32_t)dec[dec_len - 4]
-                 | (uint32_t)dec[dec_len - 3] << 8
-                 | (uint32_t)dec[dec_len - 2] << 16
-                 | (uint32_t)dec[dec_len - 1] << 24;
-    if (pik_crc32(dec, 2 + plen) != got) {
-        link_fail_frame(lk, "CRC mismatch", enc, enc_len);
-        return;
-    }
+    uint8_t        type    = frame.header[0];
+    uint8_t        ch_id   = frame.header[1];
+    size_t         plen    = frame.payload_len;
+    const uint8_t *payload = frame.payload;
 
     switch (type) {
     case F_HELLO:
@@ -546,6 +510,11 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
                                   : pty_on_frame(c, type, payload, plen);
     if (!ok)
         link_close(lk, pik_now_ms());
+}
+
+static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len) {
+    dispatch_frame((link_t *)ctx, enc, enc_len);
+    return true;
 }
 
 // ── link management ───────────────────────────────────────────────────────────

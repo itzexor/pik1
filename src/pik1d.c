@@ -1,6 +1,7 @@
 // src/pik1d.c - daemon supervisor: USB discovery, child management, mux session loop
 
 #include "serialmux.h"
+#include "fd.h"
 #include "util.h"
 #include "usb_discovery.h"
 
@@ -33,9 +34,7 @@ static void log_msg(const char *fmt, ...) {
 #define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
 
 static void ep_set(int epfd, int fd, uint32_t events, void *ptr) {
-    struct epoll_event ev = { .events = events, .data.ptr = ptr };
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1)
-        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+    pik_epoll_set(epfd, fd, events, ptr);
 }
 
 // ── tcpbridge child management ────────────────────────────────────────────────
