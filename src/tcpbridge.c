@@ -131,12 +131,6 @@ static void log_msg(const char *fmt, ...) {
 #define LOG(...) log_msg(__VA_ARGS__)
 #define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
 
-// ── epoll helpers ─────────────────────────────────────────────────────────────
-static void ep_set(int fd, uint32_t ev, void *tag) {
-    pik_epoll_set(g_epfd, fd, ev, tag);
-}
-static void ep_del(int fd) { pik_epoll_del(g_epfd, fd); }
-
 // ── forward decls ─────────────────────────────────────────────────────────────
 static void link_close(int64_t now);
 static bool enqueue_frame(uint8_t type, uint8_t conn_id,
@@ -174,8 +168,8 @@ static void conn_epoll_update(conn_t *c) {
                   | (conn_avail(c) ? EPOLLOUT : 0u);
     if (want == c->epev) return;
     c->epev = want;
-    if (want) ep_set(c->fd, want, c);
-    else      ep_del(c->fd);
+    if (want) pik_epoll_set(g_epfd, c->fd, want, c);
+    else      pik_epoll_del(g_epfd, c->fd);
 }
 
 // ── flow control ──────────────────────────────────────────────────────────────
@@ -223,7 +217,7 @@ static void lk_update_epoll(void) {
     uint32_t want = EPOLLIN | ((lk->tx_count && lk->tx_tokens) ? EPOLLOUT : 0u);
     if (want != lk->epev) {
         lk->epev = want;
-        ep_set(lk->fd, want, &g_link_tag);
+        pik_epoll_set(g_epfd, lk->fd, want, &g_link_tag);
     }
 }
 
@@ -318,7 +312,7 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
 static void conn_close(int id, bool send_close) {
     conn_t *c = &g_conns[id];
     if (c->fd < 0) return;
-    ep_del(c->fd);
+    pik_epoll_del(g_epfd, c->fd);
     close(c->fd);
     c->fd = -1;
     c->epev = 0;
@@ -349,9 +343,8 @@ static void link_fail_frame(const char *reason, const uint8_t *enc, size_t enc_l
     size_t head = enc_len < 64 ? enc_len : 64;
     pik_log_hex_sample(log_msg, "badframe head", enc, head);
     if (enc_len > head) {
-        size_t tail = enc_len < 64 ? enc_len : 64;
-        LOG("badframe tail starts at +%zu", enc_len - tail);
-        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
+        LOG("badframe tail starts at +%zu", enc_len - head);
+        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - head, head);
     }
     link_close(now);
 }
@@ -567,7 +560,7 @@ static bool link_read_available(int64_t now) {
 static void link_close(int64_t now) {
     link_t *lk = &g_link;
     if (lk->fd >= 0) {
-        ep_del(lk->fd);
+        pik_epoll_del(g_epfd, lk->fd);
         close(lk->fd);
         lk->fd = -1;
         lk->epev = 0;
@@ -584,9 +577,7 @@ static void link_close(int64_t now) {
     lk->tx_token_ms = now;
     lk->paused = false;
 
-    lk->reconnect_at = now + lk->backoff_ms;
-    lk->backoff_ms *= 2;
-    if (lk->backoff_ms > RECONNECT_MAX) lk->backoff_ms = RECONNECT_MAX;
+    lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
 }
 
 static void link_try_open(int64_t now) {
@@ -595,18 +586,14 @@ static void link_try_open(int64_t now) {
 
     int fd = open(lk->dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
-        lk->reconnect_at = now + lk->backoff_ms;
-        lk->backoff_ms *= 2;
-        if (lk->backoff_ms > RECONNECT_MAX) lk->backoff_ms = RECONNECT_MAX;
+        lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
         return;
     }
 
     if (tty_set_byte_raw(fd) < 0) {
         LOG("termios setup failed on %s: %s", lk->dev, strerror(errno));
         close(fd);
-        lk->reconnect_at = now + lk->backoff_ms;
-        lk->backoff_ms *= 2;
-        if (lk->backoff_ms > RECONNECT_MAX) lk->backoff_ms = RECONNECT_MAX;
+        lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
         return;
     }
 
@@ -621,7 +608,7 @@ static void link_try_open(int64_t now) {
     lk->tx_tokens = LINK_TX_BURST;
     lk->tx_token_ms = now;
     lk->epev = EPOLLIN;
-    ep_set(fd, EPOLLIN, &g_link_tag);
+    pik_epoll_set(g_epfd, fd, EPOLLIN, &g_link_tag);
 
     LOG("link opened: %s", lk->dev);
     enqueue_frame(TB_HELLO, 0, NULL, 0);
@@ -725,7 +712,7 @@ static void run(void) {
         }
         if (listen(lfd, 16) < 0) DIE("listen: %s", strerror(errno));
         g_listen_fd = lfd;
-        ep_set(lfd, EPOLLIN, &g_listen_tag);
+        pik_epoll_set(g_epfd, lfd, EPOLLIN, &g_listen_tag);
         LOG("listening on port %d", g_fwd_port);
     }
 

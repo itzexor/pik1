@@ -100,7 +100,6 @@ pik_frame_status_t pik_frame_decode(const uint8_t *enc, size_t enc_len,
     frame->header_len = header_len;
     frame->payload = dec + header_len;
     frame->payload_len = payload_len;
-    frame->decoded_len = dec_len;
     return PIK_FRAME_OK;
 }
 

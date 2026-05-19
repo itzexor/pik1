@@ -33,10 +33,6 @@ static void log_msg(const char *fmt, ...) {
 #define LOG(...) log_msg(__VA_ARGS__)
 #define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
 
-static void ep_set(int epfd, int fd, uint32_t events, void *ptr) {
-    pik_epoll_set(epfd, fd, events, ptr);
-}
-
 // ── tcpbridge child management ────────────────────────────────────────────────
 static struct {
     bool    enabled;
@@ -283,7 +279,7 @@ int main(int argc, char **argv) {
     if (epfd < 0) DIE("epoll_create1: %s", strerror(errno));
 
     static int sig_tag;
-    ep_set(epfd, sig_fd, EPOLLIN, &sig_tag);
+    pik_epoll_set(epfd, sig_fd, EPOLLIN, &sig_tag);
     serialmux_init(&cfg, epfd);
 
     bool shutdown = false;

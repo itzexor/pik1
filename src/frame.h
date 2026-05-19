@@ -22,7 +22,6 @@ typedef struct {
     size_t header_len;
     const uint8_t *payload;
     size_t payload_len;
-    size_t decoded_len;
 } pik_frame_t;
 
 typedef bool (*pik_frame_rx_fn)(void *ctx, const uint8_t *enc, size_t enc_len);

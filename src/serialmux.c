@@ -104,15 +104,6 @@ static void log_msg(const char *fmt, ...) {
 #define LOG(...)  log_msg(__VA_ARGS__)
 #define DIE(...)  do { log_msg(__VA_ARGS__); exit(1); } while(0)
 
-// ── epoll helpers ─────────────────────────────────────────────────────────────
-static void ep_set(int fd, uint32_t events, void *ptr) {
-    pik_epoll_set(g_epfd, fd, events, ptr);
-}
-
-static void ep_del(int fd) {
-    pik_epoll_del(g_epfd, fd);
-}
-
 // ── channel ring helpers ──────────────────────────────────────────────────────
 static uint32_t chan_avail(const channel_t *c) { return c->tx_tail - c->tx_head; }
 static uint32_t chan_space(const channel_t *c) { return CHAN_RING_CAP - chan_avail(c); }
@@ -144,9 +135,9 @@ static void chan_epoll_update(channel_t *c) {
     if (want == c->epev) return;
     c->epev = want;
     if (want)
-        ep_set(c->fd, want, c);
+        pik_epoll_set(g_epfd, c->fd, want, c);
     else
-        ep_del(c->fd);
+        pik_epoll_del(g_epfd, c->fd);
 }
 
 static void chan_pause(channel_t *c)  { if (!c->paused) { c->paused = true;  chan_epoll_update(c); } }
@@ -182,7 +173,7 @@ static bool lk_drain(link_t *lk) {
     uint32_t want = EPOLLIN | (lk_avail(lk) ? EPOLLOUT : 0u);
     if (want != lk->epev && lk->fd >= 0) {
         lk->epev = want;
-        ep_set(lk->fd, want, lk);
+        pik_epoll_set(g_epfd, lk->fd, want, lk);
     }
     return wrote;
 }
@@ -190,7 +181,7 @@ static bool lk_drain(link_t *lk) {
 // ── frame I/O ────────────────────────────────────────────────────────────────
 static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len);
 static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len);
-static void link_close(link_t *lk, int64_t now);
+static void link_close(link_t *lk);
 
 static void link_fail_frame(link_t *lk, const char *reason,
                             const uint8_t *enc, size_t enc_len) {
@@ -199,11 +190,10 @@ static void link_fail_frame(link_t *lk, const char *reason,
     size_t head = enc_len < 64 ? enc_len : 64;
     pik_log_hex_sample(log_msg, "badframe head", enc, head);
     if (enc_len > head) {
-        size_t tail = enc_len < 64 ? enc_len : 64;
-        LOG("badframe tail starts at +%zu", enc_len - tail);
-        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - tail, tail);
+        LOG("badframe tail starts at +%zu", enc_len - head);
+        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - head, head);
     }
-    link_close(lk, pik_now_ms());
+    link_close(lk);
 }
 
 static bool link_can_queue_frame(const link_t *lk, size_t plen) {
@@ -239,7 +229,7 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
 
     if (!(lk->epev & EPOLLOUT) && lk->fd >= 0) {
         lk->epev |= EPOLLOUT;
-        ep_set(lk->fd, lk->epev, lk);
+        pik_epoll_set(g_epfd, lk->fd, lk->epev, lk);
     }
 }
 
@@ -282,7 +272,7 @@ static void mcu_open(channel_t *c, link_t *lk, int64_t now) {
     if (lk->up) mcu_on_link_up(c, lk);
 }
 
-static void mcu_send_data(link_t *lk, channel_t *c, const uint8_t *buf, size_t n) {
+static void ch_send_data(link_t *lk, channel_t *c, const uint8_t *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
         size_t chunk = n - off;
@@ -292,19 +282,22 @@ static void mcu_send_data(link_t *lk, channel_t *c, const uint8_t *buf, size_t n
     }
 }
 
+static bool ch_link_full(channel_t *c, link_t *lk) {
+    if (link_can_queue_frame(lk, MAX_PAYLOAD)) return false;
+    lk->paused = true;
+    chan_pause(c);
+    return true;
+}
+
 static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
-    if (!link_can_queue_frame(lk, MAX_PAYLOAD)) {
-        lk->paused = true;
-        chan_pause(c);
-        return;
-    }
+    if (ch_link_full(c, lk)) return;
 
     static uint8_t buf[MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
         LOG("ch%u UART error: %s", c->ch_id, strerror(errno));
-        ep_del(c->fd);
+        pik_epoll_del(g_epfd, c->fd);
         close(c->fd);
         c->fd = -1;
         c->epev = 0;
@@ -320,12 +313,12 @@ static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
             c->mcu_state = MCU_ACTIVE;
             LOG("ch%u MCU active", c->ch_id);
             enqueue_frame(lk, F_READY, c->ch_id, NULL, 0);
-            mcu_send_data(lk, c, buf + i, (size_t)(n - i));
+            ch_send_data(lk, c, buf + i, (size_t)(n - i));
             return;
         }
         break;
     case MCU_ACTIVE:
-        mcu_send_data(lk, c, buf, (size_t)n);
+        ch_send_data(lk, c, buf, (size_t)n);
         break;
     }
 }
@@ -384,7 +377,7 @@ static void pty_open(channel_t *c) {
 
 static void pty_close(channel_t *c) {
     if (c->fd < 0) return;
-    ep_del(c->fd);
+    pik_epoll_del(g_epfd, c->fd);
     close(c->fd);
     c->fd = -1;
     c->epev = 0;
@@ -395,11 +388,7 @@ static void pty_close(channel_t *c) {
 }
 
 static void pty_on_readable(channel_t *c, link_t *lk) {
-    if (!link_can_queue_frame(lk, MAX_PAYLOAD)) {
-        lk->paused = true;
-        chan_pause(c);
-        return;
-    }
+    if (ch_link_full(c, lk)) return;
 
     static uint8_t buf[MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
@@ -408,13 +397,7 @@ static void pty_on_readable(channel_t *c, link_t *lk) {
         pty_close(c);
         return;
     }
-    size_t off = 0;
-    while (off < (size_t)n) {
-        size_t chunk = (size_t)n - off;
-        if (chunk > MAX_PAYLOAD) chunk = MAX_PAYLOAD;
-        enqueue_frame(lk, F_DATA, c->ch_id, buf + off, chunk);
-        off += chunk;
-    }
+    ch_send_data(lk, c, buf, (size_t)n);
 }
 
 static void pty_on_writable(channel_t *c) {
@@ -509,20 +492,19 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     bool ok = (c->type == CH_MCU) ? mcu_on_frame(c, type, payload, plen)
                                   : pty_on_frame(c, type, payload, plen);
     if (!ok)
-        link_close(lk, pik_now_ms());
+        link_close(lk);
 }
 
 static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len) {
     dispatch_frame((link_t *)ctx, enc, enc_len);
-    return true;
+    return !g_session_failed;
 }
 
 // ── link management ───────────────────────────────────────────────────────────
-static void link_close(link_t *lk, int64_t now) {
-    (void)now;
+static void link_close(link_t *lk) {
     g_session_failed = true;
     if (lk->fd >= 0) {
-        ep_del(lk->fd);
+        pik_epoll_del(g_epfd, lk->fd);
         close(lk->fd);
         lk->fd = -1;
         lk->epev = 0;
@@ -558,7 +540,7 @@ static bool link_open(link_t *lk, const char *dev, int64_t now) {
     lk->last_rx_ms = lk->last_tx_ms = now;
     lk->up   = false;
     lk->epev = EPOLLIN;
-    ep_set(lk->fd, EPOLLIN, lk);
+    pik_epoll_set(g_epfd, lk->fd, EPOLLIN, lk);
 
     LOG("link opened: %s", dev);
     enqueue_frame(lk, F_HELLO, 0, NULL, 0);
@@ -577,7 +559,7 @@ static void link_on_readable(link_t *lk, int64_t now) {
     if (n <= 0) {
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
         LOG("link read: %s", n == 0 ? "EOF" : strerror(errno));
-        link_close(lk, now);
+        link_close(lk);
         return;
     }
     lk->last_rx_ms = now;
@@ -604,7 +586,7 @@ static void link_tick(link_t *lk, int64_t now) {
             enqueue_frame(lk, F_PING, 0, NULL, 0);
         if ((now - lk->last_rx_ms) > LINK_DEAD_RX_MS) {
             LOG("link RX timeout");
-            link_close(lk, now);
+            link_close(lk);
             return;
         }
     }
@@ -670,7 +652,7 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
     if (g_session_failed) return false;
     if (ptr == &g_link) {
         if (events & (EPOLLERR | EPOLLHUP)) {
-            link_close(&g_link, now);
+            link_close(&g_link);
             return false;
         }
         if (events & EPOLLIN) link_on_readable(&g_link, now);
@@ -680,7 +662,7 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
 
     channel_t *c = (channel_t *)ptr;
     if (events & (EPOLLERR | EPOLLHUP)) {
-        ep_del(c->fd);
+        pik_epoll_del(g_epfd, c->fd);
         close(c->fd);
         c->fd = -1;
         c->epev = 0;
@@ -714,7 +696,7 @@ int64_t serialmux_deadline(int64_t now) {
 
 void serialmux_cleanup(void) {
     if (g_link.fd >= 0) {
-        ep_del(g_link.fd);
+        pik_epoll_del(g_epfd, g_link.fd);
         close(g_link.fd);
         g_link.fd = -1;
         g_link.epev = 0;
@@ -727,7 +709,7 @@ void serialmux_cleanup(void) {
     for (int i = 0; i < g_n_chans; i++) {
         channel_t *c = &g_chans[i];
         if (c->fd >= 0) {
-            ep_del(c->fd);
+            pik_epoll_del(g_epfd, c->fd);
             close(c->fd);
             c->fd = -1;
         }
