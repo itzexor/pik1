@@ -288,9 +288,7 @@ static bool read_available(int64_t now) {
             return false;
         }
         if (n == 0) {
-            LOG("read: EOF");
-            close_link();
-            return false;
+            return true;
         }
         g_ctrl.last_rx_ms = now;
         g_ctrl.rxbuf_len += (size_t)n;

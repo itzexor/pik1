@@ -507,9 +507,7 @@ static bool link_read_available(int64_t now) {
             return false;
         }
         if (r == 0) {
-            LOG("link read: EOF");
-            link_close(now);
-            return false;
+            return true;
         }
 
         g_rx_reads++;

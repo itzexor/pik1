@@ -277,7 +277,7 @@ static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
     static uint8_t buf[MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
-        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EINTR))) return;
         LOG("ch%u UART error: %s", c->ch_id, strerror(errno));
         pik_epoll_del(g_epfd, c->fd);
         close(c->fd);
@@ -522,8 +522,8 @@ static void link_on_readable(link_t *lk) {
 
     ssize_t n = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
     if (n <= 0) {
-        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
-        LOG("link read: %s", n == 0 ? "EOF" : strerror(errno));
+        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EINTR))) return;
+        LOG("link read: %s", strerror(errno));
         link_close(lk);
         return;
     }
