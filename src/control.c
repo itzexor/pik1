@@ -21,6 +21,7 @@
 #define C_PONG    0x03u
 #define C_COMMAND 0x04u
 #define C_ACK     0x05u
+#define C_LINK_STATE 0x06u
 
 #define HELLO_MAGIC_0 'P'
 #define HELLO_MAGIC_1 'I'
@@ -65,6 +66,9 @@ typedef struct {
     uint8_t ack_status;
     uint8_t ack_payload[MAX_PAYLOAD - 5u];
     size_t ack_payload_len;
+
+    bool peer_link_known;
+    uint32_t peer_link_flags;
 } control_t;
 
 static control_t g_ctrl;
@@ -255,6 +259,14 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             memcpy(g_ctrl.ack_payload, p + 5, g_ctrl.ack_payload_len);
         g_ctrl.ack_pending = true;
         return true;
+    case C_LINK_STATE:
+        if (len != 4) return true;
+        g_ctrl.peer_link_flags = pik_get_u32le(p);
+        g_ctrl.peer_link_known = true;
+        LOG("peer data links: serial=%s tcp=%s",
+            (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_SERIAL) ? "up" : "down",
+            (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_TCP) ? "up" : "down");
+        return true;
     default:
         return true;
     }
@@ -424,6 +436,8 @@ void pik_control_cleanup(void) {
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
     clear_pending_ack();
+    g_ctrl.peer_link_known = false;
+    g_ctrl.peer_link_flags = 0;
 }
 
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id) {
@@ -460,4 +474,16 @@ void pik_control_send_ack(uint32_t request_id, uint8_t status,
     if (payload_len)
         memcpy(p + 5, payload, payload_len);
     enqueue_frame(C_ACK, p, 5 + payload_len);
+}
+
+bool pik_control_send_link_state(uint32_t flags) {
+    uint8_t p[4];
+    pik_put_u32le(p, flags);
+    return enqueue_frame(C_LINK_STATE, p, sizeof(p));
+}
+
+bool pik_control_peer_link_state(uint32_t *flags) {
+    if (!g_ctrl.peer_link_known) return false;
+    if (flags) *flags = g_ctrl.peer_link_flags;
+    return true;
 }

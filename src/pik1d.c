@@ -53,6 +53,7 @@ static local_control_t g_local = {
 static int g_local_listen_tag;
 
 static const char *g_mode_name;
+static uint32_t g_link_flags;
 static pik_control_action_t g_remote_action;
 static bool g_remote_action_pending;
 static int64_t g_remote_action_at_ms;
@@ -273,15 +274,51 @@ static int64_t local_control_deadline(void) {
     return dl;
 }
 
+static void append_link_names(char *buf, size_t cap, uint32_t flags) {
+    if (flags == 0) {
+        snprintf(buf, cap, "none");
+    } else if ((flags & (PIK_CONTROL_LINK_SERIAL | PIK_CONTROL_LINK_TCP)) ==
+               (PIK_CONTROL_LINK_SERIAL | PIK_CONTROL_LINK_TCP)) {
+        snprintf(buf, cap, "serial,tcp");
+    } else if (flags & PIK_CONTROL_LINK_SERIAL) {
+        snprintf(buf, cap, "serial");
+    } else if (flags & PIK_CONTROL_LINK_TCP) {
+        snprintf(buf, cap, "tcp");
+    } else {
+        snprintf(buf, cap, "unknown");
+    }
+}
+
+static void set_link_flags(uint32_t flags) {
+    if (g_link_flags == flags) return;
+    g_link_flags = flags;
+    if (pik_control_ready())
+        pik_control_send_link_state(g_link_flags);
+}
+
+static void set_link_flag(uint32_t flag, bool up) {
+    uint32_t flags = up ? (g_link_flags | flag) : (g_link_flags & ~flag);
+    set_link_flags(flags);
+}
+
 static void on_control_command(pik_control_action_t action, uint32_t request_id, void *ctx) {
     (void)ctx;
     LOG("received command %s request=%u", pik_control_action_name(action), request_id);
     if (action == PIK_CONTROL_ACTION_STATUS) {
-        char status[96];
+        char links[24];
+        char peer_links[24];
+        uint32_t peer_flags;
+        append_link_names(links, sizeof(links), g_link_flags);
+        if (pik_control_peer_link_state(&peer_flags))
+            append_link_names(peer_links, sizeof(peer_links), peer_flags);
+        else
+            snprintf(peer_links, sizeof(peer_links), "unknown");
+
+        char status[128];
         int n = snprintf(status, sizeof(status),
-                         "mode=%s release=%s protocol=%u features=0x%08x",
+                         "mode=%s release=%s proto=%u feat=0x%08x links=%s peer=%s",
                          g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
-                         PIK1_FEATURE_FLAGS);
+                         PIK1_FEATURE_FLAGS, links, peer_links);
         if (n < 0) {
             pik_control_send_ack(request_id, 1, NULL, 0);
             return;
@@ -342,6 +379,7 @@ static void child_spawn(const char *tunnel_dev, int64_t now) {
     g_child.backoff_ms = RETRY_MIN_MS;
     g_child.intentional_stop = false;
     g_child.waiting_for_tunnel = false;
+    set_link_flag(PIK_CONTROL_LINK_TCP, true);
     LOG("child: spawned %s pid=%d", g_child.argv[0], pid);
 }
 
@@ -349,6 +387,7 @@ static void child_stop(void) {
     if (g_child.pid <= 0) {
         g_child.pid = -1;
         g_child.restart_at_ms = 0;
+        set_link_flag(PIK_CONTROL_LINK_TCP, false);
         return;
     }
 
@@ -358,6 +397,7 @@ static void child_stop(void) {
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
     g_child.pid = -1;
     g_child.restart_at_ms = 0;
+    set_link_flag(PIK_CONTROL_LINK_TCP, false);
     g_child.intentional_stop = false;
 }
 
@@ -369,6 +409,7 @@ static void child_handle_sigchld(int64_t now, bool session_active) {
     if (r <= 0) return;
 
     g_child.pid = -1;
+    set_link_flag(PIK_CONTROL_LINK_TCP, false);
     if (g_child.intentional_stop) {
         g_child.restart_at_ms = 0;
         return;
@@ -617,7 +658,7 @@ int main(int argc, char **argv) {
     while (!shutdown) {
         int64_t now = pik_now_ms();
 
-        if (!session_active && now >= usb_retry_at) {
+    if (!session_active && now >= usb_retry_at) {
             usb_wait_state_t state = usb_resolve(vidpid, has_tcp,
                                                  control_dev, sizeof(control_dev),
                                                  serial_dev, sizeof(serial_dev),
@@ -629,6 +670,7 @@ int main(int argc, char **argv) {
 
             if (state == USB_WAIT_READY) {
                 if (pik_control_start(control_dev, now)) {
+                    g_link_flags = 0;
                     session_active = true;
                     session_confirmed = false;
                     usb_retry_at = 0;
@@ -649,6 +691,7 @@ int main(int argc, char **argv) {
             if (serialmux_start(serial_dev, now)) {
                 session_confirmed = true;
                 usb_backoff_ms = RETRY_MIN_MS;
+                set_link_flag(PIK_CONTROL_LINK_SERIAL, true);
                 LOG("data session started: serial=%s%s%s",
                     serial_dev, has_tcp ? " tunnel=" : "",
                     has_tcp ? tunnel_dev : "");
@@ -656,6 +699,7 @@ int main(int argc, char **argv) {
                     child_spawn(tunnel_dev, now);
             } else {
                 LOG("serial mux failed to start");
+                set_link_flag(PIK_CONTROL_LINK_SERIAL, false);
                 session_active = false;
                 session_confirmed = false;
                 child_stop();
@@ -718,6 +762,7 @@ int main(int argc, char **argv) {
             if (pik_control_owns_event(ptr)) {
                 if (session_active && !pik_control_dispatch(ptr, ev, now)) {
                     LOG("control session failed, restarting USB link");
+                    set_link_flags(0);
                     session_active = false;
                     session_confirmed = false;
                     child_stop();
@@ -741,6 +786,7 @@ int main(int argc, char **argv) {
 
             if (session_confirmed && !serialmux_dispatch(ptr, ev, now)) {
                 LOG("session failed, restarting USB link");
+                set_link_flags(0);
                 session_active = false;
                 session_confirmed = false;
                 child_stop();
@@ -759,6 +805,7 @@ int main(int argc, char **argv) {
 
         if (session_active && !pik_control_tick(now)) {
             LOG("control session failed, restarting USB link");
+            set_link_flags(0);
             session_active = false;
             session_confirmed = false;
             child_stop();
@@ -770,6 +817,7 @@ int main(int argc, char **argv) {
 
         if (session_confirmed && !serialmux_tick(now)) {
             LOG("session failed, restarting USB link");
+            set_link_flags(0);
             session_active = false;
             session_confirmed = false;
             child_stop();

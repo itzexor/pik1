@@ -16,6 +16,11 @@ typedef enum {
     PIK_CONTROL_ACTION_STATUS = 4,
 } pik_control_action_t;
 
+enum {
+    PIK_CONTROL_LINK_SERIAL = 1u << 0,
+    PIK_CONTROL_LINK_TCP    = 1u << 1,
+};
+
 typedef void (*pik_control_command_fn)(pik_control_action_t action,
                                        uint32_t request_id,
                                        void *ctx);
@@ -35,5 +40,7 @@ bool pik_control_take_ack(uint32_t *request_id, uint8_t *status,
                           const uint8_t **payload, size_t *payload_len);
 void pik_control_send_ack(uint32_t request_id, uint8_t status,
                           const uint8_t *payload, size_t payload_len);
+bool pik_control_send_link_state(uint32_t flags);
+bool pik_control_peer_link_state(uint32_t *flags);
 
 const char *pik_control_action_name(pik_control_action_t action);
