@@ -63,7 +63,7 @@ typedef struct {
     uint32_t next_request_id;
     bool ack_pending;
     uint32_t ack_request_id;
-    uint8_t ack_status;
+    pik_control_ack_status_t ack_status;
     uint8_t ack_payload[MAX_PAYLOAD - 5u];
     size_t ack_payload_len;
 
@@ -87,6 +87,15 @@ const char *pik_control_action_name(pik_control_action_t action) {
     case PIK_CONTROL_ACTION_POWEROFF_EXPORTER: return "poweroff-exporter";
     case PIK_CONTROL_ACTION_STATUS: return "status";
     default: return "unknown";
+    }
+}
+
+const char *pik_control_ack_status_name(pik_control_ack_status_t status) {
+    switch (status) {
+    case PIK_CONTROL_ACK_OK: return "ok";
+    case PIK_CONTROL_ACK_UNKNOWN_ACTION: return "unknown-action";
+    case PIK_CONTROL_ACK_INTERNAL_ERROR: return "internal-error";
+    default: return "unknown-status";
     }
 }
 
@@ -241,7 +250,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             uint32_t request_id = pik_get_u32le(p);
             if (!action_valid(action)) {
                 LOG("rejecting unknown command action=%u request=%u", p[4], request_id);
-                pik_control_send_ack(request_id, 1, NULL, 0);
+                pik_control_send_ack(request_id, PIK_CONTROL_ACK_UNKNOWN_ACTION, NULL, 0);
                 return true;
             }
             if (g_ctrl.on_command)
@@ -251,7 +260,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
     case C_ACK:
         if (len < 5) return true;
         g_ctrl.ack_request_id = pik_get_u32le(p);
-        g_ctrl.ack_status = p[4];
+        g_ctrl.ack_status = (pik_control_ack_status_t)p[4];
         g_ctrl.ack_payload_len = len - 5;
         if (g_ctrl.ack_payload_len > sizeof(g_ctrl.ack_payload))
             g_ctrl.ack_payload_len = sizeof(g_ctrl.ack_payload);
@@ -453,7 +462,7 @@ bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id)
     return true;
 }
 
-bool pik_control_take_ack(uint32_t *request_id, uint8_t *status,
+bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status,
                           const uint8_t **payload, size_t *payload_len) {
     if (!g_ctrl.ack_pending) return false;
     if (request_id) *request_id = g_ctrl.ack_request_id;
@@ -464,7 +473,7 @@ bool pik_control_take_ack(uint32_t *request_id, uint8_t *status,
     return true;
 }
 
-void pik_control_send_ack(uint32_t request_id, uint8_t status,
+void pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
                           const uint8_t *payload, size_t payload_len) {
     uint8_t p[MAX_PAYLOAD];
     if (payload_len > sizeof(p) - 5)

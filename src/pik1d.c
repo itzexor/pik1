@@ -196,6 +196,12 @@ static void local_control_reply_and_close(const char *msg) {
     local_control_close_client();
 }
 
+static void local_control_reply_error_status(pik_control_ack_status_t status) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "ERR peer %s\n", pik_control_ack_status_name(status));
+    local_control_reply_and_close(msg);
+}
+
 static void local_control_accept(void) {
     int fd = accept4(g_local.listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) return;
@@ -237,25 +243,29 @@ static void local_control_read(int64_t now) {
 
 static void local_control_check_ack(int64_t now) {
     uint32_t request_id;
-    uint8_t status;
+    pik_control_ack_status_t status;
     const uint8_t *payload;
     size_t payload_len;
     while (pik_control_take_ack(&request_id, &status, &payload, &payload_len)) {
         if (g_local.command_pending && request_id == g_local.request_id) {
-            if (status == 0 && payload_len) {
+            if (status == PIK_CONTROL_ACK_OK && payload_len) {
                 local_control_write(g_local.client_fd, "OK ", 3);
                 local_control_write(g_local.client_fd, payload, payload_len);
                 local_control_write(g_local.client_fd, "\n", 1);
                 local_control_close_client();
             } else {
-                local_control_reply_and_close(status == 0 ? "OK\n" : "ERR peer command failed\n");
+                if (status == PIK_CONTROL_ACK_OK)
+                    local_control_reply_and_close("OK\n");
+                else
+                    local_control_reply_error_status(status);
             }
         } else if (g_signal_command_pending && request_id == g_signal_request_id) {
-            LOG("restart command ack status=%u", status);
+            LOG("restart command ack status=%s", pik_control_ack_status_name(status));
             g_signal_command_pending = false;
             g_signal_command_done = true;
         } else {
-            LOG("command ack request=%u status=%u", request_id, status);
+            LOG("command ack request=%u status=%s",
+                request_id, pik_control_ack_status_name(status));
         }
     }
     if (g_local.command_pending && now >= g_local.deadline_ms)
@@ -320,15 +330,15 @@ static void on_control_command(pik_control_action_t action, uint32_t request_id,
                          g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
                          PIK1_FEATURE_FLAGS, links, peer_links);
         if (n < 0) {
-            pik_control_send_ack(request_id, 1, NULL, 0);
+            pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR, NULL, 0);
             return;
         }
         size_t len = (size_t)n < sizeof(status) ? (size_t)n : sizeof(status) - 1;
-        pik_control_send_ack(request_id, 0, (const uint8_t *)status, len);
+        pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, (const uint8_t *)status, len);
         return;
     }
 
-    pik_control_send_ack(request_id, 0, NULL, 0);
+    pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, NULL, 0);
     g_remote_action = action;
     g_remote_action_pending = true;
     g_remote_action_at_ms = pik_now_ms() + REMOTE_ACTION_DELAY_MS;
