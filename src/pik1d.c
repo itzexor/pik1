@@ -3,6 +3,7 @@
 #include "control.h"
 #include "serialmux.h"
 #include "fd.h"
+#include "logging.h"
 #include "util.h"
 #include "usb_discovery.h"
 #include "version.h"
@@ -11,7 +12,6 @@
 #include <libgen.h>
 #include <limits.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,14 +32,8 @@
 #define COMMAND_ACK_TIMEOUT_MS 3000
 #define REMOTE_ACTION_DELAY_MS 250
 
-static void log_msg(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    fputs("[pik1] ", stderr);
-    vfprintf(stderr, fmt, ap); va_end(ap);
-    fputc('\n', stderr);
-}
-#define LOG(...) log_msg(__VA_ARGS__)
-#define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
+#define LOG(...) pik_log("pik1", __VA_ARGS__)
+#define DIE(...) pik_die("pik1", __VA_ARGS__)
 
 // ── local control client/server ───────────────────────────────────────────────
 typedef struct {
@@ -306,7 +300,7 @@ static void child_spawn(const char *tunnel_dev, int64_t now) {
         sigfillset(&all);
         sigprocmask(SIG_UNBLOCK, &all, NULL);
         execvp(g_child.argv[0], g_child.argv);
-        fprintf(stderr, "child: execvp %s: %s\n", g_child.argv[0], strerror(errno));
+        LOG("child: execvp %s: %s", g_child.argv[0], strerror(errno));
         _exit(127);
     }
 

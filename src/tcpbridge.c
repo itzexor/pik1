@@ -16,7 +16,6 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -115,14 +114,8 @@ static uint64_t g_tx_writes;
 static uint64_t g_tx_bytes;
 
 // ── logging ───────────────────────────────────────────────────────────────────
-static void log_msg(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    fputs("[tcp] ", stderr);
-    vfprintf(stderr, fmt, ap); va_end(ap);
-    fputc('\n', stderr);
-}
-#define LOG(...) log_msg(__VA_ARGS__)
-#define DIE(...) do { log_msg(__VA_ARGS__); exit(1); } while (0)
+#define LOG(...) pik_log("tcp", __VA_ARGS__)
+#define DIE(...) pik_die("tcp", __VA_ARGS__)
 
 // ── forward decls ─────────────────────────────────────────────────────────────
 static void link_close(int64_t now);
@@ -329,12 +322,7 @@ static void link_fail_frame(const char *reason, const uint8_t *enc, size_t enc_l
         (unsigned long long)g_rx_bytes,
         (unsigned long long)g_tx_writes,
         (unsigned long long)g_tx_bytes);
-    size_t head = enc_len < 64 ? enc_len : 64;
-    pik_log_hex_sample(log_msg, "badframe head", enc, head);
-    if (enc_len > head) {
-        LOG("badframe tail starts at +%zu", enc_len - head);
-        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - head, head);
-    }
+    pik_log_bad_frame_sample("tcp", enc, enc_len);
     link_close(now);
 }
 

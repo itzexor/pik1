@@ -11,7 +11,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pty.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -87,14 +86,8 @@ static int       g_epfd = -1;
 static bool      g_session_failed;
 
 // ── logging ───────────────────────────────────────────────────────────────────
-static void log_msg(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    fputs("[mux] ", stderr);
-    vfprintf(stderr, fmt, ap); va_end(ap);
-    fputc('\n', stderr);
-}
-#define LOG(...)  log_msg(__VA_ARGS__)
-#define DIE(...)  do { log_msg(__VA_ARGS__); exit(1); } while(0)
+#define LOG(...)  pik_log("mux", __VA_ARGS__)
+#define DIE(...)  pik_die("mux", __VA_ARGS__)
 
 // ── channel ring helpers ──────────────────────────────────────────────────────
 static uint32_t chan_avail(const channel_t *c) { return c->tx_tail - c->tx_head; }
@@ -179,12 +172,7 @@ static void link_fail_frame(link_t *lk, const char *reason,
                             const uint8_t *enc, size_t enc_len) {
     LOG("link failure: %s enc_len=%zu first=0x%02x", reason, enc_len,
         enc_len ? enc[0] : 0);
-    size_t head = enc_len < 64 ? enc_len : 64;
-    pik_log_hex_sample(log_msg, "badframe head", enc, head);
-    if (enc_len > head) {
-        LOG("badframe tail starts at +%zu", enc_len - head);
-        pik_log_hex_sample(log_msg, "badframe tail", enc + enc_len - head, head);
-    }
+    pik_log_bad_frame_sample("mux", enc, enc_len);
     link_close(lk);
 }
 

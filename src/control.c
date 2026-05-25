@@ -9,7 +9,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,13 +69,7 @@ static control_t g_ctrl;
 static int g_epfd = -1;
 static int g_ctrl_tag;
 
-static void log_msg(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    fputs("[ctrl] ", stderr);
-    vfprintf(stderr, fmt, ap); va_end(ap);
-    fputc('\n', stderr);
-}
-#define LOG(...) log_msg(__VA_ARGS__)
+#define LOG(...) pik_log("ctrl", __VA_ARGS__)
 
 static uint32_t avail(void) { return g_ctrl.tx_tail - g_ctrl.tx_head; }
 static uint32_t space(void) { return TX_RING_CAP - avail(); }
