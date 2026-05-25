@@ -2,7 +2,7 @@
 // Wire protocol: COBS + CRC32, frame layout:
 //   [type:1][conn_id:1][seq_le:2][payload][crc32_le:4]
 // Sequencing is detection-only: any reliable-frame gap is treated as link failure.
-// Runs on ttyGS1 (K1C) / ttyACM1 (Pi).
+// Runs on ttyGS2 (K1C) / ttyACM2 (Pi).
 
 #include "nanocobs/cobs.h"
 #include "fd.h"
@@ -27,9 +27,6 @@
 #include <unistd.h>
 
 // ── frame types ───────────────────────────────────────────────────────────────
-#define TB_HELLO  0x10u
-#define TB_PING   0x11u
-#define TB_PONG   0x12u
 #define TB_OPEN   0x20u
 #define TB_DATA   0x21u
 #define TB_CLOSE  0x22u
@@ -55,8 +52,6 @@
 #define LINK_TX_RATE_BPS  6000000u
 #define LINK_TX_BURST     4096u
 
-#define PING_IDLE_MS      3000
-#define LINK_DEAD_MS      10000
 #define RECONNECT_MIN     500
 #define RECONNECT_MAX     8000
 
@@ -276,10 +271,7 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
                           const uint8_t *payload, size_t plen) {
     link_t *lk = &g_link;
     if (plen > MAX_PAYLOAD) return false;
-    if (type != TB_HELLO && !lk->up && lk->fd >= 0) return true;
-    if (type == TB_HELLO && lk->tx_count) return true;
-    if ((type == TB_PING || type == TB_PONG) && lk->tx_count >= LINK_TXQ_CAP)
-        return true;
+    if (!lk->up && lk->fd >= 0) return true;
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
@@ -413,21 +405,6 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
     }
 
     switch (type) {
-    case TB_HELLO:
-        if (!g_link.up) {
-            g_link.up = true;
-            g_link.rx_seq = 0;
-            g_link.tx_seq = 0;
-            LOG("link up");
-            enqueue_frame(TB_HELLO, 0, NULL, 0);
-        }
-        return true;
-    case TB_PING:
-        enqueue_frame(TB_PONG, 0, NULL, 0);
-        return true;
-    case TB_PONG:
-        return true;
-
     case TB_OPEN:
         if (g_is_listener || id >= MAX_CONNS) {
             enqueue_frame(TB_CLOSE, id, NULL, 0);
@@ -602,7 +579,7 @@ static void link_try_open(int64_t now) {
     lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
     lk->tx_seq = lk->rx_seq = 0;
     lk->last_rx_ms = lk->last_tx_ms = now;
-    lk->up = false;
+    lk->up = true;
     lk->paused = false;
     lk->backoff_ms = RECONNECT_MIN;
     lk->tx_tokens = LINK_TX_BURST;
@@ -611,7 +588,7 @@ static void link_try_open(int64_t now) {
     pik_epoll_set(g_epfd, fd, EPOLLIN, &g_link_tag);
 
     LOG("link opened: %s", lk->dev);
-    enqueue_frame(TB_HELLO, 0, NULL, 0);
+    LOG("link up");
 }
 
 // ── listener / TCP input ──────────────────────────────────────────────────────
@@ -730,7 +707,6 @@ static void run(void) {
         if (g_link.fd < 0) {
             dl = g_link.reconnect_at;
         } else {
-            if (g_link.up) dl = g_link.last_tx_ms + PING_IDLE_MS;
             if (g_link.tx_count && !g_link.tx_tokens) {
                 int64_t tx_dl = now + 1;
                 if (tx_dl < dl) dl = tx_dl;
@@ -780,16 +756,6 @@ static void run(void) {
         now = pik_now_ms();
         if (g_link.fd < 0) {
             if (now >= g_link.reconnect_at) link_try_open(now);
-        } else if (g_link.up) {
-            if ((now - g_link.last_tx_ms) > PING_IDLE_MS)
-                enqueue_frame(TB_PING, 0, NULL, 0);
-            if ((now - g_link.last_rx_ms) > LINK_DEAD_MS) {
-                LOG("link RX timeout");
-                link_close(now);
-            }
-        } else {
-            if (!g_link.tx_count && (now - g_link.last_tx_ms) > 2000)
-                enqueue_frame(TB_HELLO, 0, NULL, 0);
         }
 
         if (!g_link.paused &&

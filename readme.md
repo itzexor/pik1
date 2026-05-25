@@ -7,9 +7,10 @@
 ## Overview
 
 `pik1d` is a small C daemon that bridges the K1 MCU serial ports to PTYs on the
-Pi over a USB CDC ACM link. It uses the `serialmux` code for the MCU channels and
-can also launch a sibling `tcpbridge` process for a second CDC ACM link used by
-the touchscreen Moonraker tunnel.
+Pi over USB CDC ACM links. Endpoint 0 is a dedicated control channel for
+version checks, link liveness, and remote restart/shutdown commands. Endpoint 1
+is the MCU serial mux. Endpoint 2 is a sibling `tcpbridge` process used by the
+touchscreen Moonraker tunnel.
 
 The TCP tunnel is intended for low-bandwidth Moonraker API traffic from the K1
 touchscreen to the Pi. It should not be used for high-bandwidth traffic such as
@@ -130,8 +131,9 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
     ```
 
     This copies the binaries and setup script to `/opt/pik1/`, installs and enables
-    `pik1.service`, and runs `systemctl daemon-reload`. Pass `SUDO=` if running as
-    root, or `PI_DIR=/your/path` to override the install prefix.
+    `pik1.service` and the peer reboot/poweroff helper units, and runs
+    `systemctl daemon-reload`. Pass `SUDO=` if running as root, or
+    `PI_DIR=/your/path` to override the install prefix.
 
     The service runs `setup_pik1.sh` as root first (needed for configfs access),
     then starts `pik1d` as UID 1000 so the PTY devices it creates
@@ -240,11 +242,11 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
 ## K1 touchscreen TCP tunnel
 
 The TCP tunnel forwards the Simple AF K1 touchscreen's (guppyscreen) Moonraker
-requests to the Pi over the second USB CDC ACM link. This is strongly recommended over the
+requests to the Pi over the dedicated third USB CDC ACM link. This is strongly recommended over the
 alternative of pointing guppyscreen at the Pi's WiFi IP address -- WiFi is
 unreliable enough that you will eventually lose display functionality mid-print.
-The tunnel runs over the same wired USB link as the MCU bridge and stays up as
-long as the physical connection does.
+The tunnel runs over the same wired USB connection as the control and MCU
+bridges and stays up as long as the physical connection does.
 
 The tunnel is low-bandwidth and intended for Moonraker API traffic only
 (temperatures, print status, controls). Do not route webcam streams or file
@@ -309,11 +311,15 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
     setup_pik1: gadget setup complete
-    [pik1] mode=host channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyGS1
+    [pik1] mode=host release=0.2.0 protocol=1 channels=2 tcp=127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    [ctrl] link opened: /dev/ttyGS0
+    [ctrl] link up: release=0.2.0 protocol=1 features=0x00000000
+    [pik1] control session started: control=/dev/ttyGS0 serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
+    [pik1] data session started: serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
     [pik1] child: spawned /opt/pik1/tcpbridge pid=...
-    [mux] link opened: /dev/ttyGS0
-    [tcp] tcpbridge /dev/ttyGS1 forward 127.0.0.1:7125
-    [tcp] link opened: /dev/ttyGS1
+    [mux] link opened: /dev/ttyGS1
+    [tcp] tcpbridge /dev/ttyGS2 forward 127.0.0.1:7125
+    [tcp] link opened: /dev/ttyGS2
     [mux] link up
     [tcp] link up
     [mux] ch0 PTY /tmp/klipper_mcu -> /dev/pts/2
@@ -327,12 +333,16 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     A normal startup looks like. Because `pik1d` and `tcpbridge` write to the
     same log, adjacent lines may occasionally interleave:
     ```
-    [pik1] mode=exporter channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyACM1
+    [pik1] mode=exporter release=0.2.0 protocol=1 channels=2 tcp=127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    [ctrl] link opened: /dev/ttyACM0
+    [ctrl] link up: release=0.2.0 protocol=1 features=0x00000000
+    [pik1] control session started: control=/dev/ttyACM0 serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
+    [pik1] data session started: serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
     [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
-    [mux] link opened: /dev/ttyACM0
-    [tcp] tcpbridge /dev/ttyACM1 listen 127.0.0.1:7125
+    [mux] link opened: /dev/ttyACM1
+    [tcp] tcpbridge /dev/ttyACM2 listen 127.0.0.1:7125
     [tcp] listening on port 7125
-    [tcp] link opened: /dev/ttyACM1
+    [tcp] link opened: /dev/ttyACM2
     [mux] link up
     [tcp] link up
     [mux] ch0 MCU active

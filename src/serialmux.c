@@ -24,9 +24,6 @@
 #define F_DATA   0x01u
 #define F_FLUSH  0x02u
 #define F_READY  0x03u
-#define F_HELLO  0x05u
-#define F_PING   0x20u
-#define F_PONG   0x21u
 
 // ── sizing ────────────────────────────────────────────────────────────────────
 #define MAX_PAYLOAD     4096
@@ -44,9 +41,6 @@
 
 // timing (ms)
 #define RESET_SILENCE_MS  5000
-#define PING_IDLE_TX_MS   3000
-#define LINK_DEAD_RX_MS   10000
-
 // ── types ─────────────────────────────────────────────────────────────────────
 typedef enum { MCU_INIT, MCU_ACTIVE, MCU_RESETTING } mcu_state_t;
 
@@ -203,10 +197,8 @@ static bool link_can_queue_frame(const link_t *lk, size_t plen) {
 
 static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
                            const uint8_t *payload, size_t plen) {
-    if (!lk->up && type != F_HELLO) return;
+    if (!lk->up) return;
     if (plen > MAX_PAYLOAD) return;
-    if (type == F_HELLO && lk_avail(lk) > 0) return;
-    if ((type == F_PING || type == F_PONG) && !link_can_queue_frame(lk, plen)) return;
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
@@ -466,26 +458,6 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     size_t         plen    = frame.payload_len;
     const uint8_t *payload = frame.payload;
 
-    switch (type) {
-    case F_HELLO:
-        if (!lk->up) {
-            lk->up = true;
-            LOG("link up");
-            enqueue_frame(lk, F_HELLO, 0, NULL, 0);
-            for (int i = 0; i < g_n_chans; i++) {
-                channel_t *c = &g_chans[i];
-                if (c->type == CH_MCU) mcu_on_link_up(c, lk);
-            }
-        }
-        return;
-    case F_PING:
-        enqueue_frame(lk, F_PONG, 0, NULL, 0);
-        return;
-    case F_PONG:
-        return;
-    default: break;
-    }
-
     channel_t *c = find_channel(ch_id);
     if (!c) return;
 
@@ -538,12 +510,16 @@ static bool link_open(link_t *lk, const char *dev, int64_t now) {
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = 0;
     lk->last_rx_ms = lk->last_tx_ms = now;
-    lk->up   = false;
+    lk->up   = true;
     lk->epev = EPOLLIN;
     pik_epoll_set(g_epfd, lk->fd, EPOLLIN, lk);
 
     LOG("link opened: %s", dev);
-    enqueue_frame(lk, F_HELLO, 0, NULL, 0);
+    LOG("link up");
+    for (int i = 0; i < g_n_chans; i++) {
+        channel_t *c = &g_chans[i];
+        if (c->type == CH_MCU) mcu_on_link_up(c, lk);
+    }
     return true;
 }
 
@@ -578,18 +554,8 @@ static void link_on_writable(link_t *lk, int64_t now) {
 }
 
 static void link_tick(link_t *lk, int64_t now) {
+    (void)now;
     if (lk->fd < 0) return;
-    if (!lk->up && lk_avail(lk) == 0 && (now - lk->last_tx_ms) > 2000)
-        enqueue_frame(lk, F_HELLO, 0, NULL, 0);
-    if (lk->up) {
-        if ((now - lk->last_tx_ms) > PING_IDLE_TX_MS)
-            enqueue_frame(lk, F_PING, 0, NULL, 0);
-        if ((now - lk->last_rx_ms) > LINK_DEAD_RX_MS) {
-            LOG("link RX timeout");
-            link_close(lk);
-            return;
-        }
-    }
     if (!lk->paused && lk_avail(lk) > LINK_HIGH_WATER) {
         lk->paused = true;
         for (int i = 0; i < g_n_chans; i++)
@@ -598,11 +564,8 @@ static void link_tick(link_t *lk, int64_t now) {
 }
 
 static int64_t link_deadline(const link_t *lk) {
-    if (lk->fd < 0) return INT64_MAX;
-    if (!lk->up) return lk->last_tx_ms + 2000;
-    int64_t a = lk->last_tx_ms + PING_IDLE_TX_MS;
-    int64_t b = lk->last_rx_ms + LINK_DEAD_RX_MS;
-    return a < b ? a : b;
+    (void)lk;
+    return INT64_MAX;
 }
 
 // ── component API ─────────────────────────────────────────────────────────────

@@ -9,12 +9,14 @@ BUILD    := build
 COBS_SRCS   := src/nanocobs/cobs.c
 COBS_HDRS   := src/nanocobs/cobs.h
 COMMON_SRCS := src/util.c src/logging.c src/tty.c src/frame.c src/fd.c
-COMMON_HDRS := src/util.h src/logging.h src/tty.h src/frame.h src/fd.h
+COMMON_HDRS := src/util.h src/logging.h src/tty.h src/frame.h src/fd.h src/version.h
 USB_SRCS    := src/usb_discovery.c
 USB_HDRS    := src/usb_discovery.h
+CONTROL_SRCS := src/control.c
+CONTROL_HDRS := src/control.h
 
-PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(USB_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
-PIK1D_HDRS  := src/serialmux.h $(USB_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
+PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(CONTROL_SRCS) $(USB_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
+PIK1D_HDRS  := src/serialmux.h $(CONTROL_HDRS) $(USB_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
 
 TB_SRCS     := src/tcpbridge.c $(COBS_SRCS) $(COMMON_SRCS)
 TB_HDRS     := $(COBS_HDRS) $(COMMON_HDRS)
@@ -156,12 +158,22 @@ install-pi:
 	$(SUDO) install -m 755 setup_pik1.sh $(PI_DIR)/setup_pik1.sh
 	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1.service > /dev/null
+	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1-peer-reboot.service.in | \
+		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-reboot.service > /dev/null
+	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1-peer-poweroff.service.in | \
+		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service > /dev/null
 	$(SUDO) systemctl daemon-reload
 	$(SUDO) systemctl enable pik1.service
+	$(SUDO) systemctl enable pik1-peer-reboot.service
+	$(SUDO) systemctl enable pik1-peer-poweroff.service
 
 uninstall-pi:
 	-$(SUDO) systemctl disable pik1.service
-	$(SUDO) rm -f $(PI_SYSTEMD_DIR)/pik1.service
+	-$(SUDO) systemctl disable pik1-peer-reboot.service
+	-$(SUDO) systemctl disable pik1-peer-poweroff.service
+	$(SUDO) rm -f $(PI_SYSTEMD_DIR)/pik1.service \
+		$(PI_SYSTEMD_DIR)/pik1-peer-reboot.service \
+		$(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service
 	$(SUDO) systemctl daemon-reload
 	$(SUDO) rm -rf $(PI_DIR)
 
