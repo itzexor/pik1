@@ -132,7 +132,7 @@ const char *usb_find_serial_dev(const char *vidpid, int n) {
     closedir(d);
 
     if (count == 0 || n >= count) return NULL;
-    qsort(ptrs, (size_t)count, sizeof(ptrs[0]), usb_dev_cmp);
+    qsort((void *)ptrs, (size_t)count, sizeof(ptrs[0]), usb_dev_cmp);
 
     static char result[64];
     snprintf(result, sizeof(result), "/dev/%s", ptrs[n]);

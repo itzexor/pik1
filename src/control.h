@@ -25,8 +25,7 @@ bool pik_control_dispatch(void *ptr, uint32_t events, int64_t now);
 bool pik_control_owns_event(void *ptr);
 bool pik_control_tick(int64_t now);
 bool pik_control_ready(void);
-bool pik_control_failed(void);
-int64_t pik_control_deadline(int64_t now);
+int64_t pik_control_deadline(void);
 void pik_control_cleanup(void);
 
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id);

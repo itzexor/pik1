@@ -39,8 +39,8 @@
 #define CHAN_RING_CAP   (1u << 16)
 #define CHAN_RING_MASK  (CHAN_RING_CAP - 1u)
 
-// timing (ms)
 #define RESET_SILENCE_MS  5000
+
 // ── types ─────────────────────────────────────────────────────────────────────
 typedef enum { MCU_INIT, MCU_ACTIVE, MCU_RESETTING } mcu_state_t;
 
@@ -77,8 +77,6 @@ typedef struct {
     uint8_t     rxbuf[FRAME_ENC_MAX + 4];
     size_t      rxbuf_len;
 
-    int64_t     last_tx_ms;
-    int64_t     last_rx_ms;
 } link_t;
 
 // ── globals ───────────────────────────────────────────────────────────────────
@@ -225,14 +223,18 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
     }
 }
 
-static void link_parse_rx(link_t *lk) {
+static bool link_parse_rx(link_t *lk) {
     pik_frame_status_t st = pik_frame_rx_consume(lk->rxbuf, &lk->rxbuf_len,
                                                  sizeof(lk->rxbuf),
                                                  dispatch_rx_frame, lk);
+    if (st == PIK_FRAME_CALLBACK_FAILED)
+        return false;
     if (st == PIK_FRAME_RX_OVERFLOW) {
-        LOG("link RX overflow, discarding");
-        lk->rxbuf_len = 0;
+        LOG("link RX overflow");
+        link_close(lk);
+        return false;
     }
+    return true;
 }
 
 // ── serial port ───────────────────────────────────────────────────────────────
@@ -491,7 +493,7 @@ static void link_close(link_t *lk) {
     }
 }
 
-static bool link_open(link_t *lk, const char *dev, int64_t now) {
+static bool link_open(link_t *lk, const char *dev) {
     lk->fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (lk->fd < 0) {
         LOG("link open %s: %s", dev, strerror(errno));
@@ -509,7 +511,6 @@ static bool link_open(link_t *lk, const char *dev, int64_t now) {
 
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = 0;
-    lk->last_rx_ms = lk->last_tx_ms = now;
     lk->up   = true;
     lk->epev = EPOLLIN;
     pik_epoll_set(g_epfd, lk->fd, EPOLLIN, lk);
@@ -523,12 +524,12 @@ static bool link_open(link_t *lk, const char *dev, int64_t now) {
     return true;
 }
 
-static void link_on_readable(link_t *lk, int64_t now) {
+static void link_on_readable(link_t *lk) {
     size_t space = sizeof(lk->rxbuf) - lk->rxbuf_len;
     if (!space) {
-        LOG("link RX overflow, discarding %zu bytes", lk->rxbuf_len);
-        lk->rxbuf_len = 0;
-        space = sizeof(lk->rxbuf);
+        LOG("link RX overflow");
+        link_close(lk);
+        return;
     }
 
     ssize_t n = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
@@ -538,14 +539,12 @@ static void link_on_readable(link_t *lk, int64_t now) {
         link_close(lk);
         return;
     }
-    lk->last_rx_ms = now;
     lk->rxbuf_len += (size_t)n;
-    link_parse_rx(lk);
+    if (!link_parse_rx(lk)) return;
 }
 
-static void link_on_writable(link_t *lk, int64_t now) {
-    if (lk_drain(lk))
-        lk->last_tx_ms = now;
+static void link_on_writable(link_t *lk) {
+    lk_drain(lk);
     if (lk->paused && lk_avail(lk) < LINK_LOW_WATER) {
         lk->paused = false;
         for (int i = 0; i < g_n_chans; i++)
@@ -553,19 +552,13 @@ static void link_on_writable(link_t *lk, int64_t now) {
     }
 }
 
-static void link_tick(link_t *lk, int64_t now) {
-    (void)now;
+static void link_tick(link_t *lk) {
     if (lk->fd < 0) return;
     if (!lk->paused && lk_avail(lk) > LINK_HIGH_WATER) {
         lk->paused = true;
         for (int i = 0; i < g_n_chans; i++)
             chan_pause(&g_chans[i]);
     }
-}
-
-static int64_t link_deadline(const link_t *lk) {
-    (void)lk;
-    return INT64_MAX;
 }
 
 // ── component API ─────────────────────────────────────────────────────────────
@@ -608,7 +601,7 @@ bool serialmux_start(const char *link_dev, int64_t now) {
             c->last_byte_ms = now;
         }
     }
-    return link_open(&g_link, link_dev, now);
+    return link_open(&g_link, link_dev);
 }
 
 bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
@@ -618,8 +611,8 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
             link_close(&g_link);
             return false;
         }
-        if (events & EPOLLIN) link_on_readable(&g_link, now);
-        if (!g_session_failed && (events & EPOLLOUT)) link_on_writable(&g_link, now);
+        if (events & EPOLLIN) link_on_readable(&g_link);
+        if (!g_session_failed && (events & EPOLLOUT)) link_on_writable(&g_link);
         return !g_session_failed;
     }
 
@@ -638,18 +631,14 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
 
 bool serialmux_tick(int64_t now) {
     if (g_session_failed) return false;
-    link_tick(&g_link, now);
+    link_tick(&g_link);
     for (int i = 0; i < g_n_chans && !g_session_failed; i++)
         ch_tick(&g_chans[i], &g_link, now);
     return !g_session_failed;
 }
 
-bool serialmux_link_up(void) {
-    return g_link.up;
-}
-
 int64_t serialmux_deadline(int64_t now) {
-    int64_t dl = link_deadline(&g_link);
+    int64_t dl = INT64_MAX;
     for (int i = 0; i < g_n_chans; i++) {
         int64_t cd = ch_deadline(&g_chans[i], now);
         if (cd < dl) dl = cd;

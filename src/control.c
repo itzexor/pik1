@@ -1,4 +1,5 @@
 #include "control.h"
+#include "nanocobs/cobs.h"
 #include "fd.h"
 #include "frame.h"
 #include "logging.h"
@@ -31,7 +32,7 @@
 
 #define MAX_PAYLOAD   128u
 #define FRAME_DEC_MAX (1u + MAX_PAYLOAD + 4u)
-#define FRAME_ENC_MAX 160u
+#define FRAME_ENC_MAX COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define TX_RING_CAP   8192u
 #define TX_RING_MASK  (TX_RING_CAP - 1u)
@@ -44,7 +45,6 @@ typedef struct {
     int fd;
     bool ready;
     bool failed;
-    bool hello_sent;
     uint32_t epev;
 
     uint8_t txbuf[TX_RING_CAP];
@@ -81,18 +81,6 @@ static void log_msg(const char *fmt, ...) {
 static uint32_t avail(void) { return g_ctrl.tx_tail - g_ctrl.tx_head; }
 static uint32_t space(void) { return TX_RING_CAP - avail(); }
 
-static void put_u32(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    p[3] = (uint8_t)(v >> 24);
-}
-
-static uint32_t get_u32(const uint8_t *p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
-           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
-
 const char *pik_control_action_name(pik_control_action_t action) {
     switch (action) {
     case PIK_CONTROL_ACTION_RESTART_EXPORTER: return "restart-exporter";
@@ -102,11 +90,28 @@ const char *pik_control_action_name(pik_control_action_t action) {
     }
 }
 
+static bool action_valid(pik_control_action_t action) {
+    switch (action) {
+    case PIK_CONTROL_ACTION_RESTART_EXPORTER:
+    case PIK_CONTROL_ACTION_REBOOT_EXPORTER:
+    case PIK_CONTROL_ACTION_POWEROFF_EXPORTER:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool tx_push(const uint8_t *src, size_t len) {
     if (space() < len) return false;
     for (size_t i = 0; i < len; i++)
         g_ctrl.txbuf[g_ctrl.tx_tail++ & TX_RING_MASK] = src[i];
     return true;
+}
+
+static void clear_pending_ack(void) {
+    g_ctrl.ack_pending = false;
+    g_ctrl.ack_request_id = 0;
+    g_ctrl.ack_status = 0;
 }
 
 static void update_epoll(void) {
@@ -145,15 +150,11 @@ static bool send_hello(void) {
     p[1] = HELLO_MAGIC_1;
     p[2] = HELLO_MAGIC_2;
     p[3] = HELLO_MAGIC_3;
-    put_u32(p + 4, PIK1_PROTOCOL_VERSION);
-    put_u32(p + 8, PIK1_FEATURE_FLAGS);
+    pik_put_u32le(p + 4, PIK1_PROTOCOL_VERSION);
+    pik_put_u32le(p + 8, PIK1_FEATURE_FLAGS);
     p[12] = (uint8_t)g_ctrl.role;
     snprintf((char *)p + 13, RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
-    if (enqueue_frame(C_HELLO, p, sizeof(p))) {
-        g_ctrl.hello_sent = true;
-        return true;
-    }
-    return false;
+    return enqueue_frame(C_HELLO, p, sizeof(p));
 }
 
 static void close_link(void) {
@@ -166,6 +167,7 @@ static void close_link(void) {
     if (g_ctrl.ready) LOG("link down");
     g_ctrl.ready = false;
     g_ctrl.epev = 0;
+    clear_pending_ack();
 }
 
 static bool handle_hello(const uint8_t *p, size_t len) {
@@ -177,8 +179,8 @@ static bool handle_hello(const uint8_t *p, size_t len) {
         return false;
     }
 
-    uint32_t proto = get_u32(p + 4);
-    uint32_t features = get_u32(p + 8);
+    uint32_t proto = pik_get_u32le(p + 4);
+    uint32_t features = pik_get_u32le(p + 8);
     uint8_t role = p[12];
     char release[RELEASE_LEN + 1];
     memcpy(release, p + 13, RELEASE_LEN);
@@ -232,12 +234,21 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
         return true;
     case C_COMMAND:
         if (len != 5) return true;
-        if (g_ctrl.on_command)
-            g_ctrl.on_command((pik_control_action_t)p[4], get_u32(p), g_ctrl.ctx);
+        {
+            pik_control_action_t action = (pik_control_action_t)p[4];
+            uint32_t request_id = pik_get_u32le(p);
+            if (!action_valid(action)) {
+                LOG("rejecting unknown command action=%u request=%u", p[4], request_id);
+                pik_control_send_ack(request_id, 1);
+                return true;
+            }
+            if (g_ctrl.on_command)
+                g_ctrl.on_command(action, request_id, g_ctrl.ctx);
+        }
         return true;
     case C_ACK:
         if (len != 5) return true;
-        g_ctrl.ack_request_id = get_u32(p);
+        g_ctrl.ack_request_id = pik_get_u32le(p);
         g_ctrl.ack_status = p[4];
         g_ctrl.ack_pending = true;
         return true;
@@ -283,7 +294,11 @@ static bool read_available(int64_t now) {
             close_link();
             return false;
         }
-        if (n == 0) return true;
+        if (n == 0) {
+            LOG("read: EOF");
+            close_link();
+            return false;
+        }
         g_ctrl.last_rx_ms = now;
         g_ctrl.rxbuf_len += (size_t)n;
         if (!parse_rx()) return false;
@@ -339,7 +354,6 @@ bool pik_control_start(const char *dev, int64_t now) {
     g_ctrl.fd = fd;
     g_ctrl.ready = false;
     g_ctrl.failed = false;
-    g_ctrl.hello_sent = false;
     g_ctrl.epev = EPOLLIN;
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
@@ -374,7 +388,7 @@ bool pik_control_tick(int64_t now) {
     if (!g_ctrl.ready && !avail() && (now - g_ctrl.last_tx_ms) > HELLO_RETRY_MS)
         send_hello();
     if (g_ctrl.ready) {
-        if ((now - g_ctrl.last_tx_ms) > PING_IDLE_MS)
+        if (!avail() && (now - g_ctrl.last_tx_ms) > PING_IDLE_MS)
             enqueue_frame(C_PING, NULL, 0);
         if ((now - g_ctrl.last_rx_ms) > LINK_DEAD_MS) {
             LOG("RX timeout");
@@ -389,16 +403,11 @@ bool pik_control_ready(void) {
     return g_ctrl.ready;
 }
 
-bool pik_control_failed(void) {
-    return g_ctrl.failed;
-}
-
-int64_t pik_control_deadline(int64_t now) {
+int64_t pik_control_deadline(void) {
     if (g_ctrl.fd < 0) return INT64_MAX;
     if (!g_ctrl.ready) return g_ctrl.last_tx_ms + HELLO_RETRY_MS;
     int64_t a = g_ctrl.last_tx_ms + PING_IDLE_MS;
     int64_t b = g_ctrl.last_rx_ms + LINK_DEAD_MS;
-    (void)now;
     return a < b ? a : b;
 }
 
@@ -413,6 +422,7 @@ void pik_control_cleanup(void) {
     g_ctrl.epev = 0;
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
+    clear_pending_ack();
 }
 
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id) {
@@ -420,7 +430,7 @@ bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id)
     uint8_t p[5];
     uint32_t id = g_ctrl.next_request_id++;
     if (g_ctrl.next_request_id == 0) g_ctrl.next_request_id = 1;
-    put_u32(p, id);
+    pik_put_u32le(p, id);
     p[4] = (uint8_t)action;
     if (!enqueue_frame(C_COMMAND, p, sizeof(p))) return false;
     if (request_id) *request_id = id;
@@ -438,7 +448,7 @@ bool pik_control_take_ack(uint32_t *request_id, uint8_t *status) {
 
 void pik_control_send_ack(uint32_t request_id, uint8_t status) {
     uint8_t p[5];
-    put_u32(p, request_id);
+    pik_put_u32le(p, request_id);
     p[4] = status;
     enqueue_frame(C_ACK, p, sizeof(p));
 }

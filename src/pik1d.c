@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -146,10 +147,18 @@ static bool local_control_start(int epfd) {
         g_local.listen_fd = -1;
         return false;
     }
+    if (chmod(LOCAL_CONTROL_SOCK, 0600) < 0) {
+        LOG("chmod %s: %s", LOCAL_CONTROL_SOCK, strerror(errno));
+        close(g_local.listen_fd);
+        g_local.listen_fd = -1;
+        unlink(LOCAL_CONTROL_SOCK);
+        return false;
+    }
     if (listen(g_local.listen_fd, 4) < 0) {
         LOG("listen %s: %s", LOCAL_CONTROL_SOCK, strerror(errno));
         close(g_local.listen_fd);
         g_local.listen_fd = -1;
+        unlink(LOCAL_CONTROL_SOCK);
         return false;
     }
     pik_epoll_set(epfd, g_local.listen_fd, EPOLLIN, &g_local_listen_tag);
@@ -166,23 +175,33 @@ static void local_control_cleanup(void) {
     }
 }
 
+static void local_control_write_response(int fd, const char *msg) {
+    size_t off = 0;
+    size_t len = strlen(msg);
+    while (off < len) {
+        ssize_t n = write(fd, msg + off, len - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+}
+
 static void local_control_reply_and_close(const char *msg) {
     if (g_local.client_fd >= 0)
-        (void)write(g_local.client_fd, msg, strlen(msg));
+        local_control_write_response(g_local.client_fd, msg);
     local_control_close_client();
 }
 
-static void local_control_accept(int64_t now) {
+static void local_control_accept(void) {
     int fd = accept4(g_local.listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) return;
     if (g_local.client_fd >= 0) {
-        (void)write(fd, "ERR busy\n", 9);
+        local_control_write_response(fd, "ERR busy\n");
         close(fd);
         return;
     }
     g_local.client_fd = fd;
     pik_epoll_set(g_local.epfd, fd, EPOLLIN, &g_local);
-    (void)now;
 }
 
 static void local_control_read(int64_t now) {
@@ -552,8 +571,8 @@ int main(int argc, char **argv) {
     pik_epoll_set(epfd, sig_fd, EPOLLIN, &sig_tag);
     pik_control_init(epfd, is_mcu ? PIK_CONTROL_ROLE_EXPORTER : PIK_CONTROL_ROLE_HOST,
                      on_control_command, NULL);
-    if (!is_mcu)
-        local_control_start(epfd);
+    if (!is_mcu && !local_control_start(epfd))
+        DIE("failed to start local control socket");
     serialmux_init(&cfg, epfd);
 
     bool shutdown = false;
@@ -618,7 +637,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        int64_t dl = session_active ? pik_control_deadline(now) : usb_retry_at;
+        int64_t dl = session_active ? pik_control_deadline() : usb_retry_at;
         if (session_confirmed) {
             int64_t sd = serialmux_deadline(now);
             if (sd < dl) dl = sd;
@@ -682,7 +701,7 @@ int main(int argc, char **argv) {
             }
 
             if (ptr == &g_local_listen_tag) {
-                local_control_accept(now);
+                local_control_accept();
                 continue;
             }
 

@@ -23,6 +23,5 @@ void serialmux_init(const serialmux_config_t *cfg, int epfd);
 bool serialmux_start(const char *link_dev, int64_t now);
 bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now);
 bool serialmux_tick(int64_t now);
-bool serialmux_link_up(void);
 int64_t serialmux_deadline(int64_t now);
 void serialmux_cleanup(void);

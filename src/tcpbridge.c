@@ -90,8 +90,6 @@ typedef struct {
     uint16_t tx_seq;
     uint16_t rx_seq;
 
-    int64_t  last_tx_ms;
-    int64_t  last_rx_ms;
     int64_t  reconnect_at;
     int      backoff_ms;
     char     dev[128];
@@ -253,7 +251,6 @@ static void lk_drain(int64_t now) {
         f->pos += (size_t)w;
         lk->tx_tokens -= (uint32_t)w;
         budget -= (uint32_t)w;
-        lk->last_tx_ms = now;
         g_tx_writes++;
         g_tx_bytes += (uint64_t)w;
 
@@ -521,9 +518,12 @@ static bool link_read_available(int64_t now) {
             link_close(now);
             return false;
         }
-        if (r == 0) return true;
+        if (r == 0) {
+            LOG("link read: EOF");
+            link_close(now);
+            return false;
+        }
 
-        lk->last_rx_ms = now;
         g_rx_reads++;
         g_rx_bytes += (uint64_t)r;
         lk->rxbuf_len += (size_t)r;
@@ -578,7 +578,6 @@ static void link_try_open(int64_t now) {
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
     lk->tx_seq = lk->rx_seq = 0;
-    lk->last_rx_ms = lk->last_tx_ms = now;
     lk->up = true;
     lk->paused = false;
     lk->backoff_ms = RECONNECT_MIN;
