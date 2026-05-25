@@ -52,6 +52,7 @@ static local_control_t g_local = {
 };
 static int g_local_listen_tag;
 
+static const char *g_mode_name;
 static pik_control_action_t g_remote_action;
 static bool g_remote_action_pending;
 static int64_t g_remote_action_at_ms;
@@ -108,6 +109,10 @@ static bool parse_control_action(const char *cmd, pik_control_action_t *action) 
     }
     if (strcmp(cmd, "poweroff-peer") == 0) {
         *action = PIK_CONTROL_ACTION_POWEROFF_EXPORTER;
+        return true;
+    }
+    if (strcmp(cmd, "status-peer") == 0) {
+        *action = PIK_CONTROL_ACTION_STATUS;
         return true;
     }
     return false;
@@ -169,15 +174,19 @@ static void local_control_cleanup(void) {
     }
 }
 
-static void local_control_write_response(int fd, const char *msg) {
+static void local_control_write(int fd, const void *buf, size_t len) {
+    const char *p = buf;
     size_t off = 0;
-    size_t len = strlen(msg);
     while (off < len) {
-        ssize_t n = write(fd, msg + off, len - off);
+        ssize_t n = write(fd, p + off, len - off);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
         off += (size_t)n;
     }
+}
+
+static void local_control_write_response(int fd, const char *msg) {
+    local_control_write(fd, msg, strlen(msg));
 }
 
 static void local_control_reply_and_close(const char *msg) {
@@ -228,9 +237,18 @@ static void local_control_read(int64_t now) {
 static void local_control_check_ack(int64_t now) {
     uint32_t request_id;
     uint8_t status;
-    while (pik_control_take_ack(&request_id, &status)) {
+    const uint8_t *payload;
+    size_t payload_len;
+    while (pik_control_take_ack(&request_id, &status, &payload, &payload_len)) {
         if (g_local.command_pending && request_id == g_local.request_id) {
-            local_control_reply_and_close(status == 0 ? "OK\n" : "ERR peer command failed\n");
+            if (status == 0 && payload_len) {
+                local_control_write(g_local.client_fd, "OK ", 3);
+                local_control_write(g_local.client_fd, payload, payload_len);
+                local_control_write(g_local.client_fd, "\n", 1);
+                local_control_close_client();
+            } else {
+                local_control_reply_and_close(status == 0 ? "OK\n" : "ERR peer command failed\n");
+            }
         } else if (g_signal_command_pending && request_id == g_signal_request_id) {
             LOG("restart command ack status=%u", status);
             g_signal_command_pending = false;
@@ -258,7 +276,22 @@ static int64_t local_control_deadline(void) {
 static void on_control_command(pik_control_action_t action, uint32_t request_id, void *ctx) {
     (void)ctx;
     LOG("received command %s request=%u", pik_control_action_name(action), request_id);
-    pik_control_send_ack(request_id, 0);
+    if (action == PIK_CONTROL_ACTION_STATUS) {
+        char status[96];
+        int n = snprintf(status, sizeof(status),
+                         "mode=%s release=%s protocol=%u features=0x%08x",
+                         g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+                         PIK1_FEATURE_FLAGS);
+        if (n < 0) {
+            pik_control_send_ack(request_id, 1, NULL, 0);
+            return;
+        }
+        size_t len = (size_t)n < sizeof(status) ? (size_t)n : sizeof(status) - 1;
+        pik_control_send_ack(request_id, 0, (const uint8_t *)status, len);
+        return;
+    }
+
+    pik_control_send_ack(request_id, 0, NULL, 0);
     g_remote_action = action;
     g_remote_action_pending = true;
     g_remote_action_at_ms = pik_now_ms() + REMOTE_ACTION_DELAY_MS;
@@ -435,7 +468,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s --version\n"
-        "  %s --control restart-peer|reboot-peer|poweroff-peer\n"
+        "  %s --control status-peer|restart-peer|reboot-peer|poweroff-peer\n"
         "  %s --usb VID:PID  mcu:N:DEV:BAUD [...] [tcp:ADDR:PORT]\n"
         "  %s --usb VID:PID  pty:N:SYMLINK  [...] [tcp:HOST:PORT]\n",
         prog, prog, prog, prog);
@@ -539,14 +572,16 @@ int main(int argc, char **argv) {
 
     if (argi != argc) DIE("unexpected argument: %s", argv[argi]);
 
+    g_mode_name = is_mcu ? "exporter" : "host";
+
     if (has_tcp)
         LOG("mode=%s release=%s protocol=%u channels=%d tcp=%s:%d control=usb[0] serial=usb[1] tunnel=usb[2]",
-            is_mcu ? "exporter" : "host", PIK1_RELEASE_VERSION,
-            PIK1_PROTOCOL_VERSION, cfg.n_channels, tcp_addr, tcp_port);
+            g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+            cfg.n_channels, tcp_addr, tcp_port);
     else
         LOG("mode=%s release=%s protocol=%u channels=%d control=usb[0] serial=usb[1]",
-            is_mcu ? "exporter" : "host", PIK1_RELEASE_VERSION,
-            PIK1_PROTOCOL_VERSION, cfg.n_channels);
+            g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+            cfg.n_channels);
 
     sigset_t mask;
     sigemptyset(&mask);

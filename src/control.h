@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef enum {
@@ -12,6 +13,7 @@ typedef enum {
     PIK_CONTROL_ACTION_RESTART_EXPORTER = 1,
     PIK_CONTROL_ACTION_REBOOT_EXPORTER = 2,
     PIK_CONTROL_ACTION_POWEROFF_EXPORTER = 3,
+    PIK_CONTROL_ACTION_STATUS = 4,
 } pik_control_action_t;
 
 typedef void (*pik_control_command_fn)(pik_control_action_t action,
@@ -29,7 +31,9 @@ int64_t pik_control_deadline(void);
 void pik_control_cleanup(void);
 
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id);
-bool pik_control_take_ack(uint32_t *request_id, uint8_t *status);
-void pik_control_send_ack(uint32_t request_id, uint8_t status);
+bool pik_control_take_ack(uint32_t *request_id, uint8_t *status,
+                          const uint8_t **payload, size_t *payload_len);
+void pik_control_send_ack(uint32_t request_id, uint8_t status,
+                          const uint8_t *payload, size_t payload_len);
 
 const char *pik_control_action_name(pik_control_action_t action);

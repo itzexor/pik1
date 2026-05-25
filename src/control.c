@@ -63,6 +63,8 @@ typedef struct {
     bool ack_pending;
     uint32_t ack_request_id;
     uint8_t ack_status;
+    uint8_t ack_payload[MAX_PAYLOAD - 5u];
+    size_t ack_payload_len;
 } control_t;
 
 static control_t g_ctrl;
@@ -79,6 +81,7 @@ const char *pik_control_action_name(pik_control_action_t action) {
     case PIK_CONTROL_ACTION_RESTART_EXPORTER: return "restart-exporter";
     case PIK_CONTROL_ACTION_REBOOT_EXPORTER: return "reboot-exporter";
     case PIK_CONTROL_ACTION_POWEROFF_EXPORTER: return "poweroff-exporter";
+    case PIK_CONTROL_ACTION_STATUS: return "status";
     default: return "unknown";
     }
 }
@@ -88,6 +91,7 @@ static bool action_valid(pik_control_action_t action) {
     case PIK_CONTROL_ACTION_RESTART_EXPORTER:
     case PIK_CONTROL_ACTION_REBOOT_EXPORTER:
     case PIK_CONTROL_ACTION_POWEROFF_EXPORTER:
+    case PIK_CONTROL_ACTION_STATUS:
         return true;
     default:
         return false;
@@ -105,6 +109,7 @@ static void clear_pending_ack(void) {
     g_ctrl.ack_pending = false;
     g_ctrl.ack_request_id = 0;
     g_ctrl.ack_status = 0;
+    g_ctrl.ack_payload_len = 0;
 }
 
 static void update_epoll(void) {
@@ -232,7 +237,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             uint32_t request_id = pik_get_u32le(p);
             if (!action_valid(action)) {
                 LOG("rejecting unknown command action=%u request=%u", p[4], request_id);
-                pik_control_send_ack(request_id, 1);
+                pik_control_send_ack(request_id, 1, NULL, 0);
                 return true;
             }
             if (g_ctrl.on_command)
@@ -240,9 +245,14 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
         }
         return true;
     case C_ACK:
-        if (len != 5) return true;
+        if (len < 5) return true;
         g_ctrl.ack_request_id = pik_get_u32le(p);
         g_ctrl.ack_status = p[4];
+        g_ctrl.ack_payload_len = len - 5;
+        if (g_ctrl.ack_payload_len > sizeof(g_ctrl.ack_payload))
+            g_ctrl.ack_payload_len = sizeof(g_ctrl.ack_payload);
+        if (g_ctrl.ack_payload_len)
+            memcpy(g_ctrl.ack_payload, p + 5, g_ctrl.ack_payload_len);
         g_ctrl.ack_pending = true;
         return true;
     default:
@@ -429,17 +439,25 @@ bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id)
     return true;
 }
 
-bool pik_control_take_ack(uint32_t *request_id, uint8_t *status) {
+bool pik_control_take_ack(uint32_t *request_id, uint8_t *status,
+                          const uint8_t **payload, size_t *payload_len) {
     if (!g_ctrl.ack_pending) return false;
     if (request_id) *request_id = g_ctrl.ack_request_id;
     if (status) *status = g_ctrl.ack_status;
+    if (payload) *payload = g_ctrl.ack_payload;
+    if (payload_len) *payload_len = g_ctrl.ack_payload_len;
     g_ctrl.ack_pending = false;
     return true;
 }
 
-void pik_control_send_ack(uint32_t request_id, uint8_t status) {
-    uint8_t p[5];
+void pik_control_send_ack(uint32_t request_id, uint8_t status,
+                          const uint8_t *payload, size_t payload_len) {
+    uint8_t p[MAX_PAYLOAD];
+    if (payload_len > sizeof(p) - 5)
+        payload_len = sizeof(p) - 5;
     pik_put_u32le(p, request_id);
     p[4] = status;
-    enqueue_frame(C_ACK, p, sizeof(p));
+    if (payload_len)
+        memcpy(p + 5, payload, payload_len);
+    enqueue_frame(C_ACK, p, 5 + payload_len);
 }
