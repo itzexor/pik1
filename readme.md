@@ -139,7 +139,7 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
 
     If there are any weird permissions errors then make sure UID 1000 (your klipper user,
     typically `pi` or similar) is in the `dialout` group so it can open `/dev/ttyGS0`
-    and `/dev/ttyGS1`:
+    through `/dev/ttyGS2`:
 
     ```bash
     sudo usermod -aG dialout $(id -un 1000)
@@ -308,8 +308,7 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     setup_pik1: loading libcomposite
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
-    setup_pik1: ttyGS0 ready
-    setup_pik1: ttyGS1 ready
+    setup_pik1: gadget setup complete
     [pik1] mode=host channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyGS1
     [pik1] child: spawned /opt/pik1/tcpbridge pid=...
     [mux] link opened: /dev/ttyGS0
