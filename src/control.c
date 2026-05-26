@@ -22,6 +22,7 @@
 #define C_COMMAND 0x04u
 #define C_ACK     0x05u
 #define C_LINK_STATE 0x06u
+#define C_CONFIG 0x07u
 
 #define HELLO_MAGIC_0 'P'
 #define HELLO_MAGIC_1 'I'
@@ -69,6 +70,11 @@ typedef struct {
 
     bool peer_link_known;
     uint32_t peer_link_flags;
+
+    uint8_t local_channels[MAX_PAYLOAD - 2u];
+    size_t local_channel_count;
+    pik_control_tcp_role_t local_tcp_role;
+    bool config_sent;
 } control_t;
 
 static control_t g_ctrl;
@@ -82,9 +88,9 @@ static uint32_t space(void) { return TX_RING_CAP - avail(); }
 
 const char *pik_control_action_name(pik_control_action_t action) {
     switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_EXPORTER: return "restart-exporter";
-    case PIK_CONTROL_ACTION_REBOOT_EXPORTER: return "reboot-exporter";
-    case PIK_CONTROL_ACTION_POWEROFF_EXPORTER: return "poweroff-exporter";
+    case PIK_CONTROL_ACTION_RESTART_PEER: return "restart-peer";
+    case PIK_CONTROL_ACTION_REBOOT_PEER: return "reboot-peer";
+    case PIK_CONTROL_ACTION_POWEROFF_PEER: return "poweroff-peer";
     case PIK_CONTROL_ACTION_STATUS: return "status";
     default: return "unknown";
     }
@@ -101,9 +107,9 @@ const char *pik_control_ack_status_name(pik_control_ack_status_t status) {
 
 static bool action_valid(pik_control_action_t action) {
     switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_EXPORTER:
-    case PIK_CONTROL_ACTION_REBOOT_EXPORTER:
-    case PIK_CONTROL_ACTION_POWEROFF_EXPORTER:
+    case PIK_CONTROL_ACTION_RESTART_PEER:
+    case PIK_CONTROL_ACTION_REBOOT_PEER:
+    case PIK_CONTROL_ACTION_POWEROFF_PEER:
     case PIK_CONTROL_ACTION_STATUS:
         return true;
     default:
@@ -168,6 +174,78 @@ static bool send_hello(void) {
     return enqueue_frame(C_HELLO, p, sizeof(p));
 }
 
+static const char *tcp_role_name(pik_control_tcp_role_t role) {
+    switch (role) {
+    case PIK_CONTROL_TCP_NONE: return "none";
+    case PIK_CONTROL_TCP_LISTEN: return "listen";
+    case PIK_CONTROL_TCP_FORWARD: return "forward";
+    default: return "unknown";
+    }
+}
+
+static bool send_config(void) {
+    uint8_t p[MAX_PAYLOAD];
+    if (g_ctrl.local_channel_count > sizeof(p) - 2)
+        return false;
+    p[0] = (uint8_t)g_ctrl.local_tcp_role;
+    p[1] = (uint8_t)g_ctrl.local_channel_count;
+    if (g_ctrl.local_channel_count)
+        memcpy(p + 2, g_ctrl.local_channels, g_ctrl.local_channel_count);
+    if (!enqueue_frame(C_CONFIG, p, g_ctrl.local_channel_count + 2))
+        return false;
+    g_ctrl.config_sent = true;
+    return true;
+}
+
+static bool local_channel_present(uint8_t id) {
+    for (size_t i = 0; i < g_ctrl.local_channel_count; i++)
+        if (g_ctrl.local_channels[i] == id)
+            return true;
+    return false;
+}
+
+static void handle_config(const uint8_t *p, size_t len) {
+    if (len < 2 || p[1] != len - 2) {
+        LOG("bad CONFIG");
+        return;
+    }
+
+    pik_control_tcp_role_t peer_tcp = (pik_control_tcp_role_t)p[0];
+    if (peer_tcp > PIK_CONTROL_TCP_FORWARD) {
+        LOG("bad CONFIG tcp role=%u", p[0]);
+        return;
+    }
+
+    bool peer_present[UINT8_MAX + 1] = { false };
+    for (size_t i = 2; i < len; i++) {
+        uint8_t id = p[i];
+        if (peer_present[id]) continue;
+        peer_present[id] = true;
+        if (!local_channel_present(id))
+            LOG("warning: channel id %u is not configured on this side", id);
+    }
+
+    for (size_t i = 0; i < g_ctrl.local_channel_count; i++) {
+        uint8_t id = g_ctrl.local_channels[i];
+        if (!peer_present[id])
+            LOG("warning: channel id %u is not configured on peer", id);
+    }
+
+    if (g_ctrl.local_tcp_role == PIK_CONTROL_TCP_NONE &&
+        peer_tcp != PIK_CONTROL_TCP_NONE) {
+        LOG("warning: TCP tunnel is configured on peer as %s but not on this side",
+            tcp_role_name(peer_tcp));
+    } else if (g_ctrl.local_tcp_role != PIK_CONTROL_TCP_NONE &&
+               peer_tcp == PIK_CONTROL_TCP_NONE) {
+        LOG("warning: TCP tunnel is configured on this side as %s but not on peer",
+            tcp_role_name(g_ctrl.local_tcp_role));
+    } else if (g_ctrl.local_tcp_role != PIK_CONTROL_TCP_NONE &&
+               g_ctrl.local_tcp_role == peer_tcp) {
+        LOG("warning: TCP tunnel is configured as %s on both sides",
+            tcp_role_name(g_ctrl.local_tcp_role));
+    }
+}
+
 static void close_link(void) {
     g_ctrl.failed = true;
     if (g_ctrl.fd >= 0) {
@@ -215,6 +293,7 @@ static bool handle_hello(const uint8_t *p, size_t len) {
         g_ctrl.ready = true;
         LOG("link up: release=%s protocol=%u features=0x%08x",
             release, proto, features);
+        send_config();
     }
     return true;
 }
@@ -275,6 +354,9 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
         LOG("peer data links: serial=%s tcp=%s",
             (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_SERIAL) ? "up" : "down",
             (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_TCP) ? "up" : "down");
+        return true;
+    case C_CONFIG:
+        handle_config(p, len);
         return true;
     default:
         return true;
@@ -379,6 +461,7 @@ bool pik_control_start(const char *dev, int64_t now) {
     g_ctrl.epev = EPOLLIN;
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
+    g_ctrl.config_sent = false;
     g_ctrl.last_rx_ms = g_ctrl.last_tx_ms = now;
     pik_epoll_set(g_epfd, fd, EPOLLIN, &g_ctrl_tag);
     LOG("link opened: %s", dev);
@@ -410,6 +493,8 @@ bool pik_control_tick(int64_t now) {
     if (!g_ctrl.ready && !avail() && (now - g_ctrl.last_tx_ms) > HELLO_RETRY_MS)
         send_hello();
     if (g_ctrl.ready) {
+        if (!g_ctrl.config_sent)
+            send_config();
         if (!avail() && (now - g_ctrl.last_tx_ms) > PING_IDLE_MS)
             enqueue_frame(C_PING, NULL, 0);
         if ((now - g_ctrl.last_rx_ms) > LINK_DEAD_MS) {
@@ -444,9 +529,23 @@ void pik_control_cleanup(void) {
     g_ctrl.epev = 0;
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
+    g_ctrl.config_sent = false;
     clear_pending_ack();
     g_ctrl.peer_link_known = false;
     g_ctrl.peer_link_flags = 0;
+}
+
+void pik_control_set_config(const uint8_t *channels, size_t n_channels,
+                            pik_control_tcp_role_t tcp_role) {
+    if (n_channels > sizeof(g_ctrl.local_channels))
+        n_channels = sizeof(g_ctrl.local_channels);
+    if (n_channels)
+        memcpy(g_ctrl.local_channels, channels, n_channels);
+    g_ctrl.local_channel_count = n_channels;
+    g_ctrl.local_tcp_role = tcp_role;
+    g_ctrl.config_sent = false;
+    if (g_ctrl.ready)
+        send_config();
 }
 
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id) {

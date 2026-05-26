@@ -252,18 +252,20 @@ The tunnel is low-bandwidth and intended for Moonraker API traffic only
 (temperatures, print status, controls). Do not route webcam streams or file
 transfers through it.
 
-The included K1 init script and Pi systemd service enable this tunnel by default
-with matching `tcp:` specs. guppyscreen requires no configuration changes -- it
-continues talking to `localhost:7125` as normal and the tunnel forwards those
-connections to the Pi transparently.
+The included K1 init script and Pi systemd service enable this tunnel by default.
+The K1 side uses `listen:` because guppyscreen connects there; the Pi side uses
+`forward:` because it connects onward to Moonraker. guppyscreen requires no
+configuration changes -- it continues talking to `localhost:7125` as normal and
+the tunnel forwards those connections to the Pi transparently.
 
-**K1 init script** -- `/etc/init.d/S99pik1` starts `pik1d` in MCU-exporting mode:
+**K1 init script** -- `/etc/init.d/S99pik1` starts `pik1d` with physical MCU UARTs
+and a local TCP listener:
 
 ```sh
 DAEMON_ARGS="--usb $USB_ID \
     mcu:0:$CH0_DEV:$CH0_BAUD \
     mcu:1:$CH1_DEV:$CH1_BAUD \
-    tcp:$TCP_ADDR:$TCP_PORT"
+    listen:$TCP_ADDR:$TCP_PORT"
 ```
 
 Also re-enable guppyscreen if you disabled it:
@@ -275,14 +277,14 @@ mv /etc/init.d/_S99guppyscreen /etc/init.d/S99guppyscreen
 accepted on the K1. Set it to `0.0.0.0` only if you deliberately want the
 forwarded listener exposed on the K1 network interface.
 
-**Pi systemd service** -- `/etc/systemd/system/pik1.service` starts `pik1d` in
-PTY-hosting mode:
+**Pi systemd service** -- `/etc/systemd/system/pik1.service` starts `pik1d` with
+PTY destinations and a TCP forwarder:
 
 ```ini
 ExecStart=/opt/pik1/pik1d --usb 1d6b:0104 \
     pty:0:/tmp/klipper_mcu \
     pty:1:/tmp/klipper_toolhead \
-    tcp:127.0.0.1:7125
+    forward:127.0.0.1:7125
 ```
 
 Then reload and restart:
@@ -311,9 +313,9 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
     setup_pik1: gadget setup complete
-    [pik1] mode=host release=0.2.0 protocol=1 channels=2 tcp=127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    [pik1] uart=pty release=0.2.0 protocol=2 channels=2 tcp=forward:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
     [ctrl] link opened: /dev/ttyGS0
-    [ctrl] link up: release=0.2.0 protocol=1 features=0x00000000
+    [ctrl] link up: release=0.2.0 protocol=2 features=0x00000000
     [pik1] control session started: control=/dev/ttyGS0 serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
     [pik1] data session started: serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
     [pik1] child: spawned /opt/pik1/tcpbridge pid=...
@@ -333,20 +335,20 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     A normal startup looks like. Because `pik1d` and `tcpbridge` write to the
     same log, adjacent lines may occasionally interleave:
     ```
-    [pik1] mode=exporter release=0.2.0 protocol=1 channels=2 tcp=127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
-    [ctrl] link opened: /dev/ttyACM0
-    [ctrl] link up: release=0.2.0 protocol=1 features=0x00000000
-    [pik1] control session started: control=/dev/ttyACM0 serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
-    [pik1] data session started: serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
-    [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
-    [mux] link opened: /dev/ttyACM1
-    [tcp] tcpbridge /dev/ttyACM2 listen 127.0.0.1:7125
-    [tcp] listening on port 7125
-    [tcp] link opened: /dev/ttyACM2
-    [mux] link up
-    [tcp] link up
-    [mux] ch0 MCU active
-    [mux] ch1 MCU active
+    2026-05-25 19:41:50 [pik1] uart=mcu release=0.2.0 protocol=2 channels=2 tcp=listen:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    2026-05-25 19:41:50 [ctrl] link opened: /dev/ttyACM0
+    2026-05-25 19:41:50 [ctrl] link up: release=0.2.0 protocol=2 features=0x00000000
+    2026-05-25 19:41:50 [pik1] control session started: control=/dev/ttyACM0 serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
+    2026-05-25 19:41:50 [pik1] data session started: serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
+    2026-05-25 19:41:50 [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
+    2026-05-25 19:41:50 [mux] link opened: /dev/ttyACM1
+    2026-05-25 19:41:50 [tcp] tcpbridge /dev/ttyACM2 listen 127.0.0.1:7125
+    2026-05-25 19:41:50 [tcp] listening on port 7125
+    2026-05-25 19:41:50 [tcp] link opened: /dev/ttyACM2
+    2026-05-25 19:41:50 [mux] link up
+    2026-05-25 19:41:50 [tcp] link up
+    2026-05-25 19:41:50 [mux] ch0 MCU active
+    2026-05-25 19:41:50 [mux] ch1 MCU active
     ```
     If you changed `TCP_ADDR` in `/etc/init.d/S99pik1`, the logged TCP address
     will match that configured value.

@@ -1,5 +1,5 @@
 [Unit]
-Description=Propagate Pi poweroff to PiK1 exporter
+Description=Propagate Pi poweroff to PiK1 peer
 DefaultDependencies=no
 After=pik1.service
 Before=poweroff.target halt.target

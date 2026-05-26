@@ -52,7 +52,7 @@ static local_control_t g_local = {
 };
 static int g_local_listen_tag;
 
-static const char *g_mode_name;
+static const char *g_uart_name;
 static uint32_t g_link_flags;
 static pik_control_action_t g_remote_action;
 static bool g_remote_action_pending;
@@ -101,15 +101,15 @@ static int control_client_main(const char *cmd) {
 
 static bool parse_control_action(const char *cmd, pik_control_action_t *action) {
     if (strcmp(cmd, "restart-peer") == 0) {
-        *action = PIK_CONTROL_ACTION_RESTART_EXPORTER;
+        *action = PIK_CONTROL_ACTION_RESTART_PEER;
         return true;
     }
     if (strcmp(cmd, "reboot-peer") == 0) {
-        *action = PIK_CONTROL_ACTION_REBOOT_EXPORTER;
+        *action = PIK_CONTROL_ACTION_REBOOT_PEER;
         return true;
     }
     if (strcmp(cmd, "poweroff-peer") == 0) {
-        *action = PIK_CONTROL_ACTION_POWEROFF_EXPORTER;
+        *action = PIK_CONTROL_ACTION_POWEROFF_PEER;
         return true;
     }
     if (strcmp(cmd, "status-peer") == 0) {
@@ -326,8 +326,8 @@ static void on_control_command(pik_control_action_t action, uint32_t request_id,
 
         char status[128];
         int n = snprintf(status, sizeof(status),
-                         "mode=%s release=%s proto=%u feat=0x%08x links=%s peer=%s",
-                         g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+                         "uart=%s release=%s proto=%u feat=0x%08x links=%s peer=%s",
+                         g_uart_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
                          PIK1_FEATURE_FLAGS, links, peer_links);
         if (n < 0) {
             pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR, NULL, 0);
@@ -447,18 +447,18 @@ static void execute_remote_action(pik_control_action_t action) {
     local_control_cleanup();
 
     switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_EXPORTER:
-        LOG("executing restart-exporter");
+    case PIK_CONTROL_ACTION_RESTART_PEER:
+        LOG("executing restart-peer");
         execv(g_argv[0], g_argv);
         LOG("execv %s: %s", g_argv[0], strerror(errno));
         _exit(127);
-    case PIK_CONTROL_ACTION_REBOOT_EXPORTER:
-        LOG("executing reboot-exporter");
+    case PIK_CONTROL_ACTION_REBOOT_PEER:
+        LOG("executing reboot-peer");
         execl("/sbin/reboot", "reboot", (char *)NULL);
         LOG("execl /sbin/reboot: %s", strerror(errno));
         _exit(127);
-    case PIK_CONTROL_ACTION_POWEROFF_EXPORTER:
-        LOG("executing poweroff-exporter");
+    case PIK_CONTROL_ACTION_POWEROFF_PEER:
+        LOG("executing poweroff-peer");
         execl("/sbin/poweroff", "poweroff", (char *)NULL);
         LOG("execl /sbin/poweroff: %s", strerror(errno));
         _exit(127);
@@ -520,8 +520,8 @@ static void usage(const char *prog) {
         "Usage:\n"
         "  %s --version\n"
         "  %s --control status-peer|restart-peer|reboot-peer|poweroff-peer\n"
-        "  %s --usb VID:PID  mcu:N:DEV:BAUD [...] [tcp:ADDR:PORT]\n"
-        "  %s --usb VID:PID  pty:N:SYMLINK  [...] [tcp:HOST:PORT]\n",
+        "  %s --usb VID:PID  mcu:N:DEV:BAUD [...] [listen:BIND_ADDR:PORT]\n"
+        "  %s --usb VID:PID  pty:N:SYMLINK  [...] [forward:TARGET_HOST:PORT]\n",
         prog, prog, prog, prog);
     exit(1);
 }
@@ -556,6 +556,7 @@ int main(int argc, char **argv) {
     bool is_mcu = strncmp(argv[argi], "mcu:", 4) == 0;
     bool is_pty = strncmp(argv[argi], "pty:", 4) == 0;
     if (!is_mcu && !is_pty) usage(argv[0]);
+    pik_log_set_timestamps(is_mcu);
 
     serialmux_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -563,7 +564,9 @@ int main(int argc, char **argv) {
     bool seen_ch[UINT8_MAX + 1] = { false };
     while (argi < argc) {
         char *spec = argv[argi];
-        if (strncmp(spec, "tcp:", 4) == 0) break;
+        if (strncmp(spec, "listen:", 7) == 0 ||
+            strncmp(spec, "forward:", 8) == 0)
+            break;
         if (cfg.n_channels >= MAX_CHANNELS)
             DIE("too many channels (max %d): %s", MAX_CHANNELS, spec);
         argi++;
@@ -600,10 +603,26 @@ int main(int argc, char **argv) {
     static char tb_path[576], addr_port[128];
     char tcp_addr[64] = "";
     int tcp_port = 0;
+    char *tcp_mode = NULL;
+    pik_control_tcp_role_t tcp_role = PIK_CONTROL_TCP_NONE;
 
-    if (argi < argc && strncmp(argv[argi], "tcp:", 4) == 0) {
+    if (argi < argc &&
+        (strncmp(argv[argi], "listen:", 7) == 0 ||
+         strncmp(argv[argi], "forward:", 8) == 0)) {
+        const char *tcp_spec = argv[argi];
+        const char *hostport = NULL;
+        if (strncmp(tcp_spec, "listen:", 7) == 0) {
+            tcp_mode = "listen";
+            tcp_role = PIK_CONTROL_TCP_LISTEN;
+            hostport = tcp_spec + 7;
+        } else {
+            tcp_mode = "forward";
+            tcp_role = PIK_CONTROL_TCP_FORWARD;
+            hostport = tcp_spec + 8;
+        }
+
         char port_str[16], extra;
-        if (sscanf(argv[argi] + 4, "%63[^:]:%15[^:]%c",
+        if (sscanf(hostport, "%63[^:]:%15[^:]%c",
                    tcp_addr, port_str, &extra) != 2 ||
             !pik_parse_port(port_str, &tcp_port))
             DIE("bad tcp spec: %s", argv[argi]);
@@ -614,7 +633,7 @@ int main(int argc, char **argv) {
         snprintf(tb_path, sizeof(tb_path), "%s/tcpbridge", self_dir);
         g_child.argv[i++] = (access(tb_path, X_OK) == 0) ? tb_path : "tcpbridge";
         g_child.argv[i++] = g_child.tunnel_dev;
-        g_child.argv[i++] = is_mcu ? "listen" : "forward";
+        g_child.argv[i++] = tcp_mode;
         g_child.argv[i++] = addr_port;
         g_child.argv[i] = NULL;
         g_child.enabled = true;
@@ -623,15 +642,15 @@ int main(int argc, char **argv) {
 
     if (argi != argc) DIE("unexpected argument: %s", argv[argi]);
 
-    g_mode_name = is_mcu ? "exporter" : "host";
+    g_uart_name = is_mcu ? "mcu" : "pty";
 
     if (has_tcp)
-        LOG("mode=%s release=%s protocol=%u channels=%d tcp=%s:%d control=usb[0] serial=usb[1] tunnel=usb[2]",
-            g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
-            cfg.n_channels, tcp_addr, tcp_port);
+        LOG("uart=%s release=%s protocol=%u channels=%d tcp=%s:%s:%d control=usb[0] serial=usb[1] tunnel=usb[2]",
+            g_uart_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+            cfg.n_channels, tcp_mode, tcp_addr, tcp_port);
     else
-        LOG("mode=%s release=%s protocol=%u channels=%d control=usb[0] serial=usb[1]",
-            g_mode_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+        LOG("uart=%s release=%s protocol=%u channels=%d control=usb[0] serial=usb[1]",
+            g_uart_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
             cfg.n_channels);
 
     sigset_t mask;
@@ -649,8 +668,14 @@ int main(int argc, char **argv) {
 
     static int sig_tag;
     pik_epoll_set(epfd, sig_fd, EPOLLIN, &sig_tag);
-    pik_control_init(epfd, is_mcu ? PIK_CONTROL_ROLE_EXPORTER : PIK_CONTROL_ROLE_HOST,
+    pik_control_init(epfd, is_mcu ? PIK_CONTROL_ROLE_MCU : PIK_CONTROL_ROLE_PTY,
                      on_control_command, NULL);
+    {
+        uint8_t channel_ids[MAX_CHANNELS];
+        for (int i = 0; i < cfg.n_channels; i++)
+            channel_ids[i] = cfg.channels[i].ch_id;
+        pik_control_set_config(channel_ids, (size_t)cfg.n_channels, tcp_role);
+    }
     if (!is_mcu && !local_control_start(epfd))
         DIE("failed to start local control socket");
     serialmux_init(&cfg, epfd);
@@ -755,7 +780,7 @@ int main(int argc, char **argv) {
                         shutdown = true;
                     } else if (si.ssi_signo == SIGUSR1) {
                         if (!is_mcu && !g_signal_command_pending && !g_signal_command_done &&
-                            pik_control_send_command(PIK_CONTROL_ACTION_RESTART_EXPORTER,
+                            pik_control_send_command(PIK_CONTROL_ACTION_RESTART_PEER,
                                                      &g_signal_request_id)) {
                             g_signal_command_pending = true;
                             g_signal_deadline_ms = now + COMMAND_ACK_TIMEOUT_MS;

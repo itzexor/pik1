@@ -18,7 +18,7 @@ RuntimeDirectory=pik1
 ExecStart=@INSTALL_DIR@/pik1d --usb 1d6b:0104 \
     pty:0:/tmp/klipper_mcu \
     pty:1:/tmp/klipper_toolhead \
-    tcp:127.0.0.1:7125
+    forward:127.0.0.1:7125
 
 Restart=always
 RestartKillSignal=SIGUSR1

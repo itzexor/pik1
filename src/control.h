@@ -5,14 +5,14 @@
 #include <stdint.h>
 
 typedef enum {
-    PIK_CONTROL_ROLE_HOST = 1,
-    PIK_CONTROL_ROLE_EXPORTER = 2,
+    PIK_CONTROL_ROLE_PTY = 1,
+    PIK_CONTROL_ROLE_MCU = 2,
 } pik_control_role_t;
 
 typedef enum {
-    PIK_CONTROL_ACTION_RESTART_EXPORTER = 1,
-    PIK_CONTROL_ACTION_REBOOT_EXPORTER = 2,
-    PIK_CONTROL_ACTION_POWEROFF_EXPORTER = 3,
+    PIK_CONTROL_ACTION_RESTART_PEER = 1,
+    PIK_CONTROL_ACTION_REBOOT_PEER = 2,
+    PIK_CONTROL_ACTION_POWEROFF_PEER = 3,
     PIK_CONTROL_ACTION_STATUS = 4,
 } pik_control_action_t;
 
@@ -21,6 +21,12 @@ typedef enum {
     PIK_CONTROL_ACK_UNKNOWN_ACTION = 1,
     PIK_CONTROL_ACK_INTERNAL_ERROR = 2,
 } pik_control_ack_status_t;
+
+typedef enum {
+    PIK_CONTROL_TCP_NONE = 0,
+    PIK_CONTROL_TCP_LISTEN = 1,
+    PIK_CONTROL_TCP_FORWARD = 2,
+} pik_control_tcp_role_t;
 
 enum {
     PIK_CONTROL_LINK_SERIAL = 1u << 0,
@@ -41,6 +47,8 @@ bool pik_control_ready(void);
 int64_t pik_control_deadline(void);
 void pik_control_cleanup(void);
 
+void pik_control_set_config(const uint8_t *channels, size_t n_channels,
+                            pik_control_tcp_role_t tcp_role);
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id);
 bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status,
                           const uint8_t **payload, size_t *payload_len);

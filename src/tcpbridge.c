@@ -777,6 +777,7 @@ int main(int argc, char **argv) {
         g_is_listener = false;
     else
         usage(argv[0]);
+    pik_log_set_timestamps(g_is_listener);
 
     const char *hostport = argv[3];
     const char *colon = strrchr(hostport, ':');

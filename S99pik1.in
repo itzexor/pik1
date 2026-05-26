@@ -1,5 +1,5 @@
 #!/bin/sh
-# /etc/init.d/S99pik1 — pik1 exporter: bridges K1C MCU UARTs to the Pi over USB CDC ACM.
+# /etc/init.d/S99pik1 — pik1 K1 side: bridges K1C MCU UARTs to the Pi over USB CDC ACM.
 
 INSTALL_DIR="@INSTALL_DIR@"
 BINARY="$INSTALL_DIR/pik1d"
@@ -24,7 +24,7 @@ TCP_PORT="7125"
 DAEMON_ARGS="--usb $USB_ID \
     mcu:0:$CH0_DEV:$CH0_BAUD \
     mcu:1:$CH1_DEV:$CH1_BAUD \
-    tcp:$TCP_ADDR:$TCP_PORT"
+    listen:$TCP_ADDR:$TCP_PORT"
 
 case "$1" in
     start)
