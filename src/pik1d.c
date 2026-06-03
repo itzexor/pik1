@@ -365,7 +365,8 @@ static void on_control_command(pik_control_action_t action, uint32_t request_id,
         return;
     }
 
-    pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, NULL, 0);
+    if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, NULL, 0))
+        return;
     g_remote_action = action;
     g_remote_action_pending = true;
     g_remote_action_at_ms = pik_now_ms() + REMOTE_ACTION_DELAY_MS;
