@@ -564,6 +564,13 @@ static bool link_open(link_t *lk, const char *dev) {
         g_session_failed = true;
         return false;
     }
+    if (tty_flush_io(lk->fd) < 0) {
+        LOG("termios flush failed on %s: %s", dev, strerror(errno));
+        close(lk->fd);
+        lk->fd = -1;
+        g_session_failed = true;
+        return false;
+    }
 
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = 0;

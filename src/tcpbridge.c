@@ -610,6 +610,12 @@ static void link_try_open(int64_t now) {
         lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
         return;
     }
+    if (tty_flush_io(fd) < 0) {
+        LOG("termios flush failed on %s: %s", lk->dev, strerror(errno));
+        close(fd);
+        lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
+        return;
+    }
 
     lk->fd = fd;
     lk->rxbuf_len = 0;

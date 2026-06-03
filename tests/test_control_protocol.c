@@ -38,7 +38,22 @@ static void put_u16le(uint8_t *p, uint16_t v) {
     p[1] = (uint8_t)(v >> 8);
 }
 
-static bool fixture_init(ctrl_fixture_t *fx, pik_control_role_t role) {
+static bool write_stale_config(ctrl_fixture_t *fx) {
+    uint8_t header[PIK_CONTROL_FRAME_HEADER_LEN];
+    uint8_t payload[] = { PIK_CONTROL_TCP_NONE, 0 };
+    uint8_t enc[128];
+    size_t enc_len = 0;
+    header[0] = PIK_CONTROL_FRAME_CONFIG;
+    pik_put_u32le(header + 1, 0x0badcafeu);
+    put_u16le(header + 5, 1);
+    if (!test_encode_frame(header, sizeof(header), payload, sizeof(payload),
+                           enc, sizeof(enc), &enc_len))
+        return false;
+    return test_write_all(fx->master, enc, enc_len);
+}
+
+static bool fixture_init_with_stale(ctrl_fixture_t *fx, pik_control_role_t role,
+                                    bool stale_input) {
     memset(fx, 0, sizeof(*fx));
     fx->epfd = epoll_create1(EPOLL_CLOEXEC);
     fx->master = -1;
@@ -50,9 +65,15 @@ static bool fixture_init(ctrl_fixture_t *fx, pik_control_role_t role) {
     if (openpty(&fx->master, &fx->slave_keepalive, fx->slave_name, NULL, NULL) < 0)
         return false;
     test_set_nonblock(fx->master);
+    if (stale_input && !write_stale_config(fx))
+        return false;
 
     pik_control_init(fx->epfd, role, command_cb, NULL);
     return pik_control_start(fx->slave_name, pik_now_ms());
+}
+
+static bool fixture_init(ctrl_fixture_t *fx, pik_control_role_t role) {
+    return fixture_init_with_stale(fx, role, false);
 }
 
 static void fixture_cleanup(ctrl_fixture_t *fx) {
@@ -200,6 +221,14 @@ static void test_missing_peer_handshake_times_out(void) {
     fixture_cleanup(&fx);
 }
 
+static void test_stale_startup_input_is_flushed(void) {
+    ctrl_fixture_t fx;
+
+    CHECK(fixture_init_with_stale(&fx, PIK_CONTROL_ROLE_PTY, true));
+    CHECK(handshake(&fx));
+    fixture_cleanup(&fx);
+}
+
 static void test_sequence_gap_fails(void) {
     ctrl_fixture_t fx;
 
@@ -302,6 +331,7 @@ int main(void) {
     test_protocol_mismatch_fails();
     test_role_mismatch_fails();
     test_missing_peer_handshake_times_out();
+    test_stale_startup_input_is_flushed();
     test_sequence_gap_fails();
     test_session_change_fails();
     test_unknown_type_fails();

@@ -54,3 +54,7 @@ int tty_set_byte_raw(int fd) {
 int tty_set_byte_raw_baud(int fd, int baud) {
     return tty_apply_byte_raw(fd, baud);
 }
+
+int tty_flush_io(int fd) {
+    return tcflush(fd, TCIOFLUSH);
+}

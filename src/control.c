@@ -534,6 +534,12 @@ bool pik_control_start(const char *dev, int64_t now) {
         g_ctrl.failed = true;
         return false;
     }
+    if (tty_flush_io(fd) < 0) {
+        LOG("termios flush failed on %s: %s", dev, strerror(errno));
+        close(fd);
+        g_ctrl.failed = true;
+        return false;
+    }
 
     g_ctrl.fd = fd;
     g_ctrl.ready = false;
