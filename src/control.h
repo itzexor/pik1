@@ -52,7 +52,7 @@ void pik_control_set_config(const uint8_t *channels, size_t n_channels,
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id);
 bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status,
                           const uint8_t **payload, size_t *payload_len);
-void pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
+bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
                           const uint8_t *payload, size_t payload_len);
 bool pik_control_send_link_state(uint32_t flags);
 bool pik_control_peer_link_state(uint32_t *flags);

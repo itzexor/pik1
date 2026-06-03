@@ -172,7 +172,11 @@ static void update_epoll(void) {
 }
 
 static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
-    if (plen > MAX_PAYLOAD) return false;
+    if (plen > MAX_PAYLOAD) {
+        LOG("oversized frame type=0x%02x plen=%zu", type, plen);
+        close_link();
+        return false;
+    }
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
@@ -187,10 +191,12 @@ static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
     if (pik_frame_encode(header, sizeof(header), payload, plen,
                          dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
         LOG("encode failed type=0x%02x", type);
+        close_link();
         return false;
     }
     if (!tx_push(enc, enc_len)) {
-        LOG("TX ring full, drop type=0x%02x", type);
+        LOG("TX ring full, closing before dropping type=0x%02x", type);
+        close_link();
         return false;
     }
     g_ctrl.tx_seq++;
@@ -334,7 +340,8 @@ static bool handle_hello(const uint8_t *p, size_t len) {
         g_ctrl.ready = true;
         LOG("link up: release=%s protocol=%u features=0x%08x",
             release, proto, features);
-        send_config();
+        if (!send_config())
+            return false;
     }
     return true;
 }
@@ -394,8 +401,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             close_link();
             return false;
         }
-        enqueue_frame(C_PONG, NULL, 0);
-        return true;
+        return enqueue_frame(C_PONG, NULL, 0);
     case C_PONG:
         if (len != 0) {
             LOG("bad PONG len=%zu", len);
@@ -414,11 +420,13 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             uint32_t request_id = pik_get_u32le(p);
             if (!action_valid(action)) {
                 LOG("rejecting unknown command action=%u request=%u", p[4], request_id);
-                pik_control_send_ack(request_id, PIK_CONTROL_ACK_UNKNOWN_ACTION, NULL, 0);
-                return true;
+                return pik_control_send_ack(request_id, PIK_CONTROL_ACK_UNKNOWN_ACTION,
+                                            NULL, 0);
             }
             if (g_ctrl.on_command)
                 g_ctrl.on_command(action, request_id, g_ctrl.ctx);
+            if (g_ctrl.failed)
+                return false;
         }
         return true;
     case C_ACK:
@@ -567,8 +575,7 @@ bool pik_control_start(const char *dev, int64_t now) {
     g_ctrl.last_rx_ms = g_ctrl.last_tx_ms = now;
     pik_epoll_set(g_epfd, fd, EPOLLIN, &g_ctrl_tag);
     LOG("link opened: %s", dev);
-    send_hello();
-    return true;
+    return send_hello();
 }
 
 bool pik_control_owns_event(void *ptr) {
@@ -677,7 +684,7 @@ bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status
     return true;
 }
 
-void pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
+bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
                           const uint8_t *payload, size_t payload_len) {
     uint8_t p[MAX_PAYLOAD];
     if (payload_len > sizeof(p) - 5)
@@ -686,7 +693,7 @@ void pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
     p[4] = status;
     if (payload_len)
         memcpy(p + 5, payload, payload_len);
-    enqueue_frame(C_ACK, p, 5 + payload_len);
+    return enqueue_frame(C_ACK, p, 5 + payload_len);
 }
 
 bool pik_control_send_link_state(uint32_t flags) {
