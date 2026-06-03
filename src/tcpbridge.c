@@ -1,8 +1,8 @@
 // src/tcpbridge.c — multi-connection TCP-over-serial bridge
 // Wire protocol: COBS + CRC32, frame layout:
 //   [type:1][conn_id:1][session_le:4][seq_le:2][payload][crc32_le:4]
-// Session and sequencing are detection-only: any generation change or reliable
-// frame gap is treated as link failure.
+// Session and sequencing are detection-only: any generation change or frame gap
+// is treated as link failure.
 // Runs on ttyGS2 (K1C) / ttyACM2 (Pi).
 
 #include "nanocobs/cobs.h"
