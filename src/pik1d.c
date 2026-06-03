@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <sys/signalfd.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -30,6 +31,7 @@
 #define MAX_EVENTS 32
 #define LOCAL_CONTROL_SOCK "/run/pik1/control.sock"
 #define COMMAND_ACK_TIMEOUT_MS 3000
+#define LOCAL_CONTROL_WRITE_TIMEOUT_MS 1000
 #define REMOTE_ACTION_DELAY_MS 250
 
 #define LOG(...) pik_log("pik1", __VA_ARGS__)
@@ -175,25 +177,56 @@ static void local_control_cleanup(void) {
     }
 }
 
-static void local_control_write(int fd, const void *buf, size_t len) {
+static bool local_control_write(int fd, const void *buf, size_t len) {
     const char *p = buf;
     size_t off = 0;
     while (off < len) {
         ssize_t n = write(fd, p + off, len - off);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int r = poll(&pfd, 1, LOCAL_CONTROL_WRITE_TIMEOUT_MS);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) {
+                LOG("local control write timeout after %zu/%zu bytes", off, len);
+                return false;
+            }
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                LOG("local control write failed after %zu/%zu bytes", off, len);
+                return false;
+            }
+            continue;
+        }
+        if (n <= 0) {
+            LOG("local control write: %s", n == 0 ? "EOF" : strerror(errno));
+            return false;
+        }
         off += (size_t)n;
     }
+    return true;
 }
 
-static void local_control_write_response(int fd, const char *msg) {
-    local_control_write(fd, msg, strlen(msg));
+static bool local_control_write_response(int fd, const char *msg) {
+    return local_control_write(fd, msg, strlen(msg));
 }
 
 static void local_control_reply_and_close(const char *msg) {
-    if (g_local.client_fd >= 0)
-        local_control_write_response(g_local.client_fd, msg);
+    if (g_local.client_fd >= 0 &&
+        !local_control_write_response(g_local.client_fd, msg))
+        LOG("local control response was not fully delivered");
     local_control_close_client();
+}
+
+static void local_control_reply_payload_and_close(const uint8_t *payload,
+                                                  size_t payload_len) {
+    char msg[160];
+    int n = snprintf(msg, sizeof(msg), "OK %.*s\n",
+                     (int)payload_len, (const char *)payload);
+    if (n < 0 || (size_t)n >= sizeof(msg)) {
+        local_control_reply_and_close("ERR response too large\n");
+        return;
+    }
+    local_control_reply_and_close(msg);
 }
 
 static void local_control_reply_error_status(pik_control_ack_status_t status) {
@@ -206,7 +239,8 @@ static void local_control_accept(void) {
     int fd = accept4(g_local.listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) return;
     if (g_local.client_fd >= 0) {
-        local_control_write_response(fd, "ERR busy\n");
+        if (!local_control_write_response(fd, "ERR busy\n"))
+            LOG("local control busy response was not fully delivered");
         close(fd);
         return;
     }
@@ -249,10 +283,7 @@ static void local_control_check_ack(int64_t now) {
     while (pik_control_take_ack(&request_id, &status, &payload, &payload_len)) {
         if (g_local.command_pending && request_id == g_local.request_id) {
             if (status == PIK_CONTROL_ACK_OK && payload_len) {
-                local_control_write(g_local.client_fd, "OK ", 3);
-                local_control_write(g_local.client_fd, payload, payload_len);
-                local_control_write(g_local.client_fd, "\n", 1);
-                local_control_close_client();
+                local_control_reply_payload_and_close(payload, payload_len);
             } else {
                 if (status == PIK_CONTROL_ACK_OK)
                     local_control_reply_and_close("OK\n");
