@@ -314,9 +314,9 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
     setup_pik1: gadget setup complete
-    [pik1] uart=pty release=0.2.0 protocol=2 channels=2 tcp=forward:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    [pik1] uart=pty release=0.3.0 protocol=3 channels=2 tcp=forward:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
     [ctrl] link opened: /dev/ttyGS0
-    [ctrl] link up: release=0.2.0 protocol=2 features=0x00000000
+    [ctrl] link up: release=0.3.0 protocol=3 features=0x00000000
     [pik1] control session started: control=/dev/ttyGS0 serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
     [pik1] data session started: serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
     [pik1] child: spawned /opt/pik1/tcpbridge pid=...
@@ -336,9 +336,9 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     A normal startup looks like. Because `pik1d` and `tcpbridge` write to the
     same log, adjacent lines may occasionally interleave:
     ```
-    2026-05-25 19:41:50 [pik1] uart=mcu release=0.2.0 protocol=2 channels=2 tcp=listen:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    2026-05-25 19:41:50 [pik1] uart=mcu release=0.3.0 protocol=3 channels=2 tcp=listen:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
     2026-05-25 19:41:50 [ctrl] link opened: /dev/ttyACM0
-    2026-05-25 19:41:50 [ctrl] link up: release=0.2.0 protocol=2 features=0x00000000
+    2026-05-25 19:41:50 [ctrl] link up: release=0.3.0 protocol=3 features=0x00000000
     2026-05-25 19:41:50 [pik1] control session started: control=/dev/ttyACM0 serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
     2026-05-25 19:41:50 [pik1] data session started: serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
     2026-05-25 19:41:50 [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...

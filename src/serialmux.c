@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 // ── frame types ───────────────────────────────────────────────────────────────
@@ -27,7 +28,8 @@
 // ── sizing ────────────────────────────────────────────────────────────────────
 #define MAX_PAYLOAD     4096
 
-#define FRAME_DEC_MAX   (2 + MAX_PAYLOAD + 4)
+#define FRAME_HEADER_LEN 8u
+#define FRAME_DEC_MAX   (FRAME_HEADER_LEN + MAX_PAYLOAD + 4)
 #define FRAME_ENC_MAX   COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define LINK_RING_CAP   (1u << 20)
@@ -75,6 +77,11 @@ typedef struct {
 
     uint8_t     rxbuf[FRAME_ENC_MAX + 4];
     size_t      rxbuf_len;
+
+    uint32_t    tx_session;
+    uint32_t    rx_session;
+    uint16_t    tx_seq;
+    uint16_t    rx_seq;
 
 } link_t;
 
@@ -163,6 +170,18 @@ static bool lk_drain(link_t *lk) {
     return wrote;
 }
 
+static uint32_t new_session_id(int64_t now) {
+    static uint32_t counter;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t s = (uint32_t)now
+               ^ (uint32_t)getpid()
+               ^ (uint32_t)tv.tv_sec
+               ^ (uint32_t)tv.tv_usec
+               ^ ++counter;
+    return s ? s : ++counter;
+}
+
 // ── frame I/O ────────────────────────────────────────────────────────────────
 static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len);
 static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len);
@@ -188,10 +207,13 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[2];
+    uint8_t header[FRAME_HEADER_LEN];
 
     header[0] = type;
     header[1] = ch_id;
+    pik_put_u32le(header + 2, lk->tx_session);
+    header[6] = (uint8_t)lk->tx_seq;
+    header[7] = (uint8_t)(lk->tx_seq >> 8);
 
     size_t enc_len = 0;
     if (pik_frame_encode(header, sizeof(header), payload, plen,
@@ -204,6 +226,7 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
         LOG("link TX ring full, dropping frame type=0x%02x ch=%u", type, ch_id);
         return;
     }
+    lk->tx_seq++;
 
     if (!(lk->epev & EPOLLOUT) && lk->fd >= 0) {
         lk->epev |= EPOLLOUT;
@@ -437,7 +460,7 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     pik_frame_t frame;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             2, dec, sizeof(dec), &frame);
+                                             FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
     if (st != PIK_FRAME_OK) {
         link_fail_frame(lk, pik_frame_status_text(st), enc, enc_len);
         return;
@@ -445,8 +468,39 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
 
     uint8_t        type    = frame.header[0];
     uint8_t        ch_id   = frame.header[1];
+    uint32_t       session = pik_get_u32le(frame.header + 2);
+    uint16_t       seq     = (uint16_t)frame.header[6] | (uint16_t)frame.header[7] << 8;
     size_t         plen    = frame.payload_len;
     const uint8_t *payload = frame.payload;
+
+    if (session == 0) {
+        LOG("link failure: zero session type=0x%02x ch=%u", type, ch_id);
+        link_close(lk);
+        return;
+    }
+    if (lk->rx_session == 0) {
+        if (seq != 0) {
+            LOG("link failure: first frame seq=%u type=0x%02x ch=%u", seq, type, ch_id);
+            link_close(lk);
+            return;
+        }
+        lk->rx_session = session;
+        lk->rx_seq = 1;
+    } else {
+        if (session != lk->rx_session) {
+            LOG("link failure: session changed old=0x%08x new=0x%08x type=0x%02x ch=%u",
+                lk->rx_session, session, type, ch_id);
+            link_close(lk);
+            return;
+        }
+        if (seq != lk->rx_seq) {
+            LOG("link failure: seq gap session=0x%08x seq=%u expected=%u type=0x%02x ch=%u",
+                session, seq, lk->rx_seq, type, ch_id);
+            link_close(lk);
+            return;
+        }
+        lk->rx_seq++;
+    }
 
     channel_t *c = find_channel(ch_id);
     if (!c) return;
@@ -499,6 +553,10 @@ static bool link_open(link_t *lk, const char *dev) {
 
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = 0;
+    if (!lk->tx_session)
+        lk->tx_session = new_session_id(0);
+    lk->rx_session = 0;
+    lk->tx_seq = lk->rx_seq = 0;
     lk->up   = true;
     lk->epev = EPOLLIN;
     pik_epoll_set(g_epfd, lk->fd, EPOLLIN, lk);
@@ -578,6 +636,7 @@ void serialmux_init(const serialmux_config_t *cfg, int epfd) {
 bool serialmux_start(const char *link_dev, int64_t now) {
     memset(&g_link, 0, sizeof(g_link));
     g_link.fd = -1;
+    g_link.tx_session = new_session_id(now);
     g_session_failed = false;
     for (int i = 0; i < g_n_chans; i++) {
         channel_t *c = &g_chans[i];
