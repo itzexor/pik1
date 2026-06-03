@@ -83,6 +83,8 @@ static int g_ctrl_tag;
 
 #define LOG(...) pik_log("ctrl", __VA_ARGS__)
 
+static void close_link(void);
+
 static uint32_t avail(void) { return g_ctrl.tx_tail - g_ctrl.tx_head; }
 static uint32_t space(void) { return TX_RING_CAP - avail(); }
 
@@ -111,6 +113,17 @@ static bool action_valid(pik_control_action_t action) {
     case PIK_CONTROL_ACTION_REBOOT_PEER:
     case PIK_CONTROL_ACTION_POWEROFF_PEER:
     case PIK_CONTROL_ACTION_STATUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool ack_status_valid(pik_control_ack_status_t status) {
+    switch (status) {
+    case PIK_CONTROL_ACK_OK:
+    case PIK_CONTROL_ACK_UNKNOWN_ACTION:
+    case PIK_CONTROL_ACK_INTERNAL_ERROR:
         return true;
     default:
         return false;
@@ -204,16 +217,18 @@ static bool local_channel_present(uint8_t id) {
     return false;
 }
 
-static void handle_config(const uint8_t *p, size_t len) {
+static bool handle_config(const uint8_t *p, size_t len) {
     if (len < 2 || p[1] != len - 2) {
         LOG("bad CONFIG");
-        return;
+        close_link();
+        return false;
     }
 
     pik_control_tcp_role_t peer_tcp = (pik_control_tcp_role_t)p[0];
     if (peer_tcp > PIK_CONTROL_TCP_FORWARD) {
         LOG("bad CONFIG tcp role=%u", p[0]);
-        return;
+        close_link();
+        return false;
     }
 
     bool peer_present[UINT8_MAX + 1] = { false };
@@ -244,6 +259,7 @@ static void handle_config(const uint8_t *p, size_t len) {
         LOG("warning: TCP tunnel is configured as %s on both sides",
             tcp_role_name(g_ctrl.local_tcp_role));
     }
+    return true;
 }
 
 static void close_link(void) {
@@ -318,12 +334,26 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
     case C_HELLO:
         return handle_hello(p, len);
     case C_PING:
+        if (len != 0) {
+            LOG("bad PING len=%zu", len);
+            close_link();
+            return false;
+        }
         enqueue_frame(C_PONG, NULL, 0);
         return true;
     case C_PONG:
+        if (len != 0) {
+            LOG("bad PONG len=%zu", len);
+            close_link();
+            return false;
+        }
         return true;
     case C_COMMAND:
-        if (len != 5) return true;
+        if (len != 5) {
+            LOG("bad COMMAND len=%zu", len);
+            close_link();
+            return false;
+        }
         {
             pik_control_action_t action = (pik_control_action_t)p[4];
             uint32_t request_id = pik_get_u32le(p);
@@ -337,9 +367,18 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
         }
         return true;
     case C_ACK:
-        if (len < 5) return true;
+        if (len < 5) {
+            LOG("bad ACK len=%zu", len);
+            close_link();
+            return false;
+        }
         g_ctrl.ack_request_id = pik_get_u32le(p);
         g_ctrl.ack_status = (pik_control_ack_status_t)p[4];
+        if (!ack_status_valid(g_ctrl.ack_status)) {
+            LOG("bad ACK status=%u request=%u", p[4], g_ctrl.ack_request_id);
+            close_link();
+            return false;
+        }
         g_ctrl.ack_payload_len = len - 5;
         if (g_ctrl.ack_payload_len > sizeof(g_ctrl.ack_payload))
             g_ctrl.ack_payload_len = sizeof(g_ctrl.ack_payload);
@@ -348,7 +387,11 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
         g_ctrl.ack_pending = true;
         return true;
     case C_LINK_STATE:
-        if (len != 4) return true;
+        if (len != 4) {
+            LOG("bad LINK_STATE len=%zu", len);
+            close_link();
+            return false;
+        }
         g_ctrl.peer_link_flags = pik_get_u32le(p);
         g_ctrl.peer_link_known = true;
         LOG("peer data links: serial=%s tcp=%s",
@@ -356,10 +399,11 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_TCP) ? "up" : "down");
         return true;
     case C_CONFIG:
-        handle_config(p, len);
-        return true;
+        return handle_config(p, len);
     default:
-        return true;
+        LOG("bad control frame type=0x%02x len=%zu", type, len);
+        close_link();
+        return false;
     }
 }
 
