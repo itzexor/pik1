@@ -311,6 +311,8 @@ static bool handle_hello(const uint8_t *p, size_t len) {
         g_ctrl.ready = true;
         LOG("link up: release=%s protocol=%u features=0x%08x",
             release, proto, features);
+        if (!send_hello())
+            return false;
         if (!send_config())
             return false;
     }
@@ -341,13 +343,13 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
         return false;
     }
     if (g_ctrl.rx_session == 0) {
-        if (seq != 0) {
-            LOG("bad first control seq=%u type=0x%02x", seq, type);
+        if (type != PIK_CONTROL_FRAME_HELLO) {
+            LOG("bad first control frame type=0x%02x seq=%u", type, seq);
             close_link();
             return false;
         }
         g_ctrl.rx_session = session;
-        g_ctrl.rx_seq = 1;
+        g_ctrl.rx_seq = seq + 1;
     } else if (session != g_ctrl.rx_session) {
         LOG("control session changed old=0x%08x new=0x%08x type=0x%02x",
             g_ctrl.rx_session, session, type);

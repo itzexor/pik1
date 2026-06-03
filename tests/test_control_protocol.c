@@ -158,6 +158,11 @@ static bool handshake(ctrl_fixture_t *fx) {
     if (!read_local_frame(fx, enc, sizeof(enc), &enc_len)) return false;
     if (!decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)))
         return false;
+    if (type != PIK_CONTROL_FRAME_HELLO) return false;
+
+    if (!read_local_frame(fx, enc, sizeof(enc), &enc_len)) return false;
+    if (!decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)))
+        return false;
     return type == PIK_CONTROL_FRAME_CONFIG;
 }
 
@@ -226,6 +231,29 @@ static void test_stale_startup_input_is_flushed(void) {
 
     CHECK(fixture_init_with_stale(&fx, PIK_CONTROL_ROLE_PTY, true));
     CHECK(handshake(&fx));
+    fixture_cleanup(&fx);
+}
+
+static void test_late_peer_hello_retry_sequence(void) {
+    ctrl_fixture_t fx;
+    uint8_t enc[512], dec[512], type;
+    uint32_t session;
+    uint16_t seq;
+    size_t enc_len = 0;
+    pik_frame_t frame;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    fx.peer_seq = 4;
+    CHECK(send_peer_hello(&fx, PIK_CONTROL_ROLE_MCU, PIK1_PROTOCOL_VERSION));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(pik_control_ready());
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_HELLO);
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_CONFIG);
     fixture_cleanup(&fx);
 }
 
@@ -332,6 +360,7 @@ int main(void) {
     test_role_mismatch_fails();
     test_missing_peer_handshake_times_out();
     test_stale_startup_input_is_flushed();
+    test_late_peer_hello_retry_sequence();
     test_sequence_gap_fails();
     test_session_change_fails();
     test_unknown_type_fails();

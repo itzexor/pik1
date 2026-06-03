@@ -73,13 +73,12 @@ static TEST_UNUSED bool test_read_delimited_frame(int fd, uint8_t *buf, size_t c
     *len = 0;
     while (*len < cap) {
         if (!test_wait_fd(fd, false, timeout_ms)) return false;
-        ssize_t n = read(fd, buf + *len, cap - *len);
+        ssize_t n = read(fd, buf + *len, 1);
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         if (n <= 0) return false;
-        uint8_t *delim = memchr(buf + *len, 0, (size_t)n);
         *len += (size_t)n;
-        if (delim) return true;
+        if (buf[*len - 1] == 0) return true;
     }
     return false;
 }
