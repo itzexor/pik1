@@ -454,8 +454,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             if (fd < 0) {
                 LOG("conn %d: connect to %s:%d failed: %s",
                     id, g_fwd_host, g_fwd_port, strerror(errno));
-                enqueue_frame(TB_CLOSE, id, NULL, 0);
-                return true;
+                return enqueue_frame(TB_CLOSE, id, NULL, 0);
             }
             g_conns[id].fd = fd;
             g_conns[id].epev = 0;
@@ -473,14 +472,15 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         }
         if (g_conns[id].fd < 0) {
             LOG("conn %u: DATA for closed connection", id);
-            enqueue_frame(TB_CLOSE, id, NULL, 0);
-            return true;
+            return enqueue_frame(TB_CLOSE, id, NULL, 0);
         }
         if (!plen) return true;
         conn_drain(&g_conns[id]);
         if (conn_space(&g_conns[id]) < plen) {
             if (!g_conns[id].pause_sent && enqueue_frame(TB_PAUSE, id, NULL, 0))
                 g_conns[id].pause_sent = true;
+            if (!g_conns[id].pause_sent)
+                return false;
             link_fail_text("conn output buffer overflow despite PAUSE", now);
             return false;
         }
@@ -490,11 +490,13 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             conn_t *c = &g_conns[id];
             uint32_t avail = conn_avail(c);
             if (!c->pause_sent && avail > CONN_HIGH_WATER) {
-                if (enqueue_frame(TB_PAUSE, id, NULL, 0))
-                    c->pause_sent = true;
+                if (!enqueue_frame(TB_PAUSE, id, NULL, 0))
+                    return false;
+                c->pause_sent = true;
             } else if (c->pause_sent && avail < CONN_LOW_WATER) {
-                if (enqueue_frame(TB_RESUME, id, NULL, 0))
-                    c->pause_sent = false;
+                if (!enqueue_frame(TB_RESUME, id, NULL, 0))
+                    return false;
+                c->pause_sent = false;
             }
         }
         conn_epoll_update(&g_conns[id]);
