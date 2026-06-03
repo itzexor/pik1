@@ -105,7 +105,7 @@ static void chan_push(channel_t *c, const uint8_t *src, size_t len) {
         c->txbuf[c->tx_tail++ & CHAN_RING_MASK] = src[i];
 }
 
-static void chan_drain(channel_t *c) {
+static bool chan_drain(channel_t *c) {
     while (chan_avail(c)) {
         uint32_t off    = c->tx_head & CHAN_RING_MASK;
         uint32_t contig = CHAN_RING_CAP - off;
@@ -113,12 +113,15 @@ static void chan_drain(channel_t *c) {
         size_t   n      = avail < contig ? avail : contig;
         ssize_t  w      = write(c->fd, c->txbuf + off, n);
         if (w <= 0) {
-            if (w < 0 && errno != EAGAIN && errno != EINTR)
+            if (w < 0 && errno != EAGAIN && errno != EINTR) {
                 LOG("ch%u write: %s", c->ch_id, strerror(errno));
+                return false;
+            }
             break;
         }
         c->tx_head += (uint32_t)w;
     }
+    return true;
 }
 
 static void chan_epoll_update(channel_t *c) {
@@ -328,9 +331,13 @@ static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
     }
 }
 
-static void mcu_on_writable(channel_t *c) {
-    chan_drain(c);
+static bool mcu_on_writable(channel_t *c) {
+    if (!chan_drain(c)) {
+        LOG("ch%u MCU write failure, closing link", c->ch_id);
+        return false;
+    }
     chan_epoll_update(c);
+    return true;
 }
 
 static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
@@ -412,9 +419,13 @@ static void pty_on_readable(channel_t *c, link_t *lk) {
     ch_send_data(lk, c, buf, (size_t)n);
 }
 
-static void pty_on_writable(channel_t *c) {
-    chan_drain(c);
+static bool pty_on_writable(channel_t *c) {
+    if (!chan_drain(c)) {
+        pty_close(c);
+        return true;
+    }
     chan_epoll_update(c);
+    return true;
 }
 
 static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
@@ -452,9 +463,9 @@ static void ch_on_readable(channel_t *c, link_t *lk, int64_t now) {
     else                    pty_on_readable(c, lk);
 }
 
-static void ch_on_writable(channel_t *c) {
-    if (c->type == CH_MCU) mcu_on_writable(c);
-    else                    pty_on_writable(c);
+static bool ch_on_writable(channel_t *c) {
+    if (c->type == CH_MCU) return mcu_on_writable(c);
+    return pty_on_writable(c);
 }
 
 static void ch_tick(channel_t *c, link_t *lk, int64_t now) {
@@ -688,7 +699,10 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
         return true;
     }
     if (events & EPOLLIN) ch_on_readable(c, &g_link, now);
-    if (!g_session_failed && (events & EPOLLOUT)) ch_on_writable(c);
+    if (!g_session_failed && (events & EPOLLOUT) && !ch_on_writable(c)) {
+        link_close(&g_link);
+        return false;
+    }
     return !g_session_failed;
 }
 
