@@ -601,8 +601,8 @@ static void link_on_readable(link_t *lk) {
 
     ssize_t n = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
     if (n <= 0) {
-        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EINTR))) return;
-        LOG("link read: %s", strerror(errno));
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+        LOG("link read: %s", n == 0 ? "EOF" : strerror(errno));
         link_close(lk);
         return;
     }
