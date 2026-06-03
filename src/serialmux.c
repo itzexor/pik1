@@ -334,7 +334,14 @@ static void mcu_on_writable(channel_t *c) {
 }
 
 static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
-    if (type != F_DATA || c->fd < 0) return true;
+    if (type != F_DATA) {
+        LOG("ch%u unexpected MCU frame type=0x%02x", c->ch_id, type);
+        return false;
+    }
+    if (c->fd < 0) {
+        LOG("ch%u data for closed MCU", c->ch_id);
+        return false;
+    }
     if (chan_space(c) < plen) {
         LOG("ch%u MCU txbuf full, closing link before dropping %zu bytes", c->ch_id, plen);
         return false;
@@ -413,7 +420,10 @@ static void pty_on_writable(channel_t *c) {
 static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
     switch (type) {
     case F_DATA:
-        if (c->fd < 0) return true;
+        if (c->fd < 0) {
+            LOG("ch%u data for closed PTY", c->ch_id);
+            return false;
+        }
         if (chan_space(c) < plen) {
             LOG("ch%u PTY txbuf full, closing link before dropping %zu bytes", c->ch_id, plen);
             return false;
@@ -423,7 +433,9 @@ static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, siz
         break;
     case F_FLUSH: pty_close(c); break;
     case F_READY: pty_open(c);  break;
-    default: break;
+    default:
+        LOG("ch%u unexpected PTY frame type=0x%02x", c->ch_id, type);
+        return false;
     }
     return true;
 }
@@ -503,7 +515,11 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     }
 
     channel_t *c = find_channel(ch_id);
-    if (!c) return;
+    if (!c) {
+        LOG("link failure: unknown channel id=%u type=0x%02x", ch_id, type);
+        link_close(lk);
+        return;
+    }
 
     bool ok = (c->type == CH_MCU) ? mcu_on_frame(c, type, payload, plen)
                                   : pty_on_frame(c, type, payload, plen);
