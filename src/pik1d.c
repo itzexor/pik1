@@ -420,8 +420,8 @@ static void child_spawn(const char *tunnel_dev, int64_t now) {
     g_child.backoff_ms = RETRY_MIN_MS;
     g_child.intentional_stop = false;
     g_child.waiting_for_tunnel = false;
-    set_link_flag(PIK_CONTROL_LINK_TCP, true);
-    LOG("child: spawned %s pid=%d", g_child.argv[0], pid);
+    set_link_flag(PIK_CONTROL_LINK_TCP, false);
+    LOG("child: spawned %s pid=%d (TCP link state pending)", g_child.argv[0], pid);
 }
 
 static void child_stop(void) {
