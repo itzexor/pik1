@@ -200,13 +200,17 @@ static void link_fail_frame(link_t *lk, const char *reason,
 
 static bool link_can_queue_frame(const link_t *lk, size_t plen) {
     if (plen > MAX_PAYLOAD) return false;
-    return lk_space(lk) >= COBS_ENCODE_MAX(2 + plen + 4);
+    return lk_space(lk) >= COBS_ENCODE_MAX(FRAME_HEADER_LEN + plen + 4);
 }
 
 static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
                            const uint8_t *payload, size_t plen) {
     if (!lk->up) return;
-    if (plen > MAX_PAYLOAD) return;
+    if (plen > MAX_PAYLOAD) {
+        LOG("oversized frame type=0x%02x ch=%u plen=%zu", type, ch_id, plen);
+        link_close(lk);
+        return;
+    }
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
@@ -222,11 +226,14 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
     if (pik_frame_encode(header, sizeof(header), payload, plen,
                          dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
         LOG("cobs_encode failed type=0x%02x ch=%u", type, ch_id);
+        link_close(lk);
         return;
     }
 
     if (!lk_push(lk, enc, enc_len)) {
-        LOG("link TX ring full, dropping frame type=0x%02x ch=%u", type, ch_id);
+        LOG("link TX ring full, closing before dropping frame type=0x%02x ch=%u",
+            type, ch_id);
+        link_close(lk);
         return;
     }
     lk->tx_seq++;

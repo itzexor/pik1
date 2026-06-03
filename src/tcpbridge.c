@@ -277,8 +277,12 @@ static void lk_drain(int64_t now) {
 static bool enqueue_frame(uint8_t type, uint8_t conn_id,
                           const uint8_t *payload, size_t plen) {
     link_t *lk = &g_link;
-    if (plen > MAX_PAYLOAD) return false;
-    if (!lk->up && lk->fd >= 0) return true;
+    if (plen > MAX_PAYLOAD) {
+        LOG("oversized frame type=0x%02x conn=%u plen=%zu", type, conn_id, plen);
+        link_close(pik_now_ms());
+        return false;
+    }
+    if (!lk->up) return false;
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
@@ -297,10 +301,12 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
     if (pik_frame_encode(header, sizeof(header), payload, plen,
                          dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
         LOG("encode failed type=0x%02x", type);
+        link_close(pik_now_ms());
         return false;
     }
     if (!lk_queue_encoded(enc, enc_len)) {
-        LOG("link TX frame queue full, drop type=0x%02x", type);
+        LOG("link TX frame queue full, closing before dropping type=0x%02x", type);
+        link_close(pik_now_ms());
         return false;
     }
     if (reliable)
