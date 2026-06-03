@@ -49,26 +49,39 @@ AARCH64_STRIP ?= $(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-
 ARMV7_CC     ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 ARMV7_STRIP  ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-strip
 
-.PHONY: all native mipsel aarch64 armv7 test test-cli toolchain clean distclean \
+.PHONY: all native mipsel aarch64 armv7 test test-unit test-cli test-templates \
+        test-integration test-tcpbridge-integration toolchain clean distclean \
         render-k1-init install-k1 uninstall-k1 install-pi uninstall-pi FORCE
 
 all: native
 
 native: $(BUILD)/pik1d $(BUILD)/tcpbridge
 
-test: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_frame \
-      $(TEST_BUILD)/test_logging $(TEST_BUILD)/test_control_names test-cli test-templates
+test: test-unit test-cli test-templates test-integration
+
+test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_frame \
+      $(TEST_BUILD)/test_logging $(TEST_BUILD)/test_control_names \
+      $(TEST_BUILD)/test_control_protocol $(TEST_BUILD)/test_pik1d_supervisor \
+      $(TEST_BUILD)/test_serialmux_protocol
 	$(TEST_BUILD)/test_util
 	$(TEST_BUILD)/test_cobs
 	$(TEST_BUILD)/test_frame
 	$(TEST_BUILD)/test_logging
 	$(TEST_BUILD)/test_control_names
+	$(TEST_BUILD)/test_control_protocol
+	$(TEST_BUILD)/test_pik1d_supervisor
+	$(TEST_BUILD)/test_serialmux_protocol
 
 test-cli: native
 	PIK1D=$(BUILD)/pik1d TCPBRIDGE=$(BUILD)/tcpbridge bash tests/test_cli.sh
 
 test-templates:
 	bash tests/test_templates.sh
+
+test-integration: test-tcpbridge-integration
+
+test-tcpbridge-integration: native
+	TCPBRIDGE=$(BUILD)/tcpbridge python3 tests/test_tcpbridge_integration.py
 
 # ── Native builds ─────────────────────────────────────────────────────────────
 $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
@@ -91,6 +104,15 @@ $(TEST_BUILD)/test_logging: tests/test_logging.c src/logging.c src/logging.h | $
 
 $(TEST_BUILD)/test_control_names: tests/test_control_names.c src/control.c src/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_control_names.c src/control.c $(COBS_SRCS) $(COMMON_SRCS)
+
+$(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h src/control.c src/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_control_protocol.c src/control.c $(COBS_SRCS) $(COMMON_SRCS)
+
+$(TEST_BUILD)/test_pik1d_supervisor: tests/test_pik1d_supervisor.c tests/test_harness.h src/pik1d.c src/control.c src/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_pik1d_supervisor.c src/control.c $(COBS_SRCS) $(COMMON_SRCS)
+
+$(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h src/serialmux.c src/serialmux.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_serialmux_protocol.c src/serialmux.c $(COBS_SRCS) $(COMMON_SRCS)
 
 # ── MIPSEL ────────────────────────────────────────────────────────────────────
 mipsel: $(BUILD)/pik1d.mipsel $(BUILD)/tcpbridge.mipsel

@@ -171,6 +171,23 @@ static void test_rx_consume_empty_delimiters(void) {
     CHECK(rx_len == 0);
 }
 
+static void test_rx_consume_empty_delimiters_before_frame(void) {
+    uint8_t frame[64], rxbuf[96];
+    size_t enc_len = 0, rx_len = 0;
+    rx_ctx_t ctx = { 0 };
+
+    encode_sample(frame, sizeof(frame), &enc_len);
+    rxbuf[rx_len++] = COBS_FRAME_DELIMITER;
+    rxbuf[rx_len++] = COBS_FRAME_DELIMITER;
+    memcpy(rxbuf + rx_len, frame, enc_len);
+    rx_len += enc_len;
+
+    CHECK(pik_frame_rx_consume(rxbuf, &rx_len, sizeof(rxbuf), rx_cb, &ctx) == PIK_FRAME_OK);
+    CHECK(ctx.calls == 1);
+    CHECK(ctx.lens[0] == enc_len);
+    CHECK(rx_len == 0);
+}
+
 static void test_rx_consume_callback_failed(void) {
     uint8_t frame[64], rxbuf[64];
     size_t enc_len = 0, rx_len = 0;
@@ -183,6 +200,7 @@ static void test_rx_consume_callback_failed(void) {
     CHECK(pik_frame_rx_consume(rxbuf, &rx_len, sizeof(rxbuf), rx_cb, &ctx) ==
           PIK_FRAME_CALLBACK_FAILED);
     CHECK(ctx.calls == 1);
+    CHECK(rx_len == enc_len);
 }
 
 static void test_rx_consume_overflow(void) {
@@ -201,6 +219,29 @@ static void test_status_text(void) {
     CHECK(strcmp(pik_frame_status_text((pik_frame_status_t)255), "ok") == 0);
 }
 
+static void test_max_size_roundtrip(void) {
+    uint8_t header[8];
+    uint8_t payload[4096];
+    uint8_t dec[sizeof(header) + sizeof(payload) + 4];
+    uint8_t enc[COBS_ENCODE_MAX(sizeof(dec))];
+    uint8_t out[sizeof(dec)];
+    size_t enc_len = 0;
+    pik_frame_t frame;
+
+    for (size_t i = 0; i < sizeof(header); i++)
+        header[i] = (uint8_t)(0x80u + i);
+    for (size_t i = 0; i < sizeof(payload); i++)
+        payload[i] = (uint8_t)i;
+
+    CHECK(pik_frame_encode(header, sizeof(header), payload, sizeof(payload),
+                           dec, sizeof(dec), enc, sizeof(enc), &enc_len) == PIK_FRAME_OK);
+    CHECK(pik_frame_decode(enc, enc_len, sizeof(enc), sizeof(header),
+                           out, sizeof(out), &frame) == PIK_FRAME_OK);
+    CHECK(frame.payload_len == sizeof(payload));
+    CHECK(memcmp(frame.header, header, sizeof(header)) == 0);
+    CHECK(memcmp(frame.payload, payload, sizeof(payload)) == 0);
+}
+
 int main(void) {
     test_roundtrip();
     test_empty_payload();
@@ -212,9 +253,11 @@ int main(void) {
     test_rx_consume_multiple_frames();
     test_rx_consume_partial_frame();
     test_rx_consume_empty_delimiters();
+    test_rx_consume_empty_delimiters_before_frame();
     test_rx_consume_callback_failed();
     test_rx_consume_overflow();
     test_status_text();
+    test_max_size_roundtrip();
 
     if (failures) {
         fprintf(stderr, "test_frame: %d failure(s)\n", failures);
