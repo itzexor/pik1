@@ -391,11 +391,18 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
 
     switch (type) {
     case TB_OPEN:
-        if (g_is_listener || id >= MAX_CONNS) {
-            enqueue_frame(TB_CLOSE, id, NULL, 0);
-            return true;
+        if (g_is_listener) {
+            link_fail_text("received OPEN while in listener mode", now);
+            return false;
         }
-        if (g_conns[id].fd >= 0) conn_close(id, false);
+        if (id >= MAX_CONNS) {
+            link_fail_text("OPEN with invalid connection id", now);
+            return false;
+        }
+        if (g_conns[id].fd >= 0) {
+            link_fail_text("duplicate OPEN for active connection", now);
+            return false;
+        }
         {
             int fd = tcp_connect_to_target();
             if (fd < 0) {
@@ -414,8 +421,12 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         return true;
 
     case TB_DATA:
-        if (id >= MAX_CONNS) return true;
+        if (id >= MAX_CONNS) {
+            link_fail_text("DATA with invalid connection id", now);
+            return false;
+        }
         if (g_conns[id].fd < 0) {
+            LOG("conn %u: DATA for closed connection", id);
             enqueue_frame(TB_CLOSE, id, NULL, 0);
             return true;
         }
@@ -444,25 +455,46 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         return true;
 
     case TB_CLOSE:
-        if (id < MAX_CONNS) conn_close(id, false);
+        if (id >= MAX_CONNS) {
+            link_fail_text("CLOSE with invalid connection id", now);
+            return false;
+        }
+        if (g_conns[id].fd < 0) {
+            LOG("conn %u: duplicate CLOSE for closed connection", id);
+            return true;
+        }
+        conn_close(id, false);
         return true;
 
     case TB_PAUSE:
-        if (id < MAX_CONNS && g_conns[id].fd >= 0) {
-            g_conns[id].flow_paused = true;
-            conn_epoll_update(&g_conns[id]);
+        if (id >= MAX_CONNS) {
+            link_fail_text("PAUSE with invalid connection id", now);
+            return false;
         }
+        if (g_conns[id].fd < 0) {
+            LOG("conn %u: PAUSE for closed connection", id);
+            return true;
+        }
+        g_conns[id].flow_paused = true;
+        conn_epoll_update(&g_conns[id]);
         return true;
 
     case TB_RESUME:
-        if (id < MAX_CONNS && g_conns[id].fd >= 0) {
-            g_conns[id].flow_paused = false;
-            conn_epoll_update(&g_conns[id]);
+        if (id >= MAX_CONNS) {
+            link_fail_text("RESUME with invalid connection id", now);
+            return false;
         }
+        if (g_conns[id].fd < 0) {
+            LOG("conn %u: RESUME for closed connection", id);
+            return true;
+        }
+        g_conns[id].flow_paused = false;
+        conn_epoll_update(&g_conns[id]);
         return true;
 
     default:
-        return true;
+        link_fail_text("unknown frame type", now);
+        return false;
     }
 }
 
