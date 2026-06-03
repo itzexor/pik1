@@ -276,7 +276,9 @@ mv /etc/init.d/_S99guppyscreen /etc/init.d/S99guppyscreen
 
 `TCP_ADDR` is `127.0.0.1` by default so only local touchscreen requests are
 accepted on the K1. Set it to `0.0.0.0` only if you deliberately want the
-forwarded listener exposed on the K1 network interface.
+forwarded listener exposed on the K1 network interface. The TCP tunnel is not
+authenticated; wildcard binds expose raw forwarded Moonraker traffic to any
+client that can reach that port.
 
 **Pi systemd service** -- `/etc/systemd/system/pik1.service` starts `pik1d` with
 PTY destinations and a TCP forwarder:
@@ -344,7 +346,7 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     2026-05-25 19:41:50 [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
     2026-05-25 19:41:50 [mux] link opened: /dev/ttyACM1
     2026-05-25 19:41:50 [tcp] tcpbridge /dev/ttyACM2 listen 127.0.0.1:7125
-    2026-05-25 19:41:50 [tcp] listening on port 7125
+    2026-05-25 19:41:50 [tcp] listening on 127.0.0.1:7125
     2026-05-25 19:41:50 [tcp] link opened: /dev/ttyACM2
     2026-05-25 19:41:50 [mux] link up
     2026-05-25 19:41:50 [tcp] link up

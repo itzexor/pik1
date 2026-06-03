@@ -17,8 +17,10 @@ CH0_BAUD="230400"
 CH1_DEV="/dev/ttyS1"
 CH1_BAUD="230400"
 
-# TCP tunnel — Moonraker port forwarded to the Pi
-TCP_ADDR="127.0.0.1" # 0.0.0.0 to listen on all interfaces instead
+# TCP tunnel — Moonraker port forwarded to the Pi.
+# Keep this on 127.0.0.1 unless you intentionally want an unauthenticated
+# Moonraker tunnel listener exposed on the K1 network interface.
+TCP_ADDR="127.0.0.1"
 TCP_PORT="7125"
 
 DAEMON_ARGS="--usb $USB_ID \

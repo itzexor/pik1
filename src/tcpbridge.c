@@ -609,6 +609,12 @@ static void link_try_open(int64_t now) {
 }
 
 // ── listener / TCP input ──────────────────────────────────────────────────────
+static bool bind_is_wildcard(void) {
+    return strcmp(g_fwd_host, "") == 0 ||
+           strcmp(g_fwd_host, "0.0.0.0") == 0 ||
+           strcmp(g_fwd_host, "::") == 0;
+}
+
 static void listener_accept(void) {
     struct sockaddr_storage sa;
     socklen_t sl = sizeof(sa);
@@ -707,7 +713,10 @@ static void run(void) {
         if (listen(lfd, 16) < 0) DIE("listen: %s", strerror(errno));
         g_listen_fd = lfd;
         pik_epoll_set(g_epfd, lfd, EPOLLIN, &g_listen_tag);
-        LOG("listening on port %d", g_fwd_port);
+        LOG("listening on %s:%d", g_fwd_host[0] ? g_fwd_host : "0.0.0.0",
+            g_fwd_port);
+        if (bind_is_wildcard())
+            LOG("warning: unauthenticated TCP tunnel is exposed on all interfaces");
     }
 
     int64_t now = pik_now_ms();
