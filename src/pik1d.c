@@ -206,13 +206,9 @@ static bool local_control_write(int fd, const void *buf, size_t len) {
     return true;
 }
 
-static bool local_control_write_response(int fd, const char *msg) {
-    return local_control_write(fd, msg, strlen(msg));
-}
-
 static void local_control_reply_and_close(const char *msg) {
     if (g_local.client_fd >= 0 &&
-        !local_control_write_response(g_local.client_fd, msg))
+        !local_control_write(g_local.client_fd, msg, strlen(msg)))
         LOG("local control response was not fully delivered");
     local_control_close_client();
 }
@@ -239,7 +235,7 @@ static void local_control_accept(void) {
     int fd = accept4(g_local.listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) return;
     if (g_local.client_fd >= 0) {
-        if (!local_control_write_response(fd, "ERR busy\n"))
+        if (!local_control_write(fd, "ERR busy\n", strlen("ERR busy\n")))
             LOG("local control busy response was not fully delivered");
         close(fd);
         return;

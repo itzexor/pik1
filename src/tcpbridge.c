@@ -183,12 +183,6 @@ static void resume_all_conns(void) {
     }
 }
 
-// ── link TX frame queue / pacing ──────────────────────────────────────────────
-static bool frame_is_reliable(uint8_t type) {
-    return type == TB_OPEN || type == TB_DATA || type == TB_CLOSE ||
-           type == TB_PAUSE || type == TB_RESUME;
-}
-
 static void lk_refill_tokens(int64_t now) {
     link_t *lk = &g_link;
     if (!lk->tx_token_ms) lk->tx_token_ms = now;
@@ -275,14 +269,11 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
     static uint8_t enc[FRAME_ENC_MAX + 1];
     uint8_t header[FRAME_HEADER_LEN];
 
-    bool reliable = frame_is_reliable(type);
-    uint16_t seq = reliable ? lk->tx_seq : 0;
-
     header[0] = type;
     header[1] = conn_id;
     pik_put_u32le(header + 2, lk->tx_session);
-    header[6] = (uint8_t)seq;
-    header[7] = (uint8_t)(seq >> 8);
+    header[6] = (uint8_t)lk->tx_seq;
+    header[7] = (uint8_t)(lk->tx_seq >> 8);
 
     size_t enc_len = 0;
     if (pik_frame_encode(header, sizeof(header), payload, plen,
@@ -296,8 +287,7 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
         link_close(pik_now_ms());
         return false;
     }
-    if (reliable)
-        lk->tx_seq++;
+    lk->tx_seq++;
     return true;
 }
 
@@ -391,35 +381,33 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
     size_t         plen    = frame.payload_len;
     const uint8_t *payload = frame.payload;
 
-    if (frame_is_reliable(type)) {
-        if (session == 0) {
-            LOG("link failure: zero session type=0x%02x conn=%u", type, id);
+    if (session == 0) {
+        LOG("link failure: zero session type=0x%02x conn=%u", type, id);
+        link_close(now);
+        return false;
+    }
+    if (g_link.rx_session == 0) {
+        if (seq != 0) {
+            LOG("link failure: first frame seq=%u type=0x%02x conn=%u",
+                seq, type, id);
             link_close(now);
             return false;
         }
-        if (g_link.rx_session == 0) {
-            if (seq != 0) {
-                LOG("link failure: first frame seq=%u type=0x%02x conn=%u",
-                    seq, type, id);
-                link_close(now);
-                return false;
-            }
-            g_link.rx_session = session;
-            g_link.rx_seq = 1;
-        } else if (session != g_link.rx_session) {
-            LOG("link failure: session changed old=0x%08x new=0x%08x type=0x%02x conn=%u",
-                g_link.rx_session, session, type, id);
+        g_link.rx_session = session;
+        g_link.rx_seq = 1;
+    } else if (session != g_link.rx_session) {
+        LOG("link failure: session changed old=0x%08x new=0x%08x type=0x%02x conn=%u",
+            g_link.rx_session, session, type, id);
+        link_close(now);
+        return false;
+    } else {
+        if (seq != g_link.rx_seq) {
+            LOG("link failure: seq gap type=0x%02x seq=%u expected=%u",
+                type, seq, g_link.rx_seq);
             link_close(now);
             return false;
-        } else {
-            if (seq != g_link.rx_seq) {
-                LOG("link failure: seq gap type=0x%02x seq=%u expected=%u",
-                    type, seq, g_link.rx_seq);
-                link_close(now);
-                return false;
-            }
-            g_link.rx_seq++;
         }
+        g_link.rx_seq++;
     }
 
     switch (type) {
