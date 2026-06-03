@@ -572,9 +572,15 @@ bool pik_control_tick(int64_t now) {
     if (g_ctrl.fd < 0 || g_ctrl.failed) return false;
     if (avail())
         drain_tx(now);
-    if (!g_ctrl.ready && !avail() && (now - g_ctrl.last_tx_ms) > HELLO_RETRY_MS)
-        send_hello();
-    if (g_ctrl.ready) {
+    if (!g_ctrl.ready) {
+        if (!avail() && (now - g_ctrl.last_tx_ms) > HELLO_RETRY_MS)
+            send_hello();
+        if ((now - g_ctrl.last_rx_ms) > LINK_DEAD_MS) {
+            LOG("handshake RX timeout");
+            close_link();
+            return false;
+        }
+    } else {
         if (!g_ctrl.config_sent)
             send_config();
         if (!avail() && (now - g_ctrl.last_tx_ms) > PING_IDLE_MS)
@@ -594,7 +600,11 @@ bool pik_control_ready(void) {
 
 int64_t pik_control_deadline(void) {
     if (g_ctrl.fd < 0) return INT64_MAX;
-    if (!g_ctrl.ready) return g_ctrl.last_tx_ms + HELLO_RETRY_MS;
+    if (!g_ctrl.ready) {
+        int64_t a = g_ctrl.last_tx_ms + HELLO_RETRY_MS;
+        int64_t b = g_ctrl.last_rx_ms + LINK_DEAD_MS;
+        return a < b ? a : b;
+    }
     int64_t a = g_ctrl.last_tx_ms + PING_IDLE_MS;
     int64_t b = g_ctrl.last_rx_ms + LINK_DEAD_MS;
     return a < b ? a : b;

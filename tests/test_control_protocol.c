@@ -184,6 +184,22 @@ static void test_role_mismatch_fails(void) {
     fixture_cleanup(&fx);
 }
 
+static void test_missing_peer_handshake_times_out(void) {
+    ctrl_fixture_t fx;
+    uint8_t enc[512];
+    size_t enc_len = 0;
+    int64_t start;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    start = pik_now_ms();
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(!pik_control_ready());
+    CHECK(pik_control_deadline() <= start + 10000);
+    CHECK(!pik_control_tick(start + 10001));
+    CHECK(!pik_control_ready());
+    fixture_cleanup(&fx);
+}
+
 static void test_sequence_gap_fails(void) {
     ctrl_fixture_t fx;
 
@@ -285,6 +301,7 @@ int main(void) {
     test_successful_handshake_and_ping();
     test_protocol_mismatch_fails();
     test_role_mismatch_fails();
+    test_missing_peer_handshake_times_out();
     test_sequence_gap_fails();
     test_session_change_fails();
     test_unknown_type_fails();
