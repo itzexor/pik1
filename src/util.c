@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 int64_t pik_now_ms(void) {
     struct timespec ts;
@@ -16,6 +18,18 @@ int pik_backoff_next(int *backoff_ms, int max_ms) {
     *backoff_ms *= 2;
     if (*backoff_ms > max_ms) *backoff_ms = max_ms;
     return cur;
+}
+
+uint32_t pik_session_id(int64_t now) {
+    static uint32_t counter;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t s = (uint32_t)now
+               ^ (uint32_t)getpid()
+               ^ (uint32_t)tv.tv_sec
+               ^ (uint32_t)tv.tv_usec
+               ^ ++counter;
+    return s ? s : ++counter;
 }
 
 bool pik_parse_uint8(const char *s, uint8_t *out) {

@@ -6,6 +6,7 @@
 
 int64_t pik_now_ms(void);
 int pik_backoff_next(int *backoff_ms, int max_ms);
+uint32_t pik_session_id(int64_t now);
 
 bool pik_parse_uint8(const char *s, uint8_t *out);
 bool pik_parse_port(const char *s, int *out);

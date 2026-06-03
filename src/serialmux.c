@@ -17,7 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 // ── frame types ───────────────────────────────────────────────────────────────
@@ -171,18 +170,6 @@ static bool lk_drain(link_t *lk) {
         pik_epoll_set(g_epfd, lk->fd, want, lk);
     }
     return wrote;
-}
-
-static uint32_t new_session_id(int64_t now) {
-    static uint32_t counter;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint32_t s = (uint32_t)now
-               ^ (uint32_t)getpid()
-               ^ (uint32_t)tv.tv_sec
-               ^ (uint32_t)tv.tv_usec
-               ^ ++counter;
-    return s ? s : ++counter;
 }
 
 // ── frame I/O ────────────────────────────────────────────────────────────────
@@ -588,7 +575,7 @@ static bool link_open(link_t *lk, const char *dev) {
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = 0;
     if (!lk->tx_session)
-        lk->tx_session = new_session_id(0);
+        lk->tx_session = pik_session_id(0);
     lk->rx_session = 0;
     lk->tx_seq = lk->rx_seq = 0;
     lk->up   = true;
@@ -670,7 +657,7 @@ void serialmux_init(const serialmux_config_t *cfg, int epfd) {
 bool serialmux_start(const char *link_dev, int64_t now) {
     memset(&g_link, 0, sizeof(g_link));
     g_link.fd = -1;
-    g_link.tx_session = new_session_id(now);
+    g_link.tx_session = pik_session_id(now);
     g_session_failed = false;
     for (int i = 0; i < g_n_chans; i++) {
         channel_t *c = &g_chans[i];

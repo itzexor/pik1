@@ -24,7 +24,6 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 // ── frame types ───────────────────────────────────────────────────────────────
@@ -182,18 +181,6 @@ static void resume_all_conns(void) {
         g_conns[i].paused = false;
         conn_epoll_update(&g_conns[i]);
     }
-}
-
-static uint32_t new_session_id(int64_t now) {
-    static uint32_t counter;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint32_t s = (uint32_t)now
-               ^ (uint32_t)getpid()
-               ^ (uint32_t)tv.tv_sec
-               ^ (uint32_t)tv.tv_usec
-               ^ ++counter;
-    return s ? s : ++counter;
 }
 
 // ── link TX frame queue / pacing ──────────────────────────────────────────────
@@ -645,7 +632,7 @@ static void link_try_open(int64_t now) {
     lk->fd = fd;
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
-    lk->tx_session = new_session_id(now);
+    lk->tx_session = pik_session_id(now);
     lk->rx_session = 0;
     lk->tx_seq = lk->rx_seq = 0;
     lk->up = true;

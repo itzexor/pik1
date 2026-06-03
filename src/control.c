@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #define C_HELLO   0x01u
@@ -94,18 +93,6 @@ static void close_link(void);
 
 static uint32_t avail(void) { return g_ctrl.tx_tail - g_ctrl.tx_head; }
 static uint32_t space(void) { return TX_RING_CAP - avail(); }
-
-static uint32_t new_session_id(int64_t now) {
-    static uint32_t counter;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint32_t s = (uint32_t)now
-               ^ (uint32_t)getpid()
-               ^ (uint32_t)tv.tv_sec
-               ^ (uint32_t)tv.tv_usec
-               ^ ++counter;
-    return s ? s : ++counter;
-}
 
 const char *pik_control_action_name(pik_control_action_t action) {
     switch (action) {
@@ -568,7 +555,7 @@ bool pik_control_start(const char *dev, int64_t now) {
     g_ctrl.epev = EPOLLIN;
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
-    g_ctrl.tx_session = new_session_id(now);
+    g_ctrl.tx_session = pik_session_id(now);
     g_ctrl.rx_session = 0;
     g_ctrl.tx_seq = g_ctrl.rx_seq = 0;
     g_ctrl.config_sent = false;
