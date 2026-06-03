@@ -85,6 +85,7 @@ cross-compiler targets:
 make toolchain   # one-time: downloads musl.cc cross-compilers into .toolchain/
 make mipsel      # K1 binaries → build/pik1d.mipsel, build/tcpbridge.mipsel
 make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
+make test        # native non-hardware unit and CLI smoke tests
 ```
 
 ### Raspberry Pi side

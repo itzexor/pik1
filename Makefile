@@ -5,6 +5,7 @@ LDFLAGS  := -Wl,--gc-sections
 
 STATIC   := -static
 BUILD    := build
+TEST_BUILD := $(BUILD)/tests
 
 COBS_SRCS   := src/nanocobs/cobs.c
 COBS_HDRS   := src/nanocobs/cobs.h
@@ -48,12 +49,26 @@ AARCH64_STRIP ?= $(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-
 ARMV7_CC     ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 ARMV7_STRIP  ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-strip
 
-.PHONY: all native mipsel aarch64 armv7 toolchain clean distclean \
+.PHONY: all native mipsel aarch64 armv7 test test-cli toolchain clean distclean \
         render-k1-init install-k1 uninstall-k1 install-pi uninstall-pi FORCE
 
 all: native
 
 native: $(BUILD)/pik1d $(BUILD)/tcpbridge
+
+test: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_frame \
+      $(TEST_BUILD)/test_logging $(TEST_BUILD)/test_control_names test-cli test-templates
+	$(TEST_BUILD)/test_util
+	$(TEST_BUILD)/test_cobs
+	$(TEST_BUILD)/test_frame
+	$(TEST_BUILD)/test_logging
+	$(TEST_BUILD)/test_control_names
+
+test-cli: native
+	PIK1D=$(BUILD)/pik1d TCPBRIDGE=$(BUILD)/tcpbridge bash tests/test_cli.sh
+
+test-templates:
+	bash tests/test_templates.sh
 
 # ── Native builds ─────────────────────────────────────────────────────────────
 $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
@@ -61,6 +76,21 @@ $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
 
 $(BUILD)/tcpbridge: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TB_SRCS)
+
+$(TEST_BUILD)/test_util: tests/test_util.c src/util.c src/util.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_util.c src/util.c
+
+$(TEST_BUILD)/test_frame: tests/test_frame.c src/frame.c src/frame.h $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_frame.c src/frame.c $(COBS_SRCS)
+
+$(TEST_BUILD)/test_cobs: tests/test_cobs.c $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_cobs.c $(COBS_SRCS)
+
+$(TEST_BUILD)/test_logging: tests/test_logging.c src/logging.c src/logging.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_logging.c src/logging.c
+
+$(TEST_BUILD)/test_control_names: tests/test_control_names.c src/control.c src/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_control_names.c src/control.c $(COBS_SRCS) $(COMMON_SRCS)
 
 # ── MIPSEL ────────────────────────────────────────────────────────────────────
 mipsel: $(BUILD)/pik1d.mipsel $(BUILD)/tcpbridge.mipsel
@@ -96,6 +126,9 @@ $(BUILD)/tcpbridge.armv7: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
 	-$(ARMV7_STRIP) $@
 
 $(BUILD):
+	mkdir -p $@
+
+$(TEST_BUILD):
 	mkdir -p $@
 
 $(BUILD)/S99pik1: S99pik1.in FORCE | $(BUILD)

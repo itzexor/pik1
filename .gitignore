@@ -4,3 +4,4 @@ __pycache__/
 build/pik1d
 build/tcpbridge
 build/S99pik1
+build/tests/
