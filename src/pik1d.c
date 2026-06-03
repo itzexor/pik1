@@ -329,8 +329,8 @@ static void append_link_names(char *buf, size_t cap, uint32_t flags) {
 static void set_link_flags(uint32_t flags) {
     if (g_link_flags == flags) return;
     g_link_flags = flags;
-    if (pik_control_ready())
-        pik_control_send_link_state(g_link_flags);
+    if (pik_control_ready() && !pik_control_send_link_state(g_link_flags))
+        LOG("failed to send link state update");
 }
 
 static void set_link_flag(uint32_t flag, bool up) {
@@ -357,16 +357,20 @@ static void on_control_command(pik_control_action_t action, uint32_t request_id,
                          g_uart_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
                          PIK1_FEATURE_FLAGS, links, peer_links);
         if (n < 0) {
-            pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR, NULL, 0);
+            if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR, NULL, 0))
+                LOG("failed to send status error ACK request=%u", request_id);
             return;
         }
         size_t len = (size_t)n < sizeof(status) ? (size_t)n : sizeof(status) - 1;
-        pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, (const uint8_t *)status, len);
+        if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, (const uint8_t *)status, len))
+            LOG("failed to send status ACK request=%u", request_id);
         return;
     }
 
-    if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, NULL, 0))
+    if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, NULL, 0)) {
+        LOG("failed to send command ACK request=%u", request_id);
         return;
+    }
     g_remote_action = action;
     g_remote_action_pending = true;
     g_remote_action_at_ms = pik_now_ms() + REMOTE_ACTION_DELAY_MS;
