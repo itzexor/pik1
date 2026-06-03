@@ -31,7 +31,7 @@ static int tty_apply_byte_raw(int fd, int baud) {
     t.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
     t.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE | CRTSCTS);
     t.c_cflag |= CS8 | CLOCAL | CREAD;
-    t.c_cc[VMIN] = 0;
+    t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
 
     if (baud > 0) {
