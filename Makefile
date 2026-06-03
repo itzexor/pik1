@@ -14,13 +14,13 @@ COMMON_HDRS := src/util.h src/logging.h src/tty.h src/frame.h src/fd.h src/versi
 USB_SRCS    := src/usb_discovery.c
 USB_HDRS    := src/usb_discovery.h
 CONTROL_SRCS := src/control.c
-CONTROL_HDRS := src/control.h
+CONTROL_HDRS := src/control.h src/control_proto.h
 
 PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(CONTROL_SRCS) $(USB_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
-PIK1D_HDRS  := src/serialmux.h $(CONTROL_HDRS) $(USB_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
+PIK1D_HDRS  := src/serialmux.h src/serialmux_proto.h $(CONTROL_HDRS) $(USB_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
 
 TB_SRCS     := src/tcpbridge.c $(COBS_SRCS) $(COMMON_SRCS)
-TB_HDRS     := $(COBS_HDRS) $(COMMON_HDRS)
+TB_HDRS     := src/tcpbridge_proto.h $(COBS_HDRS) $(COMMON_HDRS)
 
 # ── Install ───────────────────────────────────────────────────────────────────
 SUDO            ?= sudo

@@ -1,4 +1,5 @@
 #include "control.h"
+#include "control_proto.h"
 #include "test_harness.h"
 #include "version.h"
 
@@ -11,16 +12,6 @@
 #include <unistd.h>
 
 static int failures;
-
-#define C_HELLO   0x01u
-#define C_PING    0x02u
-#define C_PONG    0x03u
-#define C_COMMAND 0x04u
-#define C_ACK     0x05u
-#define C_CONFIG  0x07u
-
-#define HELLO_LEN 29u
-#define HEADER_LEN 7u
 
 typedef struct {
     int epfd;
@@ -88,7 +79,8 @@ static bool read_local_frame(ctrl_fixture_t *fx, uint8_t *enc, size_t enc_cap,
 static bool decode_control(const uint8_t *enc, size_t enc_len, uint8_t *type,
                            uint32_t *session, uint16_t *seq,
                            pik_frame_t *frame, uint8_t *dec, size_t dec_cap) {
-    if (pik_frame_decode(enc, enc_len, 256, HEADER_LEN, dec, dec_cap, frame) != PIK_FRAME_OK)
+    if (pik_frame_decode(enc, enc_len, 256, PIK_CONTROL_FRAME_HEADER_LEN,
+                         dec, dec_cap, frame) != PIK_FRAME_OK)
         return false;
     *type = frame->header[0];
     *session = pik_get_u32le(frame->header + 1);
@@ -98,7 +90,7 @@ static bool decode_control(const uint8_t *enc, size_t enc_len, uint8_t *type,
 
 static bool send_peer_frame(ctrl_fixture_t *fx, uint8_t type, const uint8_t *payload,
                             size_t payload_len) {
-    uint8_t header[HEADER_LEN];
+    uint8_t header[PIK_CONTROL_FRAME_HEADER_LEN];
     uint8_t enc[512];
     size_t enc_len = 0;
     header[0] = type;
@@ -112,17 +104,17 @@ static bool send_peer_frame(ctrl_fixture_t *fx, uint8_t type, const uint8_t *pay
 
 static bool send_peer_hello(ctrl_fixture_t *fx, pik_control_role_t role,
                             uint32_t protocol) {
-    uint8_t p[HELLO_LEN];
+    uint8_t p[PIK_CONTROL_HELLO_LEN];
     memset(p, 0, sizeof(p));
-    p[0] = 'P';
-    p[1] = 'I';
-    p[2] = 'K';
-    p[3] = '1';
+    p[0] = PIK_CONTROL_HELLO_MAGIC_0;
+    p[1] = PIK_CONTROL_HELLO_MAGIC_1;
+    p[2] = PIK_CONTROL_HELLO_MAGIC_2;
+    p[3] = PIK_CONTROL_HELLO_MAGIC_3;
     pik_put_u32le(p + 4, protocol);
     pik_put_u32le(p + 8, PIK1_FEATURE_FLAGS);
     p[12] = (uint8_t)role;
-    snprintf((char *)p + 13, 16, "%s", PIK1_RELEASE_VERSION);
-    return send_peer_frame(fx, C_HELLO, p, sizeof(p));
+    snprintf((char *)p + 13, PIK_CONTROL_RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
+    return send_peer_frame(fx, PIK_CONTROL_FRAME_HELLO, p, sizeof(p));
 }
 
 static bool handshake(ctrl_fixture_t *fx) {
@@ -135,7 +127,7 @@ static bool handshake(ctrl_fixture_t *fx) {
     if (!read_local_frame(fx, enc, sizeof(enc), &enc_len)) return false;
     if (!decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)))
         return false;
-    if (type != C_HELLO || seq != 0 || session == 0) return false;
+    if (type != PIK_CONTROL_FRAME_HELLO || seq != 0 || session == 0) return false;
 
     if (!send_peer_hello(fx, PIK_CONTROL_ROLE_MCU, PIK1_PROTOCOL_VERSION))
         return false;
@@ -145,7 +137,7 @@ static bool handshake(ctrl_fixture_t *fx) {
     if (!read_local_frame(fx, enc, sizeof(enc), &enc_len)) return false;
     if (!decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)))
         return false;
-    return type == C_CONFIG;
+    return type == PIK_CONTROL_FRAME_CONFIG;
 }
 
 static void test_successful_handshake_and_ping(void) {
@@ -158,11 +150,11 @@ static void test_successful_handshake_and_ping(void) {
 
     CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
     CHECK(handshake(&fx));
-    CHECK(send_peer_frame(&fx, C_PING, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
     CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
     CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
-    CHECK(type == C_PONG);
+    CHECK(type == PIK_CONTROL_FRAME_PONG);
     CHECK(frame.payload_len == 0);
     fixture_cleanup(&fx);
 }
@@ -198,7 +190,7 @@ static void test_sequence_gap_fails(void) {
     CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
     CHECK(handshake(&fx));
     fx.peer_seq++;
-    CHECK(send_peer_frame(&fx, C_PING, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
     fixture_cleanup(&fx);
 }
@@ -209,7 +201,7 @@ static void test_session_change_fails(void) {
     CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
     CHECK(handshake(&fx));
     fx.peer_session++;
-    CHECK(send_peer_frame(&fx, C_PING, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
     fixture_cleanup(&fx);
 }
@@ -226,13 +218,13 @@ static void test_unknown_type_fails(void) {
 
 static void test_bad_crc_fails(void) {
     ctrl_fixture_t fx;
-    uint8_t header[HEADER_LEN];
+    uint8_t header[PIK_CONTROL_FRAME_HEADER_LEN];
     uint8_t enc[512];
     size_t enc_len = 0;
 
     CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
     CHECK(handshake(&fx));
-    header[0] = C_PING;
+    header[0] = PIK_CONTROL_FRAME_PING;
     pik_put_u32le(header + 1, fx.peer_session);
     put_u16le(header + 5, fx.peer_seq++);
     CHECK(test_encode_frame(header, sizeof(header), NULL, 0,
@@ -257,7 +249,7 @@ static void test_command_callback_and_bad_action_ack(void) {
 
     pik_put_u32le(cmd, 0x1234u);
     cmd[4] = PIK_CONTROL_ACTION_STATUS;
-    CHECK(send_peer_frame(&fx, C_COMMAND, cmd, sizeof(cmd)));
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_COMMAND, cmd, sizeof(cmd)));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
     CHECK(command_calls == 1);
     CHECK(last_action == PIK_CONTROL_ACTION_STATUS);
@@ -265,11 +257,11 @@ static void test_command_callback_and_bad_action_ack(void) {
 
     cmd[4] = 0xfeu;
     pik_put_u32le(cmd, 0x5678u);
-    CHECK(send_peer_frame(&fx, C_COMMAND, cmd, sizeof(cmd)));
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_COMMAND, cmd, sizeof(cmd)));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
     CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
     CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
-    CHECK(type == C_ACK);
+    CHECK(type == PIK_CONTROL_FRAME_ACK);
     CHECK(frame.payload_len == 5);
     CHECK(pik_get_u32le(frame.payload) == 0x5678u);
     CHECK(frame.payload[4] == PIK_CONTROL_ACK_UNKNOWN_ACTION);
@@ -284,7 +276,7 @@ static void test_bad_ack_status_fails(void) {
     CHECK(handshake(&fx));
     pik_put_u32le(ack, 1);
     ack[4] = 0xffu;
-    CHECK(send_peer_frame(&fx, C_ACK, ack, sizeof(ack)));
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_ACK, ack, sizeof(ack)));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
     fixture_cleanup(&fx);
 }

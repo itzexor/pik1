@@ -1,4 +1,5 @@
 #include "serialmux.h"
+#include "serialmux_proto.h"
 #include "test_harness.h"
 
 #include <pty.h>
@@ -11,12 +12,6 @@
 #include <unistd.h>
 
 static int failures;
-
-#define F_DATA   0x01u
-#define F_FLUSH  0x02u
-#define F_READY  0x03u
-
-#define HEADER_LEN 8u
 
 typedef struct {
     int epfd;
@@ -78,7 +73,7 @@ static bool dispatch_mux(void *ptr, uint32_t events, int64_t now) {
 
 static bool send_peer_frame(mux_fixture_t *fx, uint8_t type, uint8_t ch_id,
                             const uint8_t *payload, size_t payload_len) {
-    uint8_t header[HEADER_LEN];
+    uint8_t header[PIK_SERIALMUX_FRAME_HEADER_LEN];
     uint8_t enc[8192];
     size_t enc_len = 0;
     header[0] = type;
@@ -92,10 +87,10 @@ static bool send_peer_frame(mux_fixture_t *fx, uint8_t type, uint8_t ch_id,
 }
 
 static bool send_corrupt_frame(mux_fixture_t *fx) {
-    uint8_t header[HEADER_LEN];
+    uint8_t header[PIK_SERIALMUX_FRAME_HEADER_LEN];
     uint8_t enc[128];
     size_t enc_len = 0;
-    header[0] = F_READY;
+    header[0] = PIK_SERIALMUX_FRAME_READY;
     header[1] = 7;
     pik_put_u32le(header + 2, fx->peer_session);
     put_u16le(header + 6, fx->peer_seq++);
@@ -110,11 +105,11 @@ static void test_ready_and_flush_manage_pty(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
 
-    CHECK(send_peer_frame(&fx, F_READY, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     CHECK(access(fx.pty_link, F_OK) == 0);
 
-    CHECK(send_peer_frame(&fx, F_FLUSH, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_FLUSH, 7, NULL, 0));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     CHECK(access(fx.pty_link, F_OK) != 0);
     fixture_cleanup(&fx);
@@ -124,7 +119,7 @@ static void test_data_for_closed_pty_fails(void) {
     mux_fixture_t fx;
     uint8_t payload[] = { 1, 2, 3 };
     CHECK(fixture_init(&fx));
-    CHECK(send_peer_frame(&fx, F_DATA, 7, payload, sizeof(payload)));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_DATA, 7, payload, sizeof(payload)));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     fixture_cleanup(&fx);
 }
@@ -132,7 +127,7 @@ static void test_data_for_closed_pty_fails(void) {
 static void test_unknown_channel_fails(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
-    CHECK(send_peer_frame(&fx, F_READY, 9, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 9, NULL, 0));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     fixture_cleanup(&fx);
 }
@@ -140,7 +135,7 @@ static void test_unknown_channel_fails(void) {
 static void test_unknown_type_fails(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
-    CHECK(send_peer_frame(&fx, F_READY, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     CHECK(send_peer_frame(&fx, 0xf0, 7, NULL, 0));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
@@ -151,7 +146,7 @@ static void test_first_seq_must_be_zero(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
     fx.peer_seq = 1;
-    CHECK(send_peer_frame(&fx, F_READY, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     fixture_cleanup(&fx);
 }
@@ -159,10 +154,10 @@ static void test_first_seq_must_be_zero(void) {
 static void test_sequence_gap_fails(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
-    CHECK(send_peer_frame(&fx, F_READY, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     fx.peer_seq++;
-    CHECK(send_peer_frame(&fx, F_FLUSH, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_FLUSH, 7, NULL, 0));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     fixture_cleanup(&fx);
 }
@@ -170,10 +165,10 @@ static void test_sequence_gap_fails(void) {
 static void test_session_change_fails(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
-    CHECK(send_peer_frame(&fx, F_READY, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     fx.peer_session++;
-    CHECK(send_peer_frame(&fx, F_FLUSH, 7, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_FLUSH, 7, NULL, 0));
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
     fixture_cleanup(&fx);
 }

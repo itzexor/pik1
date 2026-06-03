@@ -9,6 +9,7 @@
 #include "fd.h"
 #include "frame.h"
 #include "logging.h"
+#include "tcpbridge_proto.h"
 #include "tty.h"
 #include "util.h"
 #include <arpa/inet.h>
@@ -26,18 +27,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// ── frame types ───────────────────────────────────────────────────────────────
-#define TB_OPEN   0x20u
-#define TB_DATA   0x21u
-#define TB_CLOSE  0x22u
-#define TB_PAUSE  0x23u
-#define TB_RESUME 0x24u
-
 // ── sizing / pacing ───────────────────────────────────────────────────────────
 #define MAX_CONNS         16
-#define MAX_PAYLOAD       2032
-#define FRAME_HEADER_LEN   8u
-#define FRAME_DEC_MAX     (FRAME_HEADER_LEN + MAX_PAYLOAD + 4)
+#define FRAME_DEC_MAX     (PIK_TCPBRIDGE_FRAME_HEADER_LEN + PIK_TCPBRIDGE_MAX_PAYLOAD + 4)
 #define FRAME_ENC_MAX     COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define CONN_RING_CAP     (1u << 18)             // 256 KB per connection
@@ -63,8 +55,8 @@ typedef struct {
     uint8_t  txbuf[CONN_RING_CAP];
     uint32_t tx_head, tx_tail;
     bool     paused;       // local serial TX queue high-water
-    bool     flow_paused;  // remote sent TB_PAUSE
-    bool     pause_sent;   // we sent TB_PAUSE
+    bool     flow_paused;  // remote sent PAUSE
+    bool     pause_sent;   // we sent PAUSE
 } conn_t;
 
 typedef struct {
@@ -258,7 +250,7 @@ static void lk_drain(int64_t now) {
 static bool enqueue_frame(uint8_t type, uint8_t conn_id,
                           const uint8_t *payload, size_t plen) {
     link_t *lk = &g_link;
-    if (plen > MAX_PAYLOAD) {
+    if (plen > PIK_TCPBRIDGE_MAX_PAYLOAD) {
         LOG("oversized frame type=0x%02x conn=%u plen=%zu", type, conn_id, plen);
         link_close(pik_now_ms());
         return false;
@@ -267,7 +259,7 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[FRAME_HEADER_LEN];
+    uint8_t header[PIK_TCPBRIDGE_FRAME_HEADER_LEN];
 
     header[0] = type;
     header[1] = conn_id;
@@ -303,7 +295,7 @@ static void conn_close(int id, bool send_close) {
     c->flow_paused = false;
     c->pause_sent = false;
     c->tx_head = c->tx_tail = 0;
-    if (send_close && !enqueue_frame(TB_CLOSE, (uint8_t)id, NULL, 0))
+    if (send_close && !enqueue_frame(PIK_TCPBRIDGE_FRAME_CLOSE, (uint8_t)id, NULL, 0))
         LOG("conn %d: unable to queue CLOSE", id);
 }
 
@@ -368,7 +360,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
     g_rx_frames++;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
+                                             PIK_TCPBRIDGE_FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
     if (st != PIK_FRAME_OK) {
         link_fail_frame(pik_frame_status_text(st), enc, enc_len, now);
         return false;
@@ -411,7 +403,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
     }
 
     switch (type) {
-    case TB_OPEN:
+    case PIK_TCPBRIDGE_FRAME_OPEN:
         if (g_is_listener) {
             link_fail_text("received OPEN while in listener mode", now);
             return false;
@@ -429,7 +421,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             if (fd < 0) {
                 LOG("conn %d: connect to %s:%d failed: %s",
                     id, g_fwd_host, g_fwd_port, strerror(errno));
-                return enqueue_frame(TB_CLOSE, id, NULL, 0);
+                return enqueue_frame(PIK_TCPBRIDGE_FRAME_CLOSE, id, NULL, 0);
             }
             g_conns[id].fd = fd;
             g_conns[id].epev = 0;
@@ -440,19 +432,19 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         }
         return true;
 
-    case TB_DATA:
+    case PIK_TCPBRIDGE_FRAME_DATA:
         if (id >= MAX_CONNS) {
             link_fail_text("DATA with invalid connection id", now);
             return false;
         }
         if (g_conns[id].fd < 0) {
             LOG("conn %u: DATA for closed connection", id);
-            return enqueue_frame(TB_CLOSE, id, NULL, 0);
+            return enqueue_frame(PIK_TCPBRIDGE_FRAME_CLOSE, id, NULL, 0);
         }
         if (!plen) return true;
         conn_drain(&g_conns[id]);
         if (conn_space(&g_conns[id]) < plen) {
-            if (!g_conns[id].pause_sent && enqueue_frame(TB_PAUSE, id, NULL, 0))
+            if (!g_conns[id].pause_sent && enqueue_frame(PIK_TCPBRIDGE_FRAME_PAUSE, id, NULL, 0))
                 g_conns[id].pause_sent = true;
             if (!g_conns[id].pause_sent)
                 return false;
@@ -465,11 +457,11 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             conn_t *c = &g_conns[id];
             uint32_t avail = conn_avail(c);
             if (!c->pause_sent && avail > CONN_HIGH_WATER) {
-                if (!enqueue_frame(TB_PAUSE, id, NULL, 0))
+                if (!enqueue_frame(PIK_TCPBRIDGE_FRAME_PAUSE, id, NULL, 0))
                     return false;
                 c->pause_sent = true;
             } else if (c->pause_sent && avail < CONN_LOW_WATER) {
-                if (!enqueue_frame(TB_RESUME, id, NULL, 0))
+                if (!enqueue_frame(PIK_TCPBRIDGE_FRAME_RESUME, id, NULL, 0))
                     return false;
                 c->pause_sent = false;
             }
@@ -477,7 +469,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         conn_epoll_update(&g_conns[id]);
         return true;
 
-    case TB_CLOSE:
+    case PIK_TCPBRIDGE_FRAME_CLOSE:
         if (id >= MAX_CONNS) {
             link_fail_text("CLOSE with invalid connection id", now);
             return false;
@@ -489,7 +481,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         conn_close(id, false);
         return true;
 
-    case TB_PAUSE:
+    case PIK_TCPBRIDGE_FRAME_PAUSE:
         if (id >= MAX_CONNS) {
             link_fail_text("PAUSE with invalid connection id", now);
             return false;
@@ -502,7 +494,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         conn_epoll_update(&g_conns[id]);
         return true;
 
-    case TB_RESUME:
+    case PIK_TCPBRIDGE_FRAME_RESUME:
         if (id >= MAX_CONNS) {
             link_fail_text("RESUME with invalid connection id", now);
             return false;
@@ -666,7 +658,7 @@ static void listener_accept(void) {
     g_conns[id].flow_paused = false;
     g_conns[id].pause_sent = false;
     conn_epoll_update(&g_conns[id]);
-    if (!enqueue_frame(TB_OPEN, (uint8_t)id, NULL, 0)) {
+    if (!enqueue_frame(PIK_TCPBRIDGE_FRAME_OPEN, (uint8_t)id, NULL, 0)) {
         LOG("conn %d: unable to queue OPEN", id);
         conn_close(id, false);
         return;
@@ -680,14 +672,14 @@ static void conn_on_readable(int id) {
         return;
     }
 
-    static uint8_t buf[MAX_PAYLOAD];
+    static uint8_t buf[PIK_TCPBRIDGE_MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
         conn_close(id, true);
         return;
     }
-    if (!enqueue_frame(TB_DATA, (uint8_t)id, buf, (size_t)n))
+    if (!enqueue_frame(PIK_TCPBRIDGE_FRAME_DATA, (uint8_t)id, buf, (size_t)n))
         pause_all_conns();
     if (g_link.tx_bytes > LINK_TX_HIGH || g_link.tx_count >= LINK_TXQ_CAP - 2)
         pause_all_conns();
@@ -799,7 +791,7 @@ static void run(void) {
                 if (c->fd >= 0 && (ev & EPOLLOUT)) {
                     conn_drain(c);
                     if (c->pause_sent && conn_avail(c) < CONN_LOW_WATER) {
-                        if (enqueue_frame(TB_RESUME, (uint8_t)id, NULL, 0))
+                        if (enqueue_frame(PIK_TCPBRIDGE_FRAME_RESUME, (uint8_t)id, NULL, 0))
                             c->pause_sent = false;
                     }
                     conn_epoll_update(c);

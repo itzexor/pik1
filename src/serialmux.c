@@ -1,6 +1,7 @@
 // src/serialmux.c — COBS serial multiplexer, library interface
 
 #include "serialmux.h"
+#include "serialmux_proto.h"
 #include "nanocobs/cobs.h"
 #include "fd.h"
 #include "frame.h"
@@ -19,16 +20,8 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 
-// ── frame types ───────────────────────────────────────────────────────────────
-#define F_DATA   0x01u
-#define F_FLUSH  0x02u
-#define F_READY  0x03u
-
 // ── sizing ────────────────────────────────────────────────────────────────────
-#define MAX_PAYLOAD     4096
-
-#define FRAME_HEADER_LEN 8u
-#define FRAME_DEC_MAX   (FRAME_HEADER_LEN + MAX_PAYLOAD + 4)
+#define FRAME_DEC_MAX   (PIK_SERIALMUX_FRAME_HEADER_LEN + PIK_SERIALMUX_MAX_PAYLOAD + 4)
 #define FRAME_ENC_MAX   COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define LINK_RING_CAP   (1u << 20)
@@ -186,14 +179,14 @@ static void link_fail_frame(link_t *lk, const char *reason,
 }
 
 static bool link_can_queue_frame(const link_t *lk, size_t plen) {
-    if (plen > MAX_PAYLOAD) return false;
-    return lk_space(lk) >= COBS_ENCODE_MAX(FRAME_HEADER_LEN + plen + 4);
+    if (plen > PIK_SERIALMUX_MAX_PAYLOAD) return false;
+    return lk_space(lk) >= COBS_ENCODE_MAX(PIK_SERIALMUX_FRAME_HEADER_LEN + plen + 4);
 }
 
 static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
                            const uint8_t *payload, size_t plen) {
     if (!lk->up) return;
-    if (plen > MAX_PAYLOAD) {
+    if (plen > PIK_SERIALMUX_MAX_PAYLOAD) {
         LOG("oversized frame type=0x%02x ch=%u plen=%zu", type, ch_id, plen);
         link_close(lk);
         return;
@@ -201,7 +194,7 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[FRAME_HEADER_LEN];
+    uint8_t header[PIK_SERIALMUX_FRAME_HEADER_LEN];
 
     header[0] = type;
     header[1] = ch_id;
@@ -259,9 +252,9 @@ static int open_serial(const char *path, int baud) {
 // ── MCU channel ───────────────────────────────────────────────────────────────
 static void mcu_on_link_up(channel_t *c, link_t *lk) {
     if (c->mcu_state == MCU_ACTIVE)
-        enqueue_frame(lk, F_READY, c->ch_id, NULL, 0);
+        enqueue_frame(lk, PIK_SERIALMUX_FRAME_READY, c->ch_id, NULL, 0);
     else
-        enqueue_frame(lk, F_FLUSH, c->ch_id, NULL, 0);
+        enqueue_frame(lk, PIK_SERIALMUX_FRAME_FLUSH, c->ch_id, NULL, 0);
 }
 
 static void mcu_open(channel_t *c, link_t *lk, int64_t now) {
@@ -278,14 +271,14 @@ static void ch_send_data(link_t *lk, channel_t *c, const uint8_t *buf, size_t n)
     size_t off = 0;
     while (off < n) {
         size_t chunk = n - off;
-        if (chunk > MAX_PAYLOAD) chunk = MAX_PAYLOAD;
-        enqueue_frame(lk, F_DATA, c->ch_id, buf + off, chunk);
+        if (chunk > PIK_SERIALMUX_MAX_PAYLOAD) chunk = PIK_SERIALMUX_MAX_PAYLOAD;
+        enqueue_frame(lk, PIK_SERIALMUX_FRAME_DATA, c->ch_id, buf + off, chunk);
         off += chunk;
     }
 }
 
 static bool ch_link_full(channel_t *c, link_t *lk) {
-    if (link_can_queue_frame(lk, MAX_PAYLOAD)) return false;
+    if (link_can_queue_frame(lk, PIK_SERIALMUX_MAX_PAYLOAD)) return false;
     lk->paused = true;
     chan_pause(c);
     return true;
@@ -294,7 +287,7 @@ static bool ch_link_full(channel_t *c, link_t *lk) {
 static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
     if (ch_link_full(c, lk)) return;
 
-    static uint8_t buf[MAX_PAYLOAD];
+    static uint8_t buf[PIK_SERIALMUX_MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
         if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EINTR))) return;
@@ -314,7 +307,7 @@ static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
             if (buf[i] != 0x7E) continue;
             c->mcu_state = MCU_ACTIVE;
             LOG("ch%u MCU active", c->ch_id);
-            enqueue_frame(lk, F_READY, c->ch_id, NULL, 0);
+            enqueue_frame(lk, PIK_SERIALMUX_FRAME_READY, c->ch_id, NULL, 0);
             ch_send_data(lk, c, buf + i, (size_t)(n - i));
             return;
         }
@@ -335,7 +328,7 @@ static bool mcu_on_writable(channel_t *c) {
 }
 
 static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
-    if (type != F_DATA) {
+    if (type != PIK_SERIALMUX_FRAME_DATA) {
         LOG("ch%u unexpected MCU frame type=0x%02x", c->ch_id, type);
         return false;
     }
@@ -360,7 +353,7 @@ static void mcu_tick(channel_t *c, link_t *lk, int64_t now) {
     if (c->mcu_state == MCU_ACTIVE && (now - c->last_byte_ms) > RESET_SILENCE_MS) {
         LOG("ch%u MCU silence timeout, resetting", c->ch_id);
         c->mcu_state = MCU_RESETTING;
-        enqueue_frame(lk, F_FLUSH, c->ch_id, NULL, 0);
+        enqueue_frame(lk, PIK_SERIALMUX_FRAME_FLUSH, c->ch_id, NULL, 0);
     }
 }
 
@@ -403,7 +396,7 @@ static void pty_close(channel_t *c) {
 static void pty_on_readable(channel_t *c, link_t *lk) {
     if (ch_link_full(c, lk)) return;
 
-    static uint8_t buf[MAX_PAYLOAD];
+    static uint8_t buf[PIK_SERIALMUX_MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
     if (n <= 0) {
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
@@ -424,7 +417,7 @@ static bool pty_on_writable(channel_t *c) {
 
 static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
     switch (type) {
-    case F_DATA:
+    case PIK_SERIALMUX_FRAME_DATA:
         if (c->fd < 0) {
             LOG("ch%u data for closed PTY", c->ch_id);
             return false;
@@ -436,8 +429,8 @@ static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, siz
         chan_push(c, payload, plen);
         chan_epoll_update(c);
         break;
-    case F_FLUSH: pty_close(c); break;
-    case F_READY: pty_open(c);  break;
+    case PIK_SERIALMUX_FRAME_FLUSH: pty_close(c); break;
+    case PIK_SERIALMUX_FRAME_READY: pty_open(c);  break;
     default:
         LOG("ch%u unexpected PTY frame type=0x%02x", c->ch_id, type);
         return false;
@@ -477,7 +470,7 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     pik_frame_t frame;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
+                                             PIK_SERIALMUX_FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
     if (st != PIK_FRAME_OK) {
         link_fail_frame(lk, pik_frame_status_text(st), enc, enc_len);
         return;

@@ -1,4 +1,5 @@
 #include "control.h"
+#include "control_proto.h"
 #include "nanocobs/cobs.h"
 #include "fd.h"
 #include "frame.h"
@@ -16,24 +17,7 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 
-#define C_HELLO   0x01u
-#define C_PING    0x02u
-#define C_PONG    0x03u
-#define C_COMMAND 0x04u
-#define C_ACK     0x05u
-#define C_LINK_STATE 0x06u
-#define C_CONFIG 0x07u
-
-#define HELLO_MAGIC_0 'P'
-#define HELLO_MAGIC_1 'I'
-#define HELLO_MAGIC_2 'K'
-#define HELLO_MAGIC_3 '1'
-#define HELLO_LEN 29u
-#define RELEASE_LEN 16u
-
-#define MAX_PAYLOAD   128u
-#define FRAME_HEADER_LEN 7u
-#define FRAME_DEC_MAX (FRAME_HEADER_LEN + MAX_PAYLOAD + 4u)
+#define FRAME_DEC_MAX (PIK_CONTROL_FRAME_HEADER_LEN + PIK_CONTROL_MAX_PAYLOAD + 4u)
 #define FRAME_ENC_MAX COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define TX_RING_CAP   8192u
@@ -71,13 +55,13 @@ typedef struct {
     bool ack_pending;
     uint32_t ack_request_id;
     pik_control_ack_status_t ack_status;
-    uint8_t ack_payload[MAX_PAYLOAD - 5u];
+    uint8_t ack_payload[PIK_CONTROL_MAX_PAYLOAD - 5u];
     size_t ack_payload_len;
 
     bool peer_link_known;
     uint32_t peer_link_flags;
 
-    uint8_t local_channels[MAX_PAYLOAD - 2u];
+    uint8_t local_channels[PIK_CONTROL_MAX_PAYLOAD - 2u];
     size_t local_channel_count;
     pik_control_tcp_role_t local_tcp_role;
     bool config_sent;
@@ -159,7 +143,7 @@ static void update_epoll(void) {
 }
 
 static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
-    if (plen > MAX_PAYLOAD) {
+    if (plen > PIK_CONTROL_MAX_PAYLOAD) {
         LOG("oversized frame type=0x%02x plen=%zu", type, plen);
         close_link();
         return false;
@@ -167,7 +151,7 @@ static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[FRAME_HEADER_LEN];
+    uint8_t header[PIK_CONTROL_FRAME_HEADER_LEN];
     size_t enc_len = 0;
 
     header[0] = type;
@@ -192,17 +176,17 @@ static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
 }
 
 static bool send_hello(void) {
-    uint8_t p[HELLO_LEN];
+    uint8_t p[PIK_CONTROL_HELLO_LEN];
     memset(p, 0, sizeof(p));
-    p[0] = HELLO_MAGIC_0;
-    p[1] = HELLO_MAGIC_1;
-    p[2] = HELLO_MAGIC_2;
-    p[3] = HELLO_MAGIC_3;
+    p[0] = PIK_CONTROL_HELLO_MAGIC_0;
+    p[1] = PIK_CONTROL_HELLO_MAGIC_1;
+    p[2] = PIK_CONTROL_HELLO_MAGIC_2;
+    p[3] = PIK_CONTROL_HELLO_MAGIC_3;
     pik_put_u32le(p + 4, PIK1_PROTOCOL_VERSION);
     pik_put_u32le(p + 8, PIK1_FEATURE_FLAGS);
     p[12] = (uint8_t)g_ctrl.role;
-    snprintf((char *)p + 13, RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
-    return enqueue_frame(C_HELLO, p, sizeof(p));
+    snprintf((char *)p + 13, PIK_CONTROL_RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
+    return enqueue_frame(PIK_CONTROL_FRAME_HELLO, p, sizeof(p));
 }
 
 static const char *tcp_role_name(pik_control_tcp_role_t role) {
@@ -215,14 +199,14 @@ static const char *tcp_role_name(pik_control_tcp_role_t role) {
 }
 
 static bool send_config(void) {
-    uint8_t p[MAX_PAYLOAD];
+    uint8_t p[PIK_CONTROL_MAX_PAYLOAD];
     if (g_ctrl.local_channel_count > sizeof(p) - 2)
         return false;
     p[0] = (uint8_t)g_ctrl.local_tcp_role;
     p[1] = (uint8_t)g_ctrl.local_channel_count;
     if (g_ctrl.local_channel_count)
         memcpy(p + 2, g_ctrl.local_channels, g_ctrl.local_channel_count);
-    if (!enqueue_frame(C_CONFIG, p, g_ctrl.local_channel_count + 2))
+    if (!enqueue_frame(PIK_CONTROL_FRAME_CONFIG, p, g_ctrl.local_channel_count + 2))
         return false;
     g_ctrl.config_sent = true;
     return true;
@@ -294,9 +278,9 @@ static void close_link(void) {
 }
 
 static bool handle_hello(const uint8_t *p, size_t len) {
-    if (len != HELLO_LEN ||
-        p[0] != HELLO_MAGIC_0 || p[1] != HELLO_MAGIC_1 ||
-        p[2] != HELLO_MAGIC_2 || p[3] != HELLO_MAGIC_3) {
+    if (len != PIK_CONTROL_HELLO_LEN ||
+        p[0] != PIK_CONTROL_HELLO_MAGIC_0 || p[1] != PIK_CONTROL_HELLO_MAGIC_1 ||
+        p[2] != PIK_CONTROL_HELLO_MAGIC_2 || p[3] != PIK_CONTROL_HELLO_MAGIC_3) {
         LOG("bad HELLO");
         close_link();
         return false;
@@ -305,9 +289,9 @@ static bool handle_hello(const uint8_t *p, size_t len) {
     uint32_t proto = pik_get_u32le(p + 4);
     uint32_t features = pik_get_u32le(p + 8);
     uint8_t role = p[12];
-    char release[RELEASE_LEN + 1];
-    memcpy(release, p + 13, RELEASE_LEN);
-    release[RELEASE_LEN] = '\0';
+    char release[PIK_CONTROL_RELEASE_LEN + 1];
+    memcpy(release, p + 13, PIK_CONTROL_RELEASE_LEN);
+    release[PIK_CONTROL_RELEASE_LEN] = '\0';
 
     if (proto != PIK1_PROTOCOL_VERSION) {
         LOG("protocol mismatch: local=%u remote=%u remote_release=%s",
@@ -338,7 +322,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
     pik_frame_t frame;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
+                                             PIK_CONTROL_FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
     if (st != PIK_FRAME_OK) {
         LOG("frame failure: %s", pik_frame_status_text(st));
         close_link();
@@ -380,23 +364,23 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
     }
 
     switch (type) {
-    case C_HELLO:
+    case PIK_CONTROL_FRAME_HELLO:
         return handle_hello(p, len);
-    case C_PING:
+    case PIK_CONTROL_FRAME_PING:
         if (len != 0) {
             LOG("bad PING len=%zu", len);
             close_link();
             return false;
         }
-        return enqueue_frame(C_PONG, NULL, 0);
-    case C_PONG:
+        return enqueue_frame(PIK_CONTROL_FRAME_PONG, NULL, 0);
+    case PIK_CONTROL_FRAME_PONG:
         if (len != 0) {
             LOG("bad PONG len=%zu", len);
             close_link();
             return false;
         }
         return true;
-    case C_COMMAND:
+    case PIK_CONTROL_FRAME_COMMAND:
         if (len != 5) {
             LOG("bad COMMAND len=%zu", len);
             close_link();
@@ -416,7 +400,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
                 return false;
         }
         return true;
-    case C_ACK:
+    case PIK_CONTROL_FRAME_ACK:
         if (len < 5) {
             LOG("bad ACK len=%zu", len);
             close_link();
@@ -436,7 +420,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             memcpy(g_ctrl.ack_payload, p + 5, g_ctrl.ack_payload_len);
         g_ctrl.ack_pending = true;
         return true;
-    case C_LINK_STATE:
+    case PIK_CONTROL_FRAME_LINK_STATE:
         if (len != 4) {
             LOG("bad LINK_STATE len=%zu", len);
             close_link();
@@ -448,7 +432,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
             (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_SERIAL) ? "up" : "down",
             (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_TCP) ? "up" : "down");
         return true;
-    case C_CONFIG:
+    case PIK_CONTROL_FRAME_CONFIG:
         return handle_config(p, len);
     default:
         LOG("bad control frame type=0x%02x len=%zu", type, len);
@@ -594,7 +578,7 @@ bool pik_control_tick(int64_t now) {
         if (!g_ctrl.config_sent)
             send_config();
         if (!avail() && (now - g_ctrl.last_tx_ms) > PING_IDLE_MS)
-            enqueue_frame(C_PING, NULL, 0);
+            enqueue_frame(PIK_CONTROL_FRAME_PING, NULL, 0);
         if ((now - g_ctrl.last_rx_ms) > LINK_DEAD_MS) {
             LOG("RX timeout");
             close_link();
@@ -656,7 +640,7 @@ bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id)
     if (g_ctrl.next_request_id == 0) g_ctrl.next_request_id = 1;
     pik_put_u32le(p, id);
     p[4] = (uint8_t)action;
-    if (!enqueue_frame(C_COMMAND, p, sizeof(p))) return false;
+    if (!enqueue_frame(PIK_CONTROL_FRAME_COMMAND, p, sizeof(p))) return false;
     if (request_id) *request_id = id;
     LOG("sent command %s request=%u", pik_control_action_name(action), id);
     return true;
@@ -675,20 +659,20 @@ bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status
 
 bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
                           const uint8_t *payload, size_t payload_len) {
-    uint8_t p[MAX_PAYLOAD];
+    uint8_t p[PIK_CONTROL_MAX_PAYLOAD];
     if (payload_len > sizeof(p) - 5)
         payload_len = sizeof(p) - 5;
     pik_put_u32le(p, request_id);
     p[4] = status;
     if (payload_len)
         memcpy(p + 5, payload, payload_len);
-    return enqueue_frame(C_ACK, p, 5 + payload_len);
+    return enqueue_frame(PIK_CONTROL_FRAME_ACK, p, 5 + payload_len);
 }
 
 bool pik_control_send_link_state(uint32_t flags) {
     uint8_t p[4];
     pik_put_u32le(p, flags);
-    return enqueue_frame(C_LINK_STATE, p, sizeof(p));
+    return enqueue_frame(PIK_CONTROL_FRAME_LINK_STATE, p, sizeof(p));
 }
 
 bool pik_control_peer_link_state(uint32_t *flags) {

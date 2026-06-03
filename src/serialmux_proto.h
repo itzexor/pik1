@@ -1,0 +1,12 @@
+#pragma once
+
+enum {
+    PIK_SERIALMUX_FRAME_DATA  = 0x01u,
+    PIK_SERIALMUX_FRAME_FLUSH = 0x02u,
+    PIK_SERIALMUX_FRAME_READY = 0x03u,
+};
+
+enum {
+    PIK_SERIALMUX_MAX_PAYLOAD      = 4096u,
+    PIK_SERIALMUX_FRAME_HEADER_LEN = 8u,
+};
