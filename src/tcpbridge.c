@@ -1,7 +1,8 @@
 // src/tcpbridge.c — multi-connection TCP-over-serial bridge
 // Wire protocol: COBS + CRC32, frame layout:
-//   [type:1][conn_id:1][seq_le:2][payload][crc32_le:4]
-// Sequencing is detection-only: any reliable-frame gap is treated as link failure.
+//   [type:1][conn_id:1][session_le:4][seq_le:2][payload][crc32_le:4]
+// Session and sequencing are detection-only: any generation change or reliable
+// frame gap is treated as link failure.
 // Runs on ttyGS2 (K1C) / ttyACM2 (Pi).
 
 #include "nanocobs/cobs.h"
@@ -23,6 +24,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 // ── frame types ───────────────────────────────────────────────────────────────
@@ -35,7 +37,8 @@
 // ── sizing / pacing ───────────────────────────────────────────────────────────
 #define MAX_CONNS         16
 #define MAX_PAYLOAD       2032
-#define FRAME_DEC_MAX     (4 + MAX_PAYLOAD + 4)  // type + conn + seq16 + payload + crc32
+#define FRAME_HEADER_LEN   8u
+#define FRAME_DEC_MAX     (FRAME_HEADER_LEN + MAX_PAYLOAD + 4)
 #define FRAME_ENC_MAX     COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define CONN_RING_CAP     (1u << 18)             // 256 KB per connection
@@ -86,6 +89,8 @@ typedef struct {
     uint8_t  rxbuf[LINK_RX_CAP];
     size_t   rxbuf_len;
 
+    uint32_t tx_session;
+    uint32_t rx_session;
     uint16_t tx_seq;
     uint16_t rx_seq;
 
@@ -179,6 +184,18 @@ static void resume_all_conns(void) {
     }
 }
 
+static uint32_t new_session_id(int64_t now) {
+    static uint32_t counter;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t s = (uint32_t)now
+               ^ (uint32_t)getpid()
+               ^ (uint32_t)tv.tv_sec
+               ^ (uint32_t)tv.tv_usec
+               ^ ++counter;
+    return s ? s : ++counter;
+}
+
 // ── link TX frame queue / pacing ──────────────────────────────────────────────
 static bool frame_is_reliable(uint8_t type) {
     return type == TB_OPEN || type == TB_DATA || type == TB_CLOSE ||
@@ -265,15 +282,16 @@ static bool enqueue_frame(uint8_t type, uint8_t conn_id,
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[4];
+    uint8_t header[FRAME_HEADER_LEN];
 
     bool reliable = frame_is_reliable(type);
     uint16_t seq = reliable ? lk->tx_seq : 0;
 
     header[0] = type;
     header[1] = conn_id;
-    header[2] = (uint8_t)seq;
-    header[3] = (uint8_t)(seq >> 8);
+    pik_put_u32le(header + 2, lk->tx_session);
+    header[6] = (uint8_t)seq;
+    header[7] = (uint8_t)(seq >> 8);
 
     size_t enc_len = 0;
     if (pik_frame_encode(header, sizeof(header), payload, plen,
@@ -367,7 +385,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
     g_rx_frames++;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             4, dec, sizeof(dec), &frame);
+                                             FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
     if (st != PIK_FRAME_OK) {
         link_fail_frame(pik_frame_status_text(st), enc, enc_len, now);
         return false;
@@ -375,18 +393,40 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
 
     uint8_t        type    = frame.header[0];
     uint8_t        id      = frame.header[1];
-    uint16_t       seq     = (uint16_t)frame.header[2] | (uint16_t)frame.header[3] << 8;
+    uint32_t       session = pik_get_u32le(frame.header + 2);
+    uint16_t       seq     = (uint16_t)frame.header[6] | (uint16_t)frame.header[7] << 8;
     size_t         plen    = frame.payload_len;
     const uint8_t *payload = frame.payload;
 
     if (frame_is_reliable(type)) {
-        if (seq != g_link.rx_seq) {
-            LOG("link failure: seq gap type=0x%02x seq=%u expected=%u",
-                type, seq, g_link.rx_seq);
+        if (session == 0) {
+            LOG("link failure: zero session type=0x%02x conn=%u", type, id);
             link_close(now);
             return false;
         }
-        g_link.rx_seq++;
+        if (g_link.rx_session == 0) {
+            if (seq != 0) {
+                LOG("link failure: first frame seq=%u type=0x%02x conn=%u",
+                    seq, type, id);
+                link_close(now);
+                return false;
+            }
+            g_link.rx_session = session;
+            g_link.rx_seq = 1;
+        } else if (session != g_link.rx_session) {
+            LOG("link failure: session changed old=0x%08x new=0x%08x type=0x%02x conn=%u",
+                g_link.rx_session, session, type, id);
+            link_close(now);
+            return false;
+        } else {
+            if (seq != g_link.rx_seq) {
+                LOG("link failure: seq gap type=0x%02x seq=%u expected=%u",
+                    type, seq, g_link.rx_seq);
+                link_close(now);
+                return false;
+            }
+            g_link.rx_seq++;
+        }
     }
 
     switch (type) {
@@ -567,6 +607,8 @@ static void link_close(int64_t now) {
     close_all_conns(false);
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
+    lk->tx_session = 0;
+    lk->rx_session = 0;
     lk->tx_seq = lk->rx_seq = 0;
     lk->tx_tokens = LINK_TX_BURST;
     lk->tx_token_ms = now;
@@ -595,6 +637,8 @@ static void link_try_open(int64_t now) {
     lk->fd = fd;
     lk->rxbuf_len = 0;
     lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
+    lk->tx_session = new_session_id(now);
+    lk->rx_session = 0;
     lk->tx_seq = lk->rx_seq = 0;
     lk->up = true;
     lk->paused = false;

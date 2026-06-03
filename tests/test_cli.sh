@@ -22,7 +22,7 @@ not_contains() {
 }
 
 out=$("$PIK1D" --version)
-contains "$out" "pik1d 0.3.0 protocol=3"
+contains "$out" "pik1d 0.4.0 protocol=4"
 
 set +e
 out=$("$PIK1D" --usb 1d6b:0104 pty:0:/tmp/test tcp:127.0.0.1:7125 2>&1)

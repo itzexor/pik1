@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define C_HELLO   0x01u
@@ -32,7 +33,8 @@
 #define RELEASE_LEN 16u
 
 #define MAX_PAYLOAD   128u
-#define FRAME_DEC_MAX (1u + MAX_PAYLOAD + 4u)
+#define FRAME_HEADER_LEN 7u
+#define FRAME_DEC_MAX (FRAME_HEADER_LEN + MAX_PAYLOAD + 4u)
 #define FRAME_ENC_MAX COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define TX_RING_CAP   8192u
@@ -53,6 +55,11 @@ typedef struct {
 
     uint8_t rxbuf[FRAME_ENC_MAX + 4];
     size_t rxbuf_len;
+
+    uint32_t tx_session;
+    uint32_t rx_session;
+    uint16_t tx_seq;
+    uint16_t rx_seq;
 
     int64_t last_tx_ms;
     int64_t last_rx_ms;
@@ -87,6 +94,18 @@ static void close_link(void);
 
 static uint32_t avail(void) { return g_ctrl.tx_tail - g_ctrl.tx_head; }
 static uint32_t space(void) { return TX_RING_CAP - avail(); }
+
+static uint32_t new_session_id(int64_t now) {
+    static uint32_t counter;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t s = (uint32_t)now
+               ^ (uint32_t)getpid()
+               ^ (uint32_t)tv.tv_sec
+               ^ (uint32_t)tv.tv_usec
+               ^ ++counter;
+    return s ? s : ++counter;
+}
 
 const char *pik_control_action_name(pik_control_action_t action) {
     switch (action) {
@@ -157,8 +176,13 @@ static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
 
     static uint8_t dec[FRAME_DEC_MAX];
     static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[1] = { type };
+    uint8_t header[FRAME_HEADER_LEN];
     size_t enc_len = 0;
+
+    header[0] = type;
+    pik_put_u32le(header + 1, g_ctrl.tx_session);
+    header[5] = (uint8_t)g_ctrl.tx_seq;
+    header[6] = (uint8_t)(g_ctrl.tx_seq >> 8);
 
     if (pik_frame_encode(header, sizeof(header), payload, plen,
                          dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
@@ -169,6 +193,7 @@ static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
         LOG("TX ring full, drop type=0x%02x", type);
         return false;
     }
+    g_ctrl.tx_seq++;
     update_epoll();
     return true;
 }
@@ -319,7 +344,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
     pik_frame_t frame;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             1, dec, sizeof(dec), &frame);
+                                             FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
     if (st != PIK_FRAME_OK) {
         LOG("frame failure: %s", pik_frame_status_text(st));
         close_link();
@@ -327,8 +352,38 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
     }
 
     uint8_t type = frame.header[0];
+    uint32_t session = pik_get_u32le(frame.header + 1);
+    uint16_t seq = (uint16_t)frame.header[5] | (uint16_t)frame.header[6] << 8;
     const uint8_t *p = frame.payload;
     size_t len = frame.payload_len;
+
+    if (session == 0) {
+        LOG("bad control session=0 type=0x%02x", type);
+        close_link();
+        return false;
+    }
+    if (g_ctrl.rx_session == 0) {
+        if (seq != 0) {
+            LOG("bad first control seq=%u type=0x%02x", seq, type);
+            close_link();
+            return false;
+        }
+        g_ctrl.rx_session = session;
+        g_ctrl.rx_seq = 1;
+    } else if (session != g_ctrl.rx_session) {
+        LOG("control session changed old=0x%08x new=0x%08x type=0x%02x",
+            g_ctrl.rx_session, session, type);
+        close_link();
+        return false;
+    } else {
+        if (seq != g_ctrl.rx_seq) {
+            LOG("control seq gap seq=%u expected=%u type=0x%02x",
+                seq, g_ctrl.rx_seq, type);
+            close_link();
+            return false;
+        }
+        g_ctrl.rx_seq++;
+    }
 
     switch (type) {
     case C_HELLO:
@@ -505,6 +560,9 @@ bool pik_control_start(const char *dev, int64_t now) {
     g_ctrl.epev = EPOLLIN;
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
+    g_ctrl.tx_session = new_session_id(now);
+    g_ctrl.rx_session = 0;
+    g_ctrl.tx_seq = g_ctrl.rx_seq = 0;
     g_ctrl.config_sent = false;
     g_ctrl.last_rx_ms = g_ctrl.last_tx_ms = now;
     pik_epoll_set(g_epfd, fd, EPOLLIN, &g_ctrl_tag);
@@ -573,6 +631,9 @@ void pik_control_cleanup(void) {
     g_ctrl.epev = 0;
     g_ctrl.tx_head = g_ctrl.tx_tail = 0;
     g_ctrl.rxbuf_len = 0;
+    g_ctrl.tx_session = 0;
+    g_ctrl.rx_session = 0;
+    g_ctrl.tx_seq = g_ctrl.rx_seq = 0;
     g_ctrl.config_sent = false;
     clear_pending_ack();
     g_ctrl.peer_link_known = false;
