@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -71,6 +72,8 @@ static void reset_state(void) {
     g_remote_action = 0;
     g_remote_action_pending = false;
     g_remote_action_at_ms = 0;
+    g_child.epfd = -1;
+    g_child.status_fd = -1;
 }
 
 static void test_status_ack_payload(void) {
@@ -113,10 +116,34 @@ static void test_remote_action_not_scheduled_on_ack_failure(void) {
     CHECK(g_remote_action_at_ms == 0);
 }
 
+static void test_child_status_updates_tcp_link(void) {
+    reset_state();
+
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    int flags = fcntl(fds[0], F_GETFL, 0);
+    CHECK(flags >= 0);
+    CHECK(fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) == 0);
+    g_child.status_fd = fds[0];
+
+    CHECK(write(fds[1], "U", 1) == 1);
+    child_status_read();
+    CHECK((g_link_flags & PIK_CONTROL_LINK_TCP) != 0);
+
+    CHECK(write(fds[1], "D", 1) == 1);
+    child_status_read();
+    CHECK((g_link_flags & PIK_CONTROL_LINK_TCP) == 0);
+
+    close(fds[0]);
+    close(fds[1]);
+    g_child.status_fd = -1;
+}
+
 int main(void) {
     test_status_ack_payload();
     test_remote_action_requires_ack_success();
     test_remote_action_not_scheduled_on_ack_failure();
+    test_child_status_updates_tcp_link();
 
     if (failures) {
         fprintf(stderr, "test_pik1d_supervisor: %d failure(s)\n", failures);

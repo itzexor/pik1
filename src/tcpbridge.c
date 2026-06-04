@@ -15,9 +15,11 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -47,6 +49,7 @@
 
 #define RECONNECT_MIN     500
 #define RECONNECT_MAX     8000
+#define TCP_STATUS_FD_ENV "PIK1_TCP_STATUS_FD"
 
 // ── types ─────────────────────────────────────────────────────────────────────
 typedef struct {
@@ -98,6 +101,8 @@ static int    g_epfd      = -1;
 static bool   g_is_listener;
 static char   g_fwd_host[64];
 static int    g_fwd_port;
+static int    g_status_fd = -1;
+static bool   g_status_up;
 
 static int g_link_tag;
 static int g_listen_tag;
@@ -112,6 +117,21 @@ static uint64_t g_tx_bytes;
 // ── logging ───────────────────────────────────────────────────────────────────
 #define LOG(...) pik_log("tcp", __VA_ARGS__)
 #define DIE(...) pik_die("tcp", __VA_ARGS__)
+
+static void status_notify(bool up) {
+    if (g_status_fd < 0 || g_status_up == up) return;
+
+    char state = up ? 'U' : 'D';
+    while (write(g_status_fd, &state, 1) < 0) {
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            close(g_status_fd);
+            g_status_fd = -1;
+        }
+        break;
+    }
+    g_status_up = up;
+}
 
 // ── forward decls ─────────────────────────────────────────────────────────────
 static void link_close(int64_t now);
@@ -579,6 +599,7 @@ static void link_close(int64_t now) {
     }
     if (lk->up) {
         lk->up = false;
+        status_notify(false);
         LOG("link down");
     }
     close_all_conns(false);
@@ -631,6 +652,7 @@ static void link_try_open(int64_t now) {
     lk->epev = EPOLLIN;
     pik_epoll_set(g_epfd, fd, EPOLLIN, &g_link_tag);
 
+    status_notify(true);
     LOG("link opened: %s", lk->dev);
     LOG("link up");
 }
@@ -832,6 +854,15 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     if (argc != 4) usage(argv[0]);
+    signal(SIGPIPE, SIG_IGN);
+
+    const char *status_fd = getenv(TCP_STATUS_FD_ENV);
+    if (status_fd && *status_fd) {
+        char *end = NULL;
+        long fd = strtol(status_fd, &end, 10);
+        if (end && *end == '\0' && fd >= 0 && fd <= INT_MAX)
+            g_status_fd = (int)fd;
+    }
 
     strncpy(g_link.dev, argv[1], sizeof(g_link.dev) - 1);
     g_link.fd = -1;

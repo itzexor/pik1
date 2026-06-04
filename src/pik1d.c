@@ -9,6 +9,7 @@
 #include "version.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
 #include <signal.h>
@@ -30,6 +31,7 @@
 #define RETRY_MAX_MS 30000
 #define MAX_EVENTS 32
 #define LOCAL_CONTROL_SOCK "/run/pik1/control.sock"
+#define TCP_STATUS_FD_ENV "PIK1_TCP_STATUS_FD"
 #define COMMAND_ACK_TIMEOUT_MS 3000
 #define LOCAL_CONTROL_WRITE_TIMEOUT_MS 1000
 #define REMOTE_ACTION_DELAY_MS 250
@@ -382,17 +384,80 @@ static struct {
     pid_t   pid;
     char   *argv[8];
     char    tunnel_dev[64];
+    int     epfd;
     int64_t restart_at_ms;
     int     backoff_ms;
+    int     status_fd;
     bool    intentional_stop;
     bool    waiting_for_tunnel;
 } g_child = {
+    .epfd = -1,
     .pid = -1,
+    .status_fd = -1,
     .backoff_ms = RETRY_MIN_MS,
 };
+static int g_child_status_tag;
 
 static void child_schedule_restart(int64_t now) {
     g_child.restart_at_ms = now + pik_backoff_next(&g_child.backoff_ms, RETRY_MAX_MS);
+}
+
+static void child_close_status_pipe(void) {
+    if (g_child.status_fd < 0) return;
+    pik_epoll_del(g_child.epfd, g_child.status_fd);
+    close(g_child.status_fd);
+    g_child.status_fd = -1;
+}
+
+static void child_status_read(void) {
+    char buf[32];
+    while (g_child.status_fd >= 0) {
+        ssize_t n = read(g_child.status_fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            LOG("child: status pipe read: %s", strerror(errno));
+            child_close_status_pipe();
+            set_link_flag(PIK_CONTROL_LINK_TCP, false);
+            return;
+        }
+        if (n == 0) {
+            child_close_status_pipe();
+            set_link_flag(PIK_CONTROL_LINK_TCP, false);
+            return;
+        }
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == 'U')
+                set_link_flag(PIK_CONTROL_LINK_TCP, true);
+            else if (buf[i] == 'D')
+                set_link_flag(PIK_CONTROL_LINK_TCP, false);
+        }
+    }
+}
+
+static bool child_make_status_pipe(int fds[2]) {
+    if (pipe(fds) < 0) {
+        LOG("child: status pipe: %s", strerror(errno));
+        return false;
+    }
+
+    int flags = fcntl(fds[0], F_GETFL, 0);
+    if (flags < 0 || fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+        LOG("child: status pipe nonblock: %s", strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+
+    flags = fcntl(fds[0], F_GETFD, 0);
+    if (flags < 0 || fcntl(fds[0], F_SETFD, flags | FD_CLOEXEC) < 0) {
+        LOG("child: status pipe cloexec: %s", strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+
+    return true;
 }
 
 static void child_spawn(const char *tunnel_dev, int64_t now) {
@@ -401,9 +466,17 @@ static void child_spawn(const char *tunnel_dev, int64_t now) {
     snprintf(g_child.tunnel_dev, sizeof(g_child.tunnel_dev), "%s", tunnel_dev);
     g_child.argv[1] = g_child.tunnel_dev;
 
+    int status_pipe[2] = { -1, -1 };
+    if (!child_make_status_pipe(status_pipe)) {
+        child_schedule_restart(now);
+        return;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         LOG("child: fork: %s", strerror(errno));
+        close(status_pipe[0]);
+        close(status_pipe[1]);
         child_schedule_restart(now);
         return;
     }
@@ -411,11 +484,18 @@ static void child_spawn(const char *tunnel_dev, int64_t now) {
         sigset_t all;
         sigfillset(&all);
         sigprocmask(SIG_UNBLOCK, &all, NULL);
+        close(status_pipe[0]);
+        char fd_env[16];
+        snprintf(fd_env, sizeof(fd_env), "%d", status_pipe[1]);
+        setenv(TCP_STATUS_FD_ENV, fd_env, 1);
         execvp(g_child.argv[0], g_child.argv);
         LOG("child: execvp %s: %s", g_child.argv[0], strerror(errno));
         _exit(127);
     }
 
+    close(status_pipe[1]);
+    g_child.status_fd = status_pipe[0];
+    pik_epoll_set(g_child.epfd, g_child.status_fd, EPOLLIN, &g_child_status_tag);
     g_child.pid = pid;
     g_child.restart_at_ms = 0;
     g_child.backoff_ms = RETRY_MIN_MS;
@@ -429,6 +509,7 @@ static void child_stop(void) {
     if (g_child.pid <= 0) {
         g_child.pid = -1;
         g_child.restart_at_ms = 0;
+        child_close_status_pipe();
         set_link_flag(PIK_CONTROL_LINK_TCP, false);
         return;
     }
@@ -439,6 +520,7 @@ static void child_stop(void) {
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
     g_child.pid = -1;
     g_child.restart_at_ms = 0;
+    child_close_status_pipe();
     set_link_flag(PIK_CONTROL_LINK_TCP, false);
     g_child.intentional_stop = false;
 }
@@ -451,6 +533,7 @@ static void child_handle_sigchld(int64_t now, bool session_active) {
     if (r <= 0) return;
 
     g_child.pid = -1;
+    child_close_status_pipe();
     set_link_flag(PIK_CONTROL_LINK_TCP, false);
     if (g_child.intentional_stop) {
         g_child.restart_at_ms = 0;
@@ -697,6 +780,7 @@ int main(int argc, char **argv) {
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) DIE("epoll_create1: %s", strerror(errno));
+    g_child.epfd = epfd;
 
     static int sig_tag;
     pik_epoll_set(epfd, sig_fd, EPOLLIN, &sig_tag);
@@ -838,6 +922,11 @@ int main(int argc, char **argv) {
                     usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
                     last_usb_state = USB_WAIT_UNKNOWN;
                 }
+                continue;
+            }
+
+            if (ptr == &g_child_status_tag) {
+                child_status_read();
                 continue;
             }
 
