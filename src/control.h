@@ -49,6 +49,8 @@ void pik_control_cleanup(void);
 
 void pik_control_set_config(const uint8_t *channels, size_t n_channels,
                             pik_control_tcp_role_t tcp_role);
+/* One outstanding outbound command per daemon: the pending-ACK slot is
+ * single, so callers (local socket, signal path) must not overlap requests. */
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id);
 bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status,
                           const uint8_t **payload, size_t *payload_len);

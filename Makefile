@@ -156,9 +156,12 @@ $(TEST_BUILD):
 $(BUILD)/S99pik1: S99pik1.in FORCE | $(BUILD)
 	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
 
+$(BUILD)/shutdown_command.sh: shutdown_command.sh.in FORCE | $(BUILD)
+	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
+
 FORCE:
 
-render-k1-init: $(BUILD)/S99pik1
+render-k1-init: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
 
 # ── Toolchain download ────────────────────────────────────────────────────────
 define fetch_toolchain
@@ -176,7 +179,7 @@ toolchain: \
 	$(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 
 # ── Install targets ───────────────────────────────────────────────────────────
-install-k1: $(BUILD)/S99pik1
+install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
 	@test -x $(BUILD)/pik1d.mipsel || \
 		{ echo "Missing $(BUILD)/pik1d.mipsel; run 'make mipsel' first"; exit 1; }
 	@test -x $(BUILD)/tcpbridge.mipsel || \
@@ -184,6 +187,7 @@ install-k1: $(BUILD)/S99pik1
 	install -d $(K1_DIR)
 	install -m 755 $(BUILD)/pik1d.mipsel    $(K1_DIR)/pik1d
 	install -m 755 $(BUILD)/tcpbridge.mipsel $(K1_DIR)/tcpbridge
+	install -m 755 $(BUILD)/shutdown_command.sh $(K1_DIR)/shutdown_command.sh
 	install -m 755 $(BUILD)/S99pik1 $(K1_INIT_DIR)/S99pik1
 	@for svc in $(K1_DISABLE_SVCS); do \
 		if [ -f $(K1_INIT_DIR)/$$svc ]; then \
@@ -194,7 +198,7 @@ install-k1: $(BUILD)/S99pik1
 
 uninstall-k1:
 	rm -f $(K1_INIT_DIR)/S99pik1
-	rm -f $(K1_DIR)/pik1d $(K1_DIR)/tcpbridge
+	rm -f $(K1_DIR)/pik1d $(K1_DIR)/tcpbridge $(K1_DIR)/shutdown_command.sh
 	@for svc in $(K1_DISABLE_SVCS); do \
 		if [ -f $(K1_INIT_DIR)/_$$svc ]; then \
 			echo "Restoring $$svc"; \
@@ -217,6 +221,8 @@ install-pi:
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-reboot.service > /dev/null
 	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1-peer-poweroff.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service > /dev/null
+	sed "s|@PIK1_USER@|$$(id -nu 1000)|g" pik1-polkit.rules.in | \
+		$(SUDO) tee /etc/polkit-1/rules.d/49-pik1.rules > /dev/null
 	$(SUDO) systemctl daemon-reload
 	$(SUDO) systemctl enable pik1.service
 	$(SUDO) systemctl enable pik1-peer-reboot.service
@@ -228,7 +234,8 @@ uninstall-pi:
 	-$(SUDO) systemctl disable pik1-peer-poweroff.service
 	$(SUDO) rm -f $(PI_SYSTEMD_DIR)/pik1.service \
 		$(PI_SYSTEMD_DIR)/pik1-peer-reboot.service \
-		$(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service
+		$(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service \
+		/etc/polkit-1/rules.d/49-pik1.rules
 	$(SUDO) systemctl daemon-reload
 	$(SUDO) rm -rf $(PI_DIR)
 

@@ -14,6 +14,10 @@ ExecStartPre=+@INSTALL_DIR@/setup_pik1.sh
 User=1000
 Group=1000
 RuntimeDirectory=pik1
+# Keep /run/pik1 (and the peer-initiated marker) when the daemon exec's
+# into systemctl for a peer-commanded reboot/poweroff -- the peer-* hook
+# units evaluate their ConditionPathExists against it during shutdown.
+RuntimeDirectoryPreserve=yes
 
 ExecStart=@INSTALL_DIR@/pik1d --usb 1d6b:0104 \
     pty:0:/tmp/klipper_mcu \

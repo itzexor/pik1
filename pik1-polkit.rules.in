@@ -1,0 +1,13 @@
+// Allow the pik1 daemon user to power off / reboot the Pi via logind when
+// commanded by the K1 over the control channel. Installed by `make
+// install-pi` as /etc/polkit-1/rules.d/49-pik1.rules with @PIK1_USER@
+// rendered to the daemon's username (uid 1000).
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions" ||
+         action.id == "org.freedesktop.login1.reboot" ||
+         action.id == "org.freedesktop.login1.reboot-multiple-sessions") &&
+        subject.user == "@PIK1_USER@") {
+        return polkit.Result.YES;
+    }
+});

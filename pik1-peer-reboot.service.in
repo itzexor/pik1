@@ -3,6 +3,9 @@ Description=Propagate Pi reboot to PiK1 peer
 DefaultDependencies=no
 After=pik1.service
 Before=reboot.target
+# Skip when this shutdown was itself commanded by the peer -- relaying it
+# back would reboot the initiator a second time.
+ConditionPathExists=!/run/pik1/peer-initiated
 
 [Service]
 Type=oneshot

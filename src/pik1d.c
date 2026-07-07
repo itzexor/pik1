@@ -30,8 +30,17 @@
 #define RETRY_MIN_MS 1000
 #define RETRY_MAX_MS 30000
 #define MAX_EVENTS 32
-#define LOCAL_CONTROL_SOCK "/run/pik1/control.sock"
+#ifndef LOCAL_CONTROL_DIR
+#define LOCAL_CONTROL_DIR "/run/pik1"
+#endif
+#ifndef LOCAL_CONTROL_SOCK
+#define LOCAL_CONTROL_SOCK LOCAL_CONTROL_DIR "/control.sock"
+#endif
+#ifndef PEER_INITIATED_MARKER
+#define PEER_INITIATED_MARKER LOCAL_CONTROL_DIR "/peer-initiated"
+#endif
 #define TCP_STATUS_FD_ENV "PIK1_TCP_STATUS_FD"
+#define CONTROL_SOCK_ENV "PIK1_CONTROL_SOCK"
 #define COMMAND_ACK_TIMEOUT_MS 3000
 #define LOCAL_CONTROL_WRITE_TIMEOUT_MS 1000
 #define REMOTE_ACTION_DELAY_MS 250
@@ -67,6 +76,11 @@ static uint32_t g_signal_request_id;
 static int64_t g_signal_deadline_ms;
 static char **g_argv;
 
+static const char *local_control_sock_path(void) {
+    const char *p = getenv(CONTROL_SOCK_ENV);
+    return (p && *p) ? p : LOCAL_CONTROL_SOCK;
+}
+
 static int connect_local_control(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
@@ -74,7 +88,7 @@ static int connect_local_control(void) {
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", LOCAL_CONTROL_SOCK);
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", local_control_sock_path());
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         close(fd);
         return -1;
@@ -85,19 +99,25 @@ static int connect_local_control(void) {
 static int control_client_main(const char *cmd) {
     int fd = connect_local_control();
     if (fd < 0) {
-        fprintf(stderr, "pik1d: connect %s: %s\n", LOCAL_CONTROL_SOCK, strerror(errno));
+        fprintf(stderr, "pik1d: connect %s: %s\n", local_control_sock_path(), strerror(errno));
         return 1;
     }
     dprintf(fd, "%s\n", cmd);
 
-    char buf[128];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    if (n < 0) {
-        fprintf(stderr, "pik1d: read control response: %s\n", strerror(errno));
-        close(fd);
-        return 1;
+    char buf[192];
+    size_t len = 0;
+    while (len < sizeof(buf) - 1) {
+        ssize_t n = read(fd, buf + len, sizeof(buf) - 1 - len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            fprintf(stderr, "pik1d: read control response: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+        if (n == 0) break;
+        len += (size_t)n;
     }
-    buf[n > 0 ? n : 0] = '\0';
+    buf[len] = '\0';
     fputs(buf, stdout);
     close(fd);
     return strncmp(buf, "OK", 2) == 0 ? 0 : 1;
@@ -133,7 +153,13 @@ static void local_control_close_client(void) {
 }
 
 static bool local_control_start(int epfd) {
+    const char *sock_path = local_control_sock_path();
     g_local.epfd = epfd;
+    if (!getenv(CONTROL_SOCK_ENV) &&
+        mkdir(LOCAL_CONTROL_DIR, 0700) < 0 && errno != EEXIST) {
+        LOG("mkdir %s: %s", LOCAL_CONTROL_DIR, strerror(errno));
+        return false;
+    }
     g_local.listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (g_local.listen_fd < 0) {
         LOG("local control socket: %s", strerror(errno));
@@ -143,26 +169,26 @@ static bool local_control_start(int epfd) {
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", LOCAL_CONTROL_SOCK);
-    unlink(LOCAL_CONTROL_SOCK);
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", sock_path);
+    unlink(sock_path);
     if (bind(g_local.listen_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        LOG("bind %s: %s", LOCAL_CONTROL_SOCK, strerror(errno));
+        LOG("bind %s: %s", sock_path, strerror(errno));
         close(g_local.listen_fd);
         g_local.listen_fd = -1;
         return false;
     }
-    if (chmod(LOCAL_CONTROL_SOCK, 0600) < 0) {
-        LOG("chmod %s: %s", LOCAL_CONTROL_SOCK, strerror(errno));
+    if (chmod(sock_path, 0600) < 0) {
+        LOG("chmod %s: %s", sock_path, strerror(errno));
         close(g_local.listen_fd);
         g_local.listen_fd = -1;
-        unlink(LOCAL_CONTROL_SOCK);
+        unlink(sock_path);
         return false;
     }
     if (listen(g_local.listen_fd, 4) < 0) {
-        LOG("listen %s: %s", LOCAL_CONTROL_SOCK, strerror(errno));
+        LOG("listen %s: %s", sock_path, strerror(errno));
         close(g_local.listen_fd);
         g_local.listen_fd = -1;
-        unlink(LOCAL_CONTROL_SOCK);
+        unlink(sock_path);
         return false;
     }
     pik_epoll_set(epfd, g_local.listen_fd, EPOLLIN, &g_local_listen_tag);
@@ -175,7 +201,7 @@ static void local_control_cleanup(void) {
         pik_epoll_del(g_local.epfd, g_local.listen_fd);
         close(g_local.listen_fd);
         g_local.listen_fd = -1;
-        unlink(LOCAL_CONTROL_SOCK);
+        unlink(local_control_sock_path());
     }
 }
 
@@ -227,9 +253,16 @@ static void local_control_reply_payload_and_close(const uint8_t *payload,
     local_control_reply_and_close(msg);
 }
 
-static void local_control_reply_error_status(pik_control_ack_status_t status) {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "ERR peer %s\n", pik_control_ack_status_name(status));
+static void local_control_reply_error_status(pik_control_ack_status_t status,
+                                             const uint8_t *payload,
+                                             size_t payload_len) {
+    char msg[160];
+    if (!payload)
+        payload_len = 0;
+    snprintf(msg, sizeof(msg), "ERR peer %s%s%.*s\n",
+             pik_control_ack_status_name(status),
+             payload_len ? " " : "", (int)payload_len,
+             payload ? (const char *)payload : "");
     local_control_reply_and_close(msg);
 }
 
@@ -261,7 +294,7 @@ static void local_control_read(int64_t now) {
         local_control_reply_and_close("ERR unknown command\n");
         return;
     }
-    if (g_local.command_pending) {
+    if (g_local.command_pending || g_signal_command_pending) {
         local_control_reply_and_close("ERR busy\n");
         return;
     }
@@ -286,7 +319,7 @@ static void local_control_check_ack(int64_t now) {
                 if (status == PIK_CONTROL_ACK_OK)
                     local_control_reply_and_close("OK\n");
                 else
-                    local_control_reply_error_status(status);
+                    local_control_reply_error_status(status, payload, payload_len);
             }
         } else if (g_signal_command_pending && request_id == g_signal_request_id) {
             LOG("restart command ack status=%s", pik_control_ack_status_name(status));
@@ -555,10 +588,30 @@ static int64_t child_deadline(void) {
     return g_child.restart_at_ms;
 }
 
-static void execute_remote_action(pik_control_action_t action) {
+/* Tear down everything tied to the current USB control session. */
+static void session_teardown(void) {
     child_stop();
     serialmux_cleanup();
     pik_control_cleanup();
+}
+
+/* A peer-commanded reboot/poweroff must not be relayed back by our own
+ * shutdown hooks: the Pi's pik1-peer-* units are gated on this marker via
+ * ConditionPathExists. Best-effort; /run is tmpfs so it clears on boot. */
+static void mark_peer_initiated(void) {
+    int fd = open(PEER_INITIATED_MARKER, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        LOG("marker %s: %s", PEER_INITIATED_MARKER, strerror(errno));
+        return;
+    }
+    close(fd);
+}
+
+static void execute_remote_action(pik_control_action_t action) {
+    if (action == PIK_CONTROL_ACTION_REBOOT_PEER ||
+        action == PIK_CONTROL_ACTION_POWEROFF_PEER)
+        mark_peer_initiated();
+    session_teardown();
     local_control_cleanup();
 
     switch (action) {
@@ -792,7 +845,7 @@ int main(int argc, char **argv) {
             channel_ids[i] = cfg.channels[i].ch_id;
         pik_control_set_config(channel_ids, (size_t)cfg.n_channels, tcp_role);
     }
-    if (!is_mcu && !local_control_start(epfd))
+    if (!local_control_start(epfd))
         DIE("failed to start local control socket");
     serialmux_init(&cfg, epfd);
 
@@ -853,9 +906,7 @@ int main(int argc, char **argv) {
                 set_link_flag(PIK_CONTROL_LINK_SERIAL, false);
                 session_active = false;
                 session_confirmed = false;
-                child_stop();
-                serialmux_cleanup();
-                pik_control_cleanup();
+                session_teardown();
                 usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
                 last_usb_state = USB_WAIT_UNKNOWN;
             }
@@ -895,7 +946,11 @@ int main(int argc, char **argv) {
                     if (si.ssi_signo == SIGTERM) {
                         shutdown = true;
                     } else if (si.ssi_signo == SIGUSR1) {
-                        if (!is_mcu && !g_signal_command_pending && !g_signal_command_done &&
+                        if (g_local.command_pending) {
+                            /* single outstanding outbound command; see control.h */
+                            LOG("ignoring SIGUSR1 while a local command is pending");
+                            g_signal_command_done = true;
+                        } else if (!is_mcu && !g_signal_command_pending && !g_signal_command_done &&
                             pik_control_send_command(PIK_CONTROL_ACTION_RESTART_PEER,
                                                      &g_signal_request_id)) {
                             g_signal_command_pending = true;
@@ -916,9 +971,7 @@ int main(int argc, char **argv) {
                     set_link_flags(0);
                     session_active = false;
                     session_confirmed = false;
-                    child_stop();
-                    serialmux_cleanup();
-                    pik_control_cleanup();
+                    session_teardown();
                     usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
                     last_usb_state = USB_WAIT_UNKNOWN;
                 }
@@ -945,9 +998,7 @@ int main(int argc, char **argv) {
                 set_link_flags(0);
                 session_active = false;
                 session_confirmed = false;
-                child_stop();
-                serialmux_cleanup();
-                pik_control_cleanup();
+                session_teardown();
                 usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
                 last_usb_state = USB_WAIT_UNKNOWN;
             }
@@ -964,9 +1015,7 @@ int main(int argc, char **argv) {
             set_link_flags(0);
             session_active = false;
             session_confirmed = false;
-            child_stop();
-            serialmux_cleanup();
-            pik_control_cleanup();
+            session_teardown();
             usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
             last_usb_state = USB_WAIT_UNKNOWN;
         }
@@ -976,9 +1025,7 @@ int main(int argc, char **argv) {
             set_link_flags(0);
             session_active = false;
             session_confirmed = false;
-            child_stop();
-            serialmux_cleanup();
-            pik_control_cleanup();
+            session_teardown();
             usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
             last_usb_state = USB_WAIT_UNKNOWN;
         }
@@ -1002,9 +1049,7 @@ int main(int argc, char **argv) {
             execute_remote_action(g_remote_action);
     }
 
-    child_stop();
-    serialmux_cleanup();
-    pik_control_cleanup();
+    session_teardown();
     local_control_cleanup();
     close(sig_fd);
     close(epfd);

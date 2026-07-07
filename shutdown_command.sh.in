@@ -1,0 +1,33 @@
+#!/bin/sh
+# shutdown_command.sh — K1-initiated shutdown/reboot that propagates to the Pi.
+#
+# Intended to be called from the touchscreen UI. Sends the matching peer
+# command to the Pi over the pik1 control channel, waits for the peer's
+# acknowledgement, then performs the local action. If the peer cannot be
+# reached the local action still proceeds — the operator asked for a
+# shutdown, so do not strand the machine.
+#
+# Usage: shutdown_command.sh shutdown|reboot
+
+PIK1D="@INSTALL_DIR@/pik1d"
+
+case "$1" in
+    shutdown)
+        peer_verb="poweroff-peer"
+        local_cmd="poweroff"
+        ;;
+    reboot)
+        peer_verb="reboot-peer"
+        local_cmd="reboot"
+        ;;
+    *)
+        echo "Usage: $0 shutdown|reboot" >&2
+        exit 2
+        ;;
+esac
+
+if ! "$PIK1D" --control "$peer_verb"; then
+    echo "warning: peer $peer_verb failed, continuing with local $local_cmd" >&2
+fi
+
+exec "$local_cmd"

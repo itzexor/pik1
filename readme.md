@@ -8,8 +8,8 @@
 
 `pik1d` is a small C daemon that bridges the K1 MCU serial ports to PTYs on the
 Pi over USB CDC ACM links. Endpoint 0 is a dedicated control channel for
-version checks, link liveness, and remote restart/shutdown commands. Endpoint 1
-is the MCU serial mux. Endpoint 2 is a sibling `tcpbridge` process used by the
+version checks, link liveness, and remote restart/shutdown commands (see
+[Peer commands](#peer-commands)). Endpoint 1 is the MCU serial mux. Endpoint 2 is a sibling `tcpbridge` process used by the
 touchscreen Moonraker tunnel.
 
 The TCP tunnel is intended for low-bandwidth Moonraker API traffic from the K1
@@ -70,6 +70,8 @@ The following files are involved:
 
 - `src/` -- C source for `pik1d`, `tcpbridge`, and the shared serial mux code
 - `S99pik1.in` -- K1 init script template, rendered to `build/S99pik1`
+- `shutdown_command.sh.in` -- K1 shutdown/reboot wrapper that propagates to the Pi
+- `pik1-polkit.rules.in` -- polkit rule letting the Pi daemon power off/reboot
 - `setup_pik1.sh` -- Pi gadget setup script
 - `pik1.service.in` -- Pi systemd service template
 
@@ -316,9 +318,9 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
     setup_pik1: binding gadget to UDC: fe980000.usb
     setup_pik1: gadget setup complete
-    [pik1] uart=pty release=0.4.0 protocol=4 channels=2 tcp=forward:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    [pik1] uart=pty release=0.5.0 protocol=4 channels=2 tcp=forward:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
     [ctrl] link opened: /dev/ttyGS0
-    [ctrl] link up: release=0.4.0 protocol=4 features=0x00000000
+    [ctrl] link up: release=0.5.0 protocol=4 features=0x00000000
     [pik1] control session started: control=/dev/ttyGS0 serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
     [pik1] data session started: serial=/dev/ttyGS1 tunnel=/dev/ttyGS2
     [pik1] child: spawned /opt/pik1/tcpbridge pid=...
@@ -338,9 +340,9 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     A normal startup looks like. Because `pik1d` and `tcpbridge` write to the
     same log, adjacent lines may occasionally interleave:
     ```
-    2026-05-25 19:41:50 [pik1] uart=mcu release=0.4.0 protocol=4 channels=2 tcp=listen:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
+    2026-05-25 19:41:50 [pik1] uart=mcu release=0.5.0 protocol=4 channels=2 tcp=listen:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
     2026-05-25 19:41:50 [ctrl] link opened: /dev/ttyACM0
-    2026-05-25 19:41:50 [ctrl] link up: release=0.4.0 protocol=4 features=0x00000000
+    2026-05-25 19:41:50 [ctrl] link up: release=0.5.0 protocol=4 features=0x00000000
     2026-05-25 19:41:50 [pik1] control session started: control=/dev/ttyACM0 serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
     2026-05-25 19:41:50 [pik1] data session started: serial=/dev/ttyACM1 tunnel=/dev/ttyACM2
     2026-05-25 19:41:50 [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
@@ -397,6 +399,50 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
 
     You can run both the Pi and K1 standalone simultaneously (e.g. for camera
     services) without conflict as long as the pik1 init script is disabled.
+
+## Peer commands
+
+Both daemons expose a local command socket at `/run/pik1/control.sock`
+(created by systemd on the Pi, by the init script on the K1). Commands are
+sent to the *other* side of the USB link and complete when the peer
+acknowledges:
+
+    pik1d --control status-peer     # peer version, protocol, link states
+    pik1d --control restart-peer    # peer daemon re-execs itself
+    pik1d --control reboot-peer     # peer runs /sbin/reboot
+    pik1d --control poweroff-peer   # peer runs /sbin/poweroff
+
+Replies are `OK`, `OK <payload>`, or `ERR <reason>`. One command may be
+outstanding at a time (`ERR busy` otherwise).
+
+### Shutdown propagation
+
+Shutdown initiated on either side propagates to the other exactly once —
+the *initiating* side is always the one that relays:
+
+- **Pi-initiated** (`sudo poweroff`, `sudo reboot`, etc.): the
+  `pik1-peer-poweroff`/`pik1-peer-reboot` systemd units run during shutdown
+  and send the matching peer command to the K1.
+- **K1-initiated** (e.g. from the touchscreen): call the installed wrapper
+  instead of plain `poweroff`/`reboot`:
+
+      /usr/data/pik1/shutdown_command.sh shutdown   # or: reboot
+
+  It sends `poweroff-peer`/`reboot-peer` to the Pi, waits for the peer's
+  acknowledgement, then performs the local action. If the Pi is
+  unreachable it warns and still shuts the K1 down.
+
+Two pieces keep this loop-free and working on the systemd Pi:
+
+- A peer-commanded reboot/poweroff drops a marker at
+  `/run/pik1/peer-initiated` before executing; the Pi's peer-* hook units
+  are gated with `ConditionPathExists=!` on it, so they never relay a
+  shutdown back to the side that asked for it.
+- `make install-pi` installs `/etc/polkit-1/rules.d/49-pik1.rules`
+  (rendered from `pik1-polkit.rules.in`), which lets the unprivileged
+  daemon user invoke `systemctl poweroff`/`reboot` via logind. Without it,
+  K1-commanded Pi shutdowns are denied by polkit and the daemon just
+  restarts.
 
 ## Optional extras
 

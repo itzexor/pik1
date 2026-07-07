@@ -21,8 +21,19 @@ not_contains() {
     [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
 }
 
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+export PIK1_CONTROL_SOCK="$tmpdir/control.sock"
+
 out=$("$PIK1D" --version)
-contains "$out" "pik1d 0.4.0 protocol=4"
+contains "$out" "pik1d 0.5.0 protocol=4"
+
+set +e
+out=$("$PIK1D" --control status-peer 2>&1)
+rc=$?
+set -e
+[[ $rc -eq 1 ]] || fail "--control status-peer with no daemon exited with $rc"
+contains "$out" "connect"
 
 set +e
 out=$("$PIK1D" --usb 1d6b:0104 pty:0:/tmp/test tcp:127.0.0.1:7125 2>&1)
