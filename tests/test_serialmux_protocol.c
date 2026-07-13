@@ -23,6 +23,7 @@ typedef struct {
     char tmpdir[128];
     char pty_link[160];
     uint32_t peer_session;
+    uint32_t mux_session;   /* the mux's TX session, learned from its frames */
     uint16_t peer_seq;
 } mux_fixture_t;
 
@@ -109,6 +110,7 @@ static bool read_mux_frame(mux_fixture_t *fx, captured_frame_t *f) {
             f->payload_len = frame.payload_len;
             if (f->payload_len)
                 memcpy(f->payload, frame.payload, f->payload_len);
+            fx->mux_session = f->session;
             return true;
         }
         test_epoll_dispatch_one(fx->epfd, dispatch_mux, 100);
@@ -123,7 +125,8 @@ static bool send_peer_nak(mux_fixture_t *fx, uint16_t expected) {
     size_t enc_len = 0;
     header[0] = PIK_SERIALMUX_FRAME_NAK;
     header[1] = 0;
-    pik_put_u32le(header + 2, fx->peer_session);
+    /* a NAK carries the session it is healing: the mux's TX session */
+    pik_put_u32le(header + 2, fx->mux_session);
     put_u16le(header + 6, fx->peer_seq); /* link-control: seq not consumed */
     if (!test_encode_frame(header, sizeof(header), payload, sizeof(payload),
                            enc, sizeof(enc), &enc_len))
@@ -341,11 +344,20 @@ static void test_nak_triggers_byte_identical_retransmit(void) {
 
 static void test_nak_beyond_window_fails(void) {
     mux_fixture_t fx;
+    captured_frame_t f;
     CHECK(fixture_init(&fx));
     CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
     CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+
+    /* make the mux emit a frame so its TX session is known for the NAK */
+    int pty_fd = open(fx.pty_link, O_WRONLY | O_NONBLOCK | O_NOCTTY);
+    CHECK(pty_fd >= 0);
+    CHECK(write(pty_fd, "hello", 5) == 5);
+    CHECK(read_mux_frame(&fx, &f));
+
     CHECK(send_peer_nak(&fx, 100)); /* nothing near that in history */
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    close(pty_fd);
     fixture_cleanup(&fx);
 }
 

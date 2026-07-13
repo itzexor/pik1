@@ -19,6 +19,7 @@ typedef struct {
     int slave_keepalive;
     char slave_name[128];
     uint32_t peer_session;
+    uint32_t local_session;   /* the daemon's TX session, learned at handshake */
     uint16_t peer_seq;
 } ctrl_fixture_t;
 
@@ -149,6 +150,7 @@ static bool handshake(ctrl_fixture_t *fx) {
     if (!decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)))
         return false;
     if (type != PIK_CONTROL_FRAME_HELLO || seq != 0 || session == 0) return false;
+    fx->local_session = session;
 
     if (!send_peer_hello(fx, PIK_CONTROL_ROLE_MCU, PIK1_PROTOCOL_VERSION))
         return false;
@@ -263,7 +265,8 @@ static bool send_peer_nak(ctrl_fixture_t *fx, uint16_t expected) {
     uint8_t enc[128];
     size_t enc_len = 0;
     header[0] = PIK_CONTROL_FRAME_NAK;
-    pik_put_u32le(header + 1, fx->peer_session);
+    /* a NAK carries the session it is healing: the local side's TX session */
+    pik_put_u32le(header + 1, fx->local_session);
     put_u16le(header + 5, fx->peer_seq); /* link-control: seq not consumed */
     if (!test_encode_frame(header, sizeof(header), payload, sizeof(payload),
                            enc, sizeof(enc), &enc_len))

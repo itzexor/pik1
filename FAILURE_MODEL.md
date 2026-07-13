@@ -77,7 +77,7 @@ These invariants should hold unless a narrow exception is documented and tested:
 
 ## Documented Exceptions
 
-### Link-layer retransmission (mux and control links, protocol 5+)
+### Link-layer retransmission (mux, control, and TCP bridge links, protocol 6+)
 
 Motivation: the K1's dwc2 USB host controller can silently drop in-flight
 bulk transfers (`dwc2_hc_chhltd_intr_dma: ChHltd set, but reason is unknown`;
@@ -91,7 +91,8 @@ discards out-of-order frames, and sends a NAK link-control frame carrying the
 next expected sequence number. The sender re-sends byte-identical stored
 copies of the affected frames from a fixed-size history ring. NAK frames are
 outside the sequenced stream so they remain processable when both directions
-have gaps simultaneously.
+have gaps simultaneously, and they carry the session they are healing so the
+sender can verify them even when its own inbound direction has been silent.
 
 Why the invariants hold:
 
@@ -118,9 +119,11 @@ because an unsynchronized restart leaves the peer's stale frames in flight
 and fail-closing on them causes restart flapping. After the window the old
 fail-closed behavior applies unchanged.
 
-Tested in tests/test_serialmux_protocol.c and tests/test_control_protocol.c:
-gap→NAK→heal, budget expiry, NAK beyond window, duplicate discard,
-byte-identical retransmit, stale bring-up traffic, and grace expiry.
+Tested in tests/test_serialmux_protocol.c and tests/test_control_protocol.c
+(gap→NAK→heal, budget expiry, NAK beyond window, duplicate discard,
+byte-identical retransmit, stale bring-up traffic, and grace expiry) and in
+tests/test_tcpbridge_integration.py (end-to-end frame drop healed without
+data loss).
 
 ## Failure Classes
 

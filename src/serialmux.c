@@ -5,6 +5,7 @@
 #include "nanocobs/cobs.h"
 #include "fd.h"
 #include "frame.h"
+#include "link.h"
 #include "logging.h"
 #include "tty.h"
 #include "util.h"
@@ -25,23 +26,14 @@
 #define FRAME_ENC_MAX   COBS_ENCODE_MAX(FRAME_DEC_MAX)
 
 #define LINK_RING_CAP   (1u << 20)
-#define LINK_RING_MASK  (LINK_RING_CAP - 1u)
 #define LINK_HIGH_WATER (LINK_RING_CAP / 2)
 #define LINK_LOW_WATER  (LINK_RING_CAP / 4)
 
 #define CHAN_RING_CAP   (1u << 16)
 #define CHAN_RING_MASK  (CHAN_RING_CAP - 1u)
 
-/* Retransmit history: encoded copies of the most recent sequenced TX frames,
- * kept so a peer NAK can be answered byte-identically (FAILURE_MODEL.md,
- * "Documented Exceptions"). */
 #define HIST_CAP        (1u << 18)
-#define HIST_MASK       (HIST_CAP - 1u)
-#define HIST_SLOTS      512u        /* power of two, bounds frame count */
-
-#define NAK_RETRY_MS      100       /* re-send NAK while a gap persists */
-#define GAP_BUDGET_MS     500       /* unhealed gap fails the link */
-#define STALE_GRACE_MS    2000      /* discard stale frames after link open */
+#define HIST_SLOTS      512u
 
 #define RESET_SILENCE_MS  5000
 
@@ -69,62 +61,17 @@ typedef struct channel {
     int         slave_fd;
 } channel_t;
 
-typedef struct {
-    uint32_t    off;    /* free-running byte offset into hist ring */
-    uint16_t    len;
-} hist_ent_t;
-
-typedef struct {
-    int         fd;
-    bool        up;
-    bool        paused;
-    uint32_t    epev;
-
-    uint8_t     txbuf[LINK_RING_CAP];
-    uint32_t    tx_head, tx_tail;
-
-    uint8_t     rxbuf[FRAME_ENC_MAX + 4];
-    size_t      rxbuf_len;
-
-    uint32_t    tx_session;
-    uint32_t    rx_session;
-    uint16_t    tx_seq;
-    uint16_t    rx_seq;
-
-    /* retransmit history of sent frames (encoded bytes + per-seq index) */
-    uint8_t     hist[HIST_CAP];
-    hist_ent_t  hist_ent[HIST_SLOTS];
-    uint16_t    hist_first;         /* seq of oldest frame still held */
-    uint16_t    hist_count;
-    uint32_t    hist_head, hist_tail;
-    int64_t     last_resend_ms;
-
-    /* receiver gap recovery */
-    int64_t     gap_since_ms;       /* 0 = stream in sync */
-    int64_t     last_nak_ms;
-    uint32_t    gap_discards;
-    uint32_t    dup_discards;
-
-    /* bring-up grace for stale frames from the peer's previous session */
-    int64_t     opened_ms;
-    uint32_t    stale_discards;
-} link_t;
-
 // ── globals ───────────────────────────────────────────────────────────────────
-static link_t    g_link;
-static channel_t g_chans[MAX_CHANNELS];
-static int       g_n_chans;
-static int       g_epfd = -1;
-static bool      g_session_failed;
-static int64_t   g_now_ms;   /* updated on entry to start/dispatch/tick */
+static pik_link_t g_link;
+static bool       g_link_paused;   /* high-water pause of all channels */
+static channel_t  g_chans[MAX_CHANNELS];
+static int        g_n_chans;
+static int        g_epfd = -1;
 
-/* Cumulative link I/O counters (process lifetime): dumped on link failure. */
-static uint64_t g_rx_frames;
-static uint64_t g_tx_frames;
-static uint64_t g_rx_reads;
-static uint64_t g_rx_bytes;
-static uint64_t g_tx_writes;
-static uint64_t g_tx_bytes;
+static uint8_t             s_link_tx[LINK_RING_CAP];
+static uint8_t             s_link_rx[FRAME_ENC_MAX + 4];
+static uint8_t             s_link_hist[HIST_CAP];
+static pik_link_hist_ent_t s_link_hist_ent[HIST_SLOTS];
 
 // ── logging ───────────────────────────────────────────────────────────────────
 #define LOG(...)  pik_log("mux", __VA_ARGS__)
@@ -172,186 +119,6 @@ static void chan_epoll_update(channel_t *c) {
 static void chan_pause(channel_t *c)  { if (!c->paused) { c->paused = true;  chan_epoll_update(c); } }
 static void chan_resume(channel_t *c) { if ( c->paused) { c->paused = false; chan_epoll_update(c); } }
 
-// ── link ring helpers ─────────────────────────────────────────────────────────
-static uint32_t lk_avail(const link_t *lk) { return lk->tx_tail - lk->tx_head; }
-static uint32_t lk_space(const link_t *lk) { return LINK_RING_CAP - lk_avail(lk); }
-
-static bool lk_push(link_t *lk, const uint8_t *src, size_t len) {
-    if (lk_space(lk) < (uint32_t)len) return false;
-    for (size_t i = 0; i < len; i++)
-        lk->txbuf[lk->tx_tail++ & LINK_RING_MASK] = src[i];
-    return true;
-}
-
-static bool lk_drain(link_t *lk) {
-    bool wrote = false;
-    while (lk_avail(lk)) {
-        uint32_t off    = lk->tx_head & LINK_RING_MASK;
-        uint32_t contig = LINK_RING_CAP - off;
-        uint32_t avail  = lk_avail(lk);
-        size_t   n      = avail < contig ? avail : contig;
-        ssize_t  w      = write(lk->fd, lk->txbuf + off, n);
-        if (w <= 0) {
-            if (w < 0 && errno != EAGAIN && errno != EINTR)
-                LOG("link write: %s", strerror(errno));
-            break;
-        }
-        lk->tx_head += (uint32_t)w;
-        g_tx_writes++;
-        g_tx_bytes += (uint64_t)w;
-        wrote = true;
-    }
-    uint32_t want = EPOLLIN | (lk_avail(lk) ? EPOLLOUT : 0u);
-    if (want != lk->epev && lk->fd >= 0) {
-        lk->epev = want;
-        pik_epoll_set(g_epfd, lk->fd, want, lk);
-    }
-    return wrote;
-}
-
-// ── frame I/O ────────────────────────────────────────────────────────────────
-static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len);
-static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len);
-static void link_close(link_t *lk);
-
-static void link_fail_frame(link_t *lk, const char *reason,
-                            const uint8_t *enc, size_t enc_len) {
-    LOG("link failure: %s enc_len=%zu first=0x%02x", reason, enc_len,
-        enc_len ? enc[0] : 0);
-    pik_log_bad_frame_sample("mux", enc, enc_len);
-    link_close(lk);
-}
-
-static bool link_can_queue_frame(const link_t *lk, size_t plen) {
-    if (plen > PIK_SERIALMUX_MAX_PAYLOAD) return false;
-    return lk_space(lk) >= COBS_ENCODE_MAX(PIK_SERIALMUX_FRAME_HEADER_LEN + plen + 4);
-}
-
-static void hist_store(link_t *lk, uint16_t seq, const uint8_t *enc, size_t enc_len) {
-    while (lk->hist_count &&
-           (lk->hist_count == HIST_SLOTS ||
-            HIST_CAP - (lk->hist_tail - lk->hist_head) < (uint32_t)enc_len)) {
-        lk->hist_head += lk->hist_ent[lk->hist_first % HIST_SLOTS].len;
-        lk->hist_first++;
-        lk->hist_count--;
-    }
-    if (!lk->hist_count) {
-        lk->hist_first = seq;
-        lk->hist_head = lk->hist_tail;
-    }
-    hist_ent_t *e = &lk->hist_ent[seq % HIST_SLOTS];
-    e->off = lk->hist_tail;
-    e->len = (uint16_t)enc_len;
-    for (size_t i = 0; i < enc_len; i++)
-        lk->hist[(lk->hist_tail + i) & HIST_MASK] = enc[i];
-    lk->hist_tail += (uint32_t)enc_len;
-    lk->hist_count++;
-}
-
-/* sequenced=false is for link-control frames (NAK): they consume no sequence
- * number and are never retransmitted, so a peer can process them mid-gap. */
-static void enqueue_frame_opt(link_t *lk, uint8_t type, uint8_t ch_id,
-                              const uint8_t *payload, size_t plen, bool sequenced) {
-    if (!lk->up) return;
-    if (plen > PIK_SERIALMUX_MAX_PAYLOAD) {
-        LOG("oversized frame type=0x%02x ch=%u plen=%zu", type, ch_id, plen);
-        link_close(lk);
-        return;
-    }
-
-    static uint8_t dec[FRAME_DEC_MAX];
-    static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[PIK_SERIALMUX_FRAME_HEADER_LEN];
-
-    header[0] = type;
-    header[1] = ch_id;
-    pik_put_u32le(header + 2, lk->tx_session);
-    header[6] = (uint8_t)lk->tx_seq;
-    header[7] = (uint8_t)(lk->tx_seq >> 8);
-
-    size_t enc_len = 0;
-    if (pik_frame_encode(header, sizeof(header), payload, plen,
-                         dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
-        LOG("cobs_encode failed type=0x%02x ch=%u", type, ch_id);
-        link_close(lk);
-        return;
-    }
-
-    if (!lk_push(lk, enc, enc_len)) {
-        LOG("link TX ring full, closing before dropping frame type=0x%02x ch=%u",
-            type, ch_id);
-        link_close(lk);
-        return;
-    }
-    if (sequenced) {
-        hist_store(lk, lk->tx_seq, enc, enc_len);
-        lk->tx_seq++;
-    }
-    g_tx_frames++;
-
-    if (!(lk->epev & EPOLLOUT) && lk->fd >= 0) {
-        lk->epev |= EPOLLOUT;
-        pik_epoll_set(g_epfd, lk->fd, lk->epev, lk);
-    }
-}
-
-static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
-                          const uint8_t *payload, size_t plen) {
-    enqueue_frame_opt(lk, type, ch_id, payload, plen, true);
-}
-
-static void send_nak(link_t *lk, int64_t now) {
-    uint8_t p[2] = { (uint8_t)lk->rx_seq, (uint8_t)(lk->rx_seq >> 8) };
-    enqueue_frame_opt(lk, PIK_SERIALMUX_FRAME_NAK, 0, p, sizeof(p), false);
-    lk->last_nak_ms = now;
-}
-
-static void handle_nak(link_t *lk, const uint8_t *p) {
-    uint16_t expected = (uint16_t)p[0] | (uint16_t)p[1] << 8;
-    uint16_t outstanding = (uint16_t)(lk->tx_seq - expected);
-    if (outstanding == 0) return; /* peer caught up while the NAK was in flight */
-    if (outstanding > lk->hist_count) {
-        LOG("link failure: NAK beyond retransmit window expected=%u tx_seq=%u window=%u",
-            expected, lk->tx_seq, lk->hist_count);
-        link_close(lk);
-        return;
-    }
-    if (lk->last_resend_ms && g_now_ms - lk->last_resend_ms < NAK_RETRY_MS / 2)
-        return; /* duplicate NAK burst; resend already queued */
-
-    LOG("retransmit: seq=%u..%u frames=%u (peer NAK)",
-        expected, (uint16_t)(lk->tx_seq - 1u), outstanding);
-    for (uint16_t s = expected; s != lk->tx_seq; s++) {
-        const hist_ent_t *e = &lk->hist_ent[s % HIST_SLOTS];
-        if (lk_space(lk) < e->len) {
-            LOG("link TX ring full during retransmit");
-            link_close(lk);
-            return;
-        }
-        for (uint16_t i = 0; i < e->len; i++)
-            lk->txbuf[lk->tx_tail++ & LINK_RING_MASK] = lk->hist[(e->off + i) & HIST_MASK];
-    }
-    lk->last_resend_ms = g_now_ms;
-    if (!(lk->epev & EPOLLOUT) && lk->fd >= 0) {
-        lk->epev |= EPOLLOUT;
-        pik_epoll_set(g_epfd, lk->fd, lk->epev, lk);
-    }
-}
-
-static bool link_parse_rx(link_t *lk) {
-    pik_frame_status_t st = pik_frame_rx_consume(lk->rxbuf, &lk->rxbuf_len,
-                                                 sizeof(lk->rxbuf),
-                                                 dispatch_rx_frame, lk);
-    if (st == PIK_FRAME_CALLBACK_FAILED)
-        return false;
-    if (st == PIK_FRAME_RX_OVERFLOW) {
-        LOG("link RX overflow");
-        link_close(lk);
-        return false;
-    }
-    return true;
-}
-
 // ── serial port ───────────────────────────────────────────────────────────────
 static int open_serial(const char *path, int baud) {
     int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -364,42 +131,42 @@ static int open_serial(const char *path, int baud) {
 }
 
 // ── MCU channel ───────────────────────────────────────────────────────────────
-static void mcu_on_link_up(channel_t *c, link_t *lk) {
+static void mcu_on_link_up(channel_t *c) {
     if (c->mcu_state == MCU_ACTIVE)
-        enqueue_frame(lk, PIK_SERIALMUX_FRAME_READY, c->ch_id, NULL, 0);
+        pik_link_enqueue(&g_link, PIK_SERIALMUX_FRAME_READY, c->ch_id, NULL, 0);
     else
-        enqueue_frame(lk, PIK_SERIALMUX_FRAME_FLUSH, c->ch_id, NULL, 0);
+        pik_link_enqueue(&g_link, PIK_SERIALMUX_FRAME_FLUSH, c->ch_id, NULL, 0);
 }
 
-static void mcu_open(channel_t *c, link_t *lk, int64_t now) {
+static void mcu_open(channel_t *c, int64_t now) {
     if (c->fd >= 0) return;
     c->fd = open_serial(c->dev, c->baud);
     if (c->fd < 0) return;
     c->last_byte_ms = now;
     c->epev = 0;
     chan_epoll_update(c);
-    if (lk->up) mcu_on_link_up(c, lk);
+    if (g_link.fd >= 0) mcu_on_link_up(c);
 }
 
-static void ch_send_data(link_t *lk, channel_t *c, const uint8_t *buf, size_t n) {
+static void ch_send_data(channel_t *c, const uint8_t *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
         size_t chunk = n - off;
         if (chunk > PIK_SERIALMUX_MAX_PAYLOAD) chunk = PIK_SERIALMUX_MAX_PAYLOAD;
-        enqueue_frame(lk, PIK_SERIALMUX_FRAME_DATA, c->ch_id, buf + off, chunk);
+        pik_link_enqueue(&g_link, PIK_SERIALMUX_FRAME_DATA, c->ch_id, buf + off, chunk);
         off += chunk;
     }
 }
 
-static bool ch_link_full(channel_t *c, link_t *lk) {
-    if (link_can_queue_frame(lk, PIK_SERIALMUX_MAX_PAYLOAD)) return false;
-    lk->paused = true;
+static bool ch_link_full(channel_t *c) {
+    if (pik_link_can_queue(&g_link, PIK_SERIALMUX_MAX_PAYLOAD)) return false;
+    g_link_paused = true;
     chan_pause(c);
     return true;
 }
 
-static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
-    if (ch_link_full(c, lk)) return;
+static void mcu_on_readable(channel_t *c, int64_t now) {
+    if (ch_link_full(c)) return;
 
     static uint8_t buf[PIK_SERIALMUX_MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
@@ -421,13 +188,13 @@ static void mcu_on_readable(channel_t *c, link_t *lk, int64_t now) {
             if (buf[i] != 0x7E) continue;
             c->mcu_state = MCU_ACTIVE;
             LOG("ch%u MCU active", c->ch_id);
-            enqueue_frame(lk, PIK_SERIALMUX_FRAME_READY, c->ch_id, NULL, 0);
-            ch_send_data(lk, c, buf + i, (size_t)(n - i));
+            pik_link_enqueue(&g_link, PIK_SERIALMUX_FRAME_READY, c->ch_id, NULL, 0);
+            ch_send_data(c, buf + i, (size_t)(n - i));
             return;
         }
         break;
     case MCU_ACTIVE:
-        ch_send_data(lk, c, buf, (size_t)n);
+        ch_send_data(c, buf, (size_t)n);
         break;
     }
 }
@@ -459,15 +226,15 @@ static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, siz
     return true;
 }
 
-static void mcu_tick(channel_t *c, link_t *lk, int64_t now) {
+static void mcu_tick(channel_t *c, int64_t now) {
     if (c->fd < 0) {
-        mcu_open(c, lk, now);
+        mcu_open(c, now);
         return;
     }
     if (c->mcu_state == MCU_ACTIVE && (now - c->last_byte_ms) > RESET_SILENCE_MS) {
         LOG("ch%u MCU silence timeout, resetting", c->ch_id);
         c->mcu_state = MCU_RESETTING;
-        enqueue_frame(lk, PIK_SERIALMUX_FRAME_FLUSH, c->ch_id, NULL, 0);
+        pik_link_enqueue(&g_link, PIK_SERIALMUX_FRAME_FLUSH, c->ch_id, NULL, 0);
     }
 }
 
@@ -507,8 +274,8 @@ static void pty_close(channel_t *c) {
     LOG("ch%u PTY closed", c->ch_id);
 }
 
-static void pty_on_readable(channel_t *c, link_t *lk) {
-    if (ch_link_full(c, lk)) return;
+static void pty_on_readable(channel_t *c) {
+    if (ch_link_full(c)) return;
 
     static uint8_t buf[PIK_SERIALMUX_MAX_PAYLOAD];
     ssize_t n = read(c->fd, buf, sizeof(buf));
@@ -517,7 +284,7 @@ static void pty_on_readable(channel_t *c, link_t *lk) {
         pty_close(c);
         return;
     }
-    ch_send_data(lk, c, buf, (size_t)n);
+    ch_send_data(c, buf, (size_t)n);
 }
 
 static bool pty_on_writable(channel_t *c) {
@@ -559,9 +326,9 @@ static channel_t *find_channel(uint8_t ch_id) {
     return NULL;
 }
 
-static void ch_on_readable(channel_t *c, link_t *lk, int64_t now) {
-    if (c->type == CH_MCU) mcu_on_readable(c, lk, now);
-    else                    pty_on_readable(c, lk);
+static void ch_on_readable(channel_t *c, int64_t now) {
+    if (c->type == CH_MCU) mcu_on_readable(c, now);
+    else                    pty_on_readable(c);
 }
 
 static bool ch_on_writable(channel_t *c) {
@@ -569,8 +336,8 @@ static bool ch_on_writable(channel_t *c) {
     return pty_on_writable(c);
 }
 
-static void ch_tick(channel_t *c, link_t *lk, int64_t now) {
-    if (c->type == CH_MCU) mcu_tick(c, lk, now);
+static void ch_tick(channel_t *c, int64_t now) {
+    if (c->type == CH_MCU) mcu_tick(c, now);
 }
 
 static int64_t ch_deadline(const channel_t *c, int64_t now) {
@@ -578,250 +345,48 @@ static int64_t ch_deadline(const channel_t *c, int64_t now) {
     return INT64_MAX;
 }
 
-// ── frame dispatch ────────────────────────────────────────────────────────────
-static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
-    static uint8_t dec[FRAME_DEC_MAX];
-    pik_frame_t frame;
-    g_rx_frames++;
-
-    pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             PIK_SERIALMUX_FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
-    if (st != PIK_FRAME_OK) {
-        link_fail_frame(lk, pik_frame_status_text(st), enc, enc_len);
-        return;
-    }
-
-    uint8_t        type    = frame.header[0];
-    uint8_t        ch_id   = frame.header[1];
-    uint32_t       session = pik_get_u32le(frame.header + 2);
-    uint16_t       seq     = (uint16_t)frame.header[6] | (uint16_t)frame.header[7] << 8;
-    size_t         plen    = frame.payload_len;
-    const uint8_t *payload = frame.payload;
-
-    if (session == 0) {
-        LOG("link failure: zero session type=0x%02x ch=%u", type, ch_id);
-        link_close(lk);
-        return;
-    }
-
-    if (type == PIK_SERIALMUX_FRAME_NAK) {
-        /* Link-control: not sequenced, so it remains processable while the
-         * peer's inbound stream has a gap. Ignore unless it is provably from
-         * the live peer session. */
-        if (lk->rx_session == 0 || session != lk->rx_session) return;
-        if (plen != 2) {
-            LOG("link failure: bad NAK len=%zu", plen);
-            link_close(lk);
-            return;
-        }
-        handle_nak(lk, payload);
-        return;
-    }
-
-    if (lk->rx_session == 0) {
-        if (seq != 0) {
-            /* Stale in-flight frames from the peer's previous session are
-             * expected physics of an unsynchronized restart: discard them
-             * for a bounded window instead of failing the fresh link. */
-            if (g_now_ms - lk->opened_ms <= STALE_GRACE_MS) {
-                if (!lk->stale_discards)
-                    LOG("discarding stale bring-up frames (session=0x%08x seq=%u type=0x%02x ch=%u)",
-                        session, seq, type, ch_id);
-                lk->stale_discards++;
-                return;
-            }
-            LOG("link failure: stale frames past bring-up grace seq=%u type=0x%02x ch=%u discarded=%u",
-                seq, type, ch_id, lk->stale_discards);
-            link_close(lk);
-            return;
-        }
-        lk->rx_session = session;
-        lk->rx_seq = 1;
-        if (lk->stale_discards)
-            LOG("bring-up synchronized, discarded %u stale frames", lk->stale_discards);
-    } else {
-        if (session != lk->rx_session) {
-            LOG("link failure: session changed old=0x%08x new=0x%08x type=0x%02x ch=%u",
-                lk->rx_session, session, type, ch_id);
-            link_close(lk);
-            return;
-        }
-        int16_t d = (int16_t)(seq - lk->rx_seq);
-        if (d < 0) {
-            /* duplicate from retransmission overlap; already delivered */
-            lk->dup_discards++;
-            return;
-        }
-        if (d > 0) {
-            if (!lk->gap_since_ms) {
-                lk->gap_since_ms = g_now_ms;
-                lk->gap_discards = 0;
-                LOG("seq gap session=0x%08x seq=%u expected=%u type=0x%02x ch=%u, requesting retransmit",
-                    session, seq, lk->rx_seq, type, ch_id);
-                send_nak(lk, g_now_ms);
-            }
-            lk->gap_discards++;
-            return;
-        }
-        lk->rx_seq++;
-        if (lk->gap_since_ms) {
-            LOG("retransmit healed: seq=%u latency=%lldms discarded=%u dups=%u",
-                seq, (long long)(g_now_ms - lk->gap_since_ms),
-                lk->gap_discards, lk->dup_discards);
-            lk->gap_since_ms = 0;
-            lk->gap_discards = 0;
-            lk->dup_discards = 0;
-        }
-    }
-
+// ── link callbacks ────────────────────────────────────────────────────────────
+static bool mux_on_frame(void *ctx, uint8_t type, uint8_t ch_id,
+                         const uint8_t *payload, size_t plen) {
+    (void)ctx;
     channel_t *c = find_channel(ch_id);
     if (!c) {
         LOG("link failure: unknown channel id=%u type=0x%02x", ch_id, type);
-        link_close(lk);
-        return;
-    }
-
-    bool ok = (c->type == CH_MCU) ? mcu_on_frame(c, type, payload, plen)
-                                  : pty_on_frame(c, type, payload, plen);
-    if (!ok)
-        link_close(lk);
-}
-
-static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len) {
-    dispatch_frame((link_t *)ctx, enc, enc_len);
-    return !g_session_failed;
-}
-
-// ── link management ───────────────────────────────────────────────────────────
-static void link_close(link_t *lk) {
-    g_session_failed = true;
-    if (lk->fd >= 0) {
-        LOG("link stats: rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu "
-            "tx_writes=%llu tx_bytes=%llu rx_seq=%u tx_seq=%u",
-            (unsigned long long)g_rx_frames, (unsigned long long)g_tx_frames,
-            (unsigned long long)g_rx_reads, (unsigned long long)g_rx_bytes,
-            (unsigned long long)g_tx_writes, (unsigned long long)g_tx_bytes,
-            lk->rx_seq, lk->tx_seq);
-        pik_epoll_del(g_epfd, lk->fd);
-        close(lk->fd);
-        lk->fd = -1;
-        lk->epev = 0;
-    }
-    if (lk->up) {
-        lk->up = false;
-        LOG("link down");
-        for (int i = 0; i < g_n_chans; i++) {
-            channel_t *c = &g_chans[i];
-            if (c->type == CH_PTY) pty_close(c);
-        }
-    }
-}
-
-static bool link_open(link_t *lk, const char *dev) {
-    lk->fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (lk->fd < 0) {
-        LOG("link open %s: %s", dev, strerror(errno));
-        g_session_failed = true;
         return false;
     }
+    return (c->type == CH_MCU) ? mcu_on_frame(c, type, payload, plen)
+                               : pty_on_frame(c, type, payload, plen);
+}
 
-    if (tty_set_byte_raw(lk->fd) < 0) {
-        LOG("termios setup failed on %s: %s", dev, strerror(errno));
-        close(lk->fd);
-        lk->fd = -1;
-        g_session_failed = true;
-        return false;
-    }
-    if (tty_flush_io(lk->fd) < 0) {
-        LOG("termios flush failed on %s: %s", dev, strerror(errno));
-        close(lk->fd);
-        lk->fd = -1;
-        g_session_failed = true;
-        return false;
-    }
-
-    lk->rxbuf_len = 0;
-    lk->tx_head = lk->tx_tail = 0;
-    if (!lk->tx_session)
-        lk->tx_session = pik_session_id(0);
-    lk->rx_session = 0;
-    lk->tx_seq = lk->rx_seq = 0;
-    lk->hist_first = lk->hist_count = 0;
-    lk->hist_head = lk->hist_tail = 0;
-    lk->last_resend_ms = 0;
-    lk->gap_since_ms = 0;
-    lk->last_nak_ms = 0;
-    lk->gap_discards = lk->dup_discards = 0;
-    lk->opened_ms = g_now_ms;
-    lk->stale_discards = 0;
-    lk->up   = true;
-    lk->epev = EPOLLIN;
-    pik_epoll_set(g_epfd, lk->fd, EPOLLIN, lk);
-
-    LOG("link opened: %s", dev);
-    LOG("link up");
+static void mux_on_down(void *ctx) {
+    (void)ctx;
+    LOG("link down");
     for (int i = 0; i < g_n_chans; i++) {
         channel_t *c = &g_chans[i];
-        if (c->type == CH_MCU) mcu_on_link_up(c, lk);
-    }
-    return true;
-}
-
-static void link_on_readable(link_t *lk) {
-    size_t space = sizeof(lk->rxbuf) - lk->rxbuf_len;
-    if (!space) {
-        LOG("link RX overflow");
-        link_close(lk);
-        return;
-    }
-
-    ssize_t n = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
-    if (n <= 0) {
-        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
-        LOG("link read: %s", n == 0 ? "EOF" : strerror(errno));
-        link_close(lk);
-        return;
-    }
-    g_rx_reads++;
-    g_rx_bytes += (uint64_t)n;
-    lk->rxbuf_len += (size_t)n;
-    if (!link_parse_rx(lk)) return;
-}
-
-static void link_on_writable(link_t *lk) {
-    lk_drain(lk);
-    if (lk->paused && lk_avail(lk) < LINK_LOW_WATER) {
-        lk->paused = false;
-        for (int i = 0; i < g_n_chans; i++)
-            chan_resume(&g_chans[i]);
-    }
-}
-
-static void link_tick(link_t *lk, int64_t now) {
-    if (lk->fd < 0) return;
-    if (!lk->paused && lk_avail(lk) > LINK_HIGH_WATER) {
-        lk->paused = true;
-        for (int i = 0; i < g_n_chans; i++)
-            chan_pause(&g_chans[i]);
-    }
-    if (lk->up && lk->gap_since_ms) {
-        if (now - lk->gap_since_ms > GAP_BUDGET_MS) {
-            LOG("link failure: seq gap not healed expected=%u after %dms discarded=%u",
-                lk->rx_seq, GAP_BUDGET_MS, lk->gap_discards);
-            link_close(lk);
-            return;
-        }
-        if (now - lk->last_nak_ms >= NAK_RETRY_MS)
-            send_nak(lk, now);
+        if (c->type == CH_PTY) pty_close(c);
     }
 }
 
 // ── component API ─────────────────────────────────────────────────────────────
 void serialmux_init(const serialmux_config_t *cfg, int epfd) {
     g_epfd = epfd;
-    g_session_failed = false;
-    memset(&g_link, 0, sizeof(g_link));
-    g_link.fd = -1;
+    g_link_paused = false;
+
+    pik_link_cfg_t lcfg = {
+        .name        = "mux",
+        .nak_type    = PIK_SERIALMUX_FRAME_NAK,
+        .has_aux     = true,
+        .first_type  = 0,   /* first frame must carry seq 0 */
+        .max_payload = PIK_SERIALMUX_MAX_PAYLOAD,
+        .txbuf       = s_link_tx,       .tx_cap     = LINK_RING_CAP,
+        .rxbuf       = s_link_rx,       .rx_cap     = sizeof(s_link_rx),
+        .hist        = s_link_hist,     .hist_cap   = HIST_CAP,
+        .hist_ent    = s_link_hist_ent, .hist_slots = HIST_SLOTS,
+        .on_frame    = mux_on_frame,
+        .on_down     = mux_on_down,
+        .ctx         = NULL,
+    };
+    pik_link_init(&g_link, &lcfg, epfd);
 
     g_n_chans = cfg->n_channels;
     for (int i = 0; i < g_n_chans; i++) {
@@ -843,11 +408,7 @@ void serialmux_init(const serialmux_config_t *cfg, int epfd) {
 }
 
 bool serialmux_start(const char *link_dev, int64_t now) {
-    g_now_ms = now;
-    memset(&g_link, 0, sizeof(g_link));
-    g_link.fd = -1;
-    g_link.tx_session = pik_session_id(now);
-    g_session_failed = false;
+    g_link_paused = false;
     for (int i = 0; i < g_n_chans; i++) {
         channel_t *c = &g_chans[i];
         c->paused = false;
@@ -858,21 +419,33 @@ bool serialmux_start(const char *link_dev, int64_t now) {
             c->last_byte_ms = now;
         }
     }
-    return link_open(&g_link, link_dev);
+    if (!pik_link_open(&g_link, link_dev, now))
+        return false;
+    LOG("link up");
+    for (int i = 0; i < g_n_chans; i++) {
+        channel_t *c = &g_chans[i];
+        if (c->type == CH_MCU) mcu_on_link_up(c);
+    }
+    return true;
+}
+
+static void resume_channels_if_drained(void) {
+    if (g_link_paused && pik_link_tx_avail(&g_link) < LINK_LOW_WATER) {
+        g_link_paused = false;
+        for (int i = 0; i < g_n_chans; i++)
+            chan_resume(&g_chans[i]);
+    }
 }
 
 bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
-    g_now_ms = now;
-    if (g_session_failed) return false;
-    if (ptr == &g_link) {
-        if (events & (EPOLLERR | EPOLLHUP)) {
-            link_close(&g_link);
+    if (g_link.failed) return false;
+    if (pik_link_owns_event(&g_link, ptr)) {
+        if (!pik_link_dispatch(&g_link, events, now))
             return false;
-        }
-        if (events & EPOLLIN) link_on_readable(&g_link);
-        if (!g_session_failed && (events & EPOLLOUT)) link_on_writable(&g_link);
-        return !g_session_failed;
+        resume_channels_if_drained();
+        return true;
     }
+    g_link.now_ms = now;
 
     channel_t *c = (channel_t *)ptr;
     if (events & (EPOLLERR | EPOLLHUP)) {
@@ -882,21 +455,27 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
         c->epev = 0;
         return true;
     }
-    if (events & EPOLLIN) ch_on_readable(c, &g_link, now);
-    if (!g_session_failed && (events & EPOLLOUT) && !ch_on_writable(c)) {
-        link_close(&g_link);
+    if (events & EPOLLIN) ch_on_readable(c, now);
+    if (!g_link.failed && (events & EPOLLOUT) && !ch_on_writable(c)) {
+        pik_link_fail(&g_link);
         return false;
     }
-    return !g_session_failed;
+    return !g_link.failed;
 }
 
 bool serialmux_tick(int64_t now) {
-    g_now_ms = now;
-    if (g_session_failed) return false;
-    link_tick(&g_link, now);
-    for (int i = 0; i < g_n_chans && !g_session_failed; i++)
-        ch_tick(&g_chans[i], &g_link, now);
-    return !g_session_failed;
+    if (g_link.failed) return false;
+    if (!g_link_paused && pik_link_tx_avail(&g_link) > LINK_HIGH_WATER) {
+        g_link_paused = true;
+        for (int i = 0; i < g_n_chans; i++)
+            chan_pause(&g_chans[i]);
+    }
+    if (!pik_link_tick(&g_link, now))
+        return false;
+    resume_channels_if_drained();
+    for (int i = 0; i < g_n_chans && !g_link.failed; i++)
+        ch_tick(&g_chans[i], now);
+    return !g_link.failed;
 }
 
 int64_t serialmux_deadline(int64_t now) {
@@ -905,26 +484,14 @@ int64_t serialmux_deadline(int64_t now) {
         int64_t cd = ch_deadline(&g_chans[i], now);
         if (cd < dl) dl = cd;
     }
-    if (g_link.up && g_link.gap_since_ms) {
-        int64_t a = g_link.gap_since_ms + GAP_BUDGET_MS;
-        int64_t b = g_link.last_nak_ms + NAK_RETRY_MS;
-        if (a < dl) dl = a;
-        if (b < dl) dl = b;
-    }
+    int64_t ld = pik_link_deadline(&g_link);
+    if (ld < dl) dl = ld;
     return dl;
 }
 
 void serialmux_cleanup(void) {
-    if (g_link.fd >= 0) {
-        pik_epoll_del(g_epfd, g_link.fd);
-        close(g_link.fd);
-        g_link.fd = -1;
-        g_link.epev = 0;
-    }
-    g_link.up = false;
-    g_link.paused = false;
-    g_link.tx_head = g_link.tx_tail = 0;
-    g_link.rxbuf_len = 0;
+    pik_link_cleanup(&g_link);
+    g_link_paused = false;
 
     for (int i = 0; i < g_n_chans; i++) {
         channel_t *c = &g_chans[i];
@@ -943,5 +510,4 @@ void serialmux_cleanup(void) {
         c->epev = 0;
         c->tx_head = c->tx_tail = 0;
     }
-    g_session_failed = false;
 }

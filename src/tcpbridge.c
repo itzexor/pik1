@@ -1,20 +1,19 @@
 // src/tcpbridge.c — multi-connection TCP-over-serial bridge
 // Wire protocol: COBS + CRC32, frame layout:
 //   [type:1][conn_id:1][session_le:4][seq_le:2][payload][crc32_le:4]
-// Session and sequencing are detection-only: any generation change or frame gap
-// is treated as link failure.
+// Sessions, sequencing, bring-up grace, and bounded link-layer retransmission
+// are handled by the shared link module (src/link.c); see FAILURE_MODEL.md,
+// "Documented Exceptions".
 // Runs on ttyGS2 (K1C) / ttyACM2 (Pi).
 
 #include "nanocobs/cobs.h"
 #include "fd.h"
-#include "frame.h"
+#include "link.h"
 #include "logging.h"
 #include "tcpbridge_proto.h"
-#include "tty.h"
 #include "util.h"
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -39,13 +38,16 @@
 #define CONN_HIGH_WATER   (64u  * 1024u)
 #define CONN_LOW_WATER    (16u  * 1024u)
 
-#define LINK_TXQ_CAP      64u                     // ~128 KB of encoded frames
+#define LINK_TX_CAP       (1u << 17)             // 128 KB encoded TX ring
 #define LINK_TX_HIGH      (32u  * 1024u)
 #define LINK_TX_LOW       (8u   * 1024u)
-#define LINK_RX_CAP       (1u << 17)              // 128 KB serial RX staging
+#define LINK_RX_CAP       (1u << 17)             // 128 KB serial RX staging
 #define LINK_WRITE_BUDGET 4096u
 #define LINK_TX_RATE_BPS  6000000u
 #define LINK_TX_BURST     4096u
+
+#define HIST_CAP          (1u << 18)             // retransmit history ring
+#define HIST_SLOTS        512u
 
 #define RECONNECT_MIN     500
 #define RECONNECT_MAX     8000
@@ -62,57 +64,27 @@ typedef struct {
     bool     pause_sent;   // we sent PAUSE
 } conn_t;
 
-typedef struct {
-    uint8_t  enc[FRAME_ENC_MAX + 1];
-    size_t   len;
-    size_t   pos;
-} tx_frame_t;
-
-typedef struct {
-    int      fd;
-    bool     up;
-    bool     paused;
-    uint32_t epev;
-
-    tx_frame_t txq[LINK_TXQ_CAP];
-    uint32_t   tx_head, tx_tail, tx_count;
-    uint32_t   tx_bytes;
-    uint32_t   tx_tokens;
-    int64_t    tx_token_ms;
-
-    uint8_t  rxbuf[LINK_RX_CAP];
-    size_t   rxbuf_len;
-
-    uint32_t tx_session;
-    uint32_t rx_session;
-    uint16_t tx_seq;
-    uint16_t rx_seq;
-
-    int64_t  reconnect_at;
-    int      backoff_ms;
-    char     dev[128];
-} link_t;
-
 // ── globals ───────────────────────────────────────────────────────────────────
-static conn_t g_conns[MAX_CONNS];
-static link_t g_link;
-static int    g_listen_fd = -1;
-static int    g_epfd      = -1;
-static bool   g_is_listener;
-static char   g_fwd_host[64];
-static int    g_fwd_port;
-static int    g_status_fd = -1;
-static bool   g_status_up;
+static conn_t     g_conns[MAX_CONNS];
+static pik_link_t g_link;
+static bool       g_conns_paused;   /* link TX high-water pause of all conns */
+static int64_t    g_reconnect_at;
+static int        g_backoff_ms;
+static char       g_dev[128];
+static int        g_listen_fd = -1;
+static int        g_epfd      = -1;
+static bool       g_is_listener;
+static char       g_fwd_host[64];
+static int        g_fwd_port;
+static int        g_status_fd = -1;
+static bool       g_status_up;
 
-static int g_link_tag;
 static int g_listen_tag;
 
-static uint64_t g_rx_frames;
-static uint64_t g_tx_frames;
-static uint64_t g_rx_reads;
-static uint64_t g_rx_bytes;
-static uint64_t g_tx_writes;
-static uint64_t g_tx_bytes;
+static uint8_t             s_link_tx[LINK_TX_CAP];
+static uint8_t             s_link_rx[LINK_RX_CAP];
+static uint8_t             s_link_hist[HIST_CAP];
+static pik_link_hist_ent_t s_link_hist_ent[HIST_SLOTS];
 
 // ── logging ───────────────────────────────────────────────────────────────────
 #define LOG(...) pik_log("tcp", __VA_ARGS__)
@@ -132,12 +104,6 @@ static void status_notify(bool up) {
     }
     g_status_up = up;
 }
-
-// ── forward decls ─────────────────────────────────────────────────────────────
-static void link_close(int64_t now);
-static bool enqueue_frame(uint8_t type, uint8_t conn_id,
-                          const uint8_t *payload, size_t plen);
-static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len);
 
 // ── connection ring helpers ───────────────────────────────────────────────────
 static uint32_t conn_avail(const conn_t *c) { return c->tx_tail - c->tx_head; }
@@ -176,8 +142,8 @@ static void conn_epoll_update(conn_t *c) {
 
 // ── flow control ──────────────────────────────────────────────────────────────
 static void pause_all_conns(void) {
-    if (g_link.paused) return;
-    g_link.paused = true;
+    if (g_conns_paused) return;
+    g_conns_paused = true;
     for (int i = 0; i < MAX_CONNS; i++) {
         if (g_conns[i].fd < 0 || g_conns[i].paused) continue;
         g_conns[i].paused = true;
@@ -186,8 +152,8 @@ static void pause_all_conns(void) {
 }
 
 static void resume_all_conns(void) {
-    if (!g_link.paused) return;
-    g_link.paused = false;
+    if (!g_conns_paused) return;
+    g_conns_paused = false;
     for (int i = 0; i < MAX_CONNS; i++) {
         if (g_conns[i].fd < 0 || !g_conns[i].paused) continue;
         g_conns[i].paused = false;
@@ -195,112 +161,10 @@ static void resume_all_conns(void) {
     }
 }
 
-static void lk_refill_tokens(int64_t now) {
-    link_t *lk = &g_link;
-    if (!lk->tx_token_ms) lk->tx_token_ms = now;
-    int64_t elapsed = now - lk->tx_token_ms;
-    if (elapsed <= 0) return;
-    uint64_t add = (uint64_t)elapsed * LINK_TX_RATE_BPS / 1000u;
-    if (!add) return;
-    uint64_t tokens = (uint64_t)lk->tx_tokens + add;
-    lk->tx_tokens = tokens > LINK_TX_BURST ? LINK_TX_BURST : (uint32_t)tokens;
-    lk->tx_token_ms = now;
-}
-
-static void lk_update_epoll(void) {
-    link_t *lk = &g_link;
-    if (lk->fd < 0) return;
-    uint32_t want = EPOLLIN | ((lk->tx_count && lk->tx_tokens) ? EPOLLOUT : 0u);
-    if (want != lk->epev) {
-        lk->epev = want;
-        pik_epoll_set(g_epfd, lk->fd, want, &g_link_tag);
-    }
-}
-
-static bool lk_queue_encoded(const uint8_t *enc, size_t enc_len) {
-    link_t *lk = &g_link;
-    if (lk->tx_count >= LINK_TXQ_CAP) return false;
-    tx_frame_t *f = &lk->txq[lk->tx_tail];
-    memcpy(f->enc, enc, enc_len);
-    f->len = enc_len;
-    f->pos = 0;
-    lk->tx_tail = (lk->tx_tail + 1u) % LINK_TXQ_CAP;
-    lk->tx_count++;
-    lk->tx_bytes += (uint32_t)enc_len;
-    g_tx_frames++;
-    lk_update_epoll();
-    return true;
-}
-
-static void lk_drain(int64_t now) {
-    link_t *lk = &g_link;
-    lk_refill_tokens(now);
-
-    uint32_t budget = LINK_WRITE_BUDGET;
-    if (budget > lk->tx_tokens) budget = lk->tx_tokens;
-
-    while (lk->tx_count && budget) {
-        tx_frame_t *f = &lk->txq[lk->tx_head];
-        size_t n = f->len - f->pos;
-        if (n > budget) n = budget;
-        ssize_t w = write(lk->fd, f->enc + f->pos, n);
-        if (w <= 0) {
-            if (w < 0 && errno != EAGAIN && errno != EINTR) {
-                LOG("link write: %s", strerror(errno));
-                link_close(now);
-            }
-            break;
-        }
-        f->pos += (size_t)w;
-        lk->tx_tokens -= (uint32_t)w;
-        budget -= (uint32_t)w;
-        g_tx_writes++;
-        g_tx_bytes += (uint64_t)w;
-
-        if (f->pos == f->len) {
-            lk->tx_bytes -= (uint32_t)f->len;
-            lk->tx_head = (lk->tx_head + 1u) % LINK_TXQ_CAP;
-            lk->tx_count--;
-        }
-    }
-    lk_update_epoll();
-}
-
-// ── frame encode / enqueue ────────────────────────────────────────────────────
+// ── frame enqueue ─────────────────────────────────────────────────────────────
 static bool enqueue_frame(uint8_t type, uint8_t conn_id,
                           const uint8_t *payload, size_t plen) {
-    link_t *lk = &g_link;
-    if (plen > PIK_TCPBRIDGE_MAX_PAYLOAD) {
-        LOG("oversized frame type=0x%02x conn=%u plen=%zu", type, conn_id, plen);
-        link_close(pik_now_ms());
-        return false;
-    }
-    if (!lk->up) return false;
-
-    static uint8_t dec[FRAME_DEC_MAX];
-    static uint8_t enc[FRAME_ENC_MAX + 1];
-    uint8_t header[PIK_TCPBRIDGE_FRAME_HEADER_LEN];
-
-    header[0] = type;
-    header[1] = conn_id;
-    pik_put_u32le(header + 2, lk->tx_session);
-    header[6] = (uint8_t)lk->tx_seq;
-    header[7] = (uint8_t)(lk->tx_seq >> 8);
-
-    size_t enc_len = 0;
-    if (pik_frame_encode(header, sizeof(header), payload, plen,
-                         dec, sizeof(dec), enc, sizeof(enc), &enc_len) != PIK_FRAME_OK) {
-        LOG("encode failed type=0x%02x", type);
-        link_close(pik_now_ms());
-        return false;
-    }
-    if (!lk_queue_encoded(enc, enc_len)) {
-        LOG("link TX frame queue full, closing before dropping type=0x%02x", type);
-        link_close(pik_now_ms());
-        return false;
-    }
-    lk->tx_seq++;
-    return true;
+    return pik_link_enqueue(&g_link, type, conn_id, payload, plen);
 }
 
 // ── connection close ──────────────────────────────────────────────────────────
@@ -322,31 +186,6 @@ static void conn_close(int id, bool send_close) {
 static void close_all_conns(bool send_close) {
     for (int i = 0; i < MAX_CONNS; i++)
         if (g_conns[i].fd >= 0) conn_close(i, send_close);
-}
-
-// ── fatal link corruption diagnostics ─────────────────────────────────────────
-static void link_fail_frame(const char *reason, const uint8_t *enc, size_t enc_len,
-                            int64_t now) {
-    LOG("link failure: %s enc_len=%zu first=0x%02x rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu tx_writes=%llu tx_bytes=%llu",
-        reason, enc_len, enc_len ? enc[0] : 0,
-        (unsigned long long)g_rx_frames,
-        (unsigned long long)g_tx_frames,
-        (unsigned long long)g_rx_reads,
-        (unsigned long long)g_rx_bytes,
-        (unsigned long long)g_tx_writes,
-        (unsigned long long)g_tx_bytes);
-    pik_log_bad_frame_sample("tcp", enc, enc_len);
-    link_close(now);
-}
-
-static void link_fail_text(const char *reason, int64_t now) {
-    LOG("link failure: %s rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu",
-        reason,
-        (unsigned long long)g_rx_frames,
-        (unsigned long long)g_tx_frames,
-        (unsigned long long)g_rx_reads,
-        (unsigned long long)g_rx_bytes);
-    link_close(now);
 }
 
 // ── TCP connect (Pi forwarder mode) ───────────────────────────────────────────
@@ -373,67 +212,23 @@ static int tcp_connect_to_target(void) {
     return fd;
 }
 
-// ── frame dispatch ────────────────────────────────────────────────────────────
-static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
-    static uint8_t dec[FRAME_DEC_MAX];
-    pik_frame_t frame;
-    g_rx_frames++;
-
-    pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
-                                             PIK_TCPBRIDGE_FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
-    if (st != PIK_FRAME_OK) {
-        link_fail_frame(pik_frame_status_text(st), enc, enc_len, now);
-        return false;
-    }
-
-    uint8_t        type    = frame.header[0];
-    uint8_t        id      = frame.header[1];
-    uint32_t       session = pik_get_u32le(frame.header + 2);
-    uint16_t       seq     = (uint16_t)frame.header[6] | (uint16_t)frame.header[7] << 8;
-    size_t         plen    = frame.payload_len;
-    const uint8_t *payload = frame.payload;
-
-    if (session == 0) {
-        LOG("link failure: zero session type=0x%02x conn=%u", type, id);
-        link_close(now);
-        return false;
-    }
-    if (g_link.rx_session == 0) {
-        if (seq != 0) {
-            LOG("link failure: first frame seq=%u type=0x%02x conn=%u",
-                seq, type, id);
-            link_close(now);
-            return false;
-        }
-        g_link.rx_session = session;
-        g_link.rx_seq = 1;
-    } else if (session != g_link.rx_session) {
-        LOG("link failure: session changed old=0x%08x new=0x%08x type=0x%02x conn=%u",
-            g_link.rx_session, session, type, id);
-        link_close(now);
-        return false;
-    } else {
-        if (seq != g_link.rx_seq) {
-            LOG("link failure: seq gap type=0x%02x seq=%u expected=%u",
-                type, seq, g_link.rx_seq);
-            link_close(now);
-            return false;
-        }
-        g_link.rx_seq++;
-    }
+// ── frame handling ────────────────────────────────────────────────────────────
+static bool bridge_on_frame(void *ctx, uint8_t type, uint8_t id,
+                            const uint8_t *payload, size_t plen) {
+    (void)ctx;
 
     switch (type) {
     case PIK_TCPBRIDGE_FRAME_OPEN:
         if (g_is_listener) {
-            link_fail_text("received OPEN while in listener mode", now);
+            LOG("link failure: received OPEN while in listener mode");
             return false;
         }
         if (id >= MAX_CONNS) {
-            link_fail_text("OPEN with invalid connection id", now);
+            LOG("link failure: OPEN with invalid connection id");
             return false;
         }
         if (g_conns[id].fd >= 0) {
-            link_fail_text("duplicate OPEN for active connection", now);
+            LOG("link failure: duplicate OPEN for active connection");
             return false;
         }
         {
@@ -445,7 +240,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
             }
             g_conns[id].fd = fd;
             g_conns[id].epev = 0;
-            g_conns[id].paused = g_link.paused;
+            g_conns[id].paused = g_conns_paused;
             g_conns[id].flow_paused = false;
             g_conns[id].pause_sent = false;
             conn_epoll_update(&g_conns[id]);
@@ -454,7 +249,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
 
     case PIK_TCPBRIDGE_FRAME_DATA:
         if (id >= MAX_CONNS) {
-            link_fail_text("DATA with invalid connection id", now);
+            LOG("link failure: DATA with invalid connection id");
             return false;
         }
         if (g_conns[id].fd < 0) {
@@ -464,11 +259,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         if (!plen) return true;
         conn_drain(&g_conns[id]);
         if (conn_space(&g_conns[id]) < plen) {
-            if (!g_conns[id].pause_sent && enqueue_frame(PIK_TCPBRIDGE_FRAME_PAUSE, id, NULL, 0))
-                g_conns[id].pause_sent = true;
-            if (!g_conns[id].pause_sent)
-                return false;
-            link_fail_text("conn output buffer overflow despite PAUSE", now);
+            LOG("link failure: conn output buffer overflow despite PAUSE");
             return false;
         }
         conn_push(&g_conns[id], payload, plen);
@@ -491,7 +282,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
 
     case PIK_TCPBRIDGE_FRAME_CLOSE:
         if (id >= MAX_CONNS) {
-            link_fail_text("CLOSE with invalid connection id", now);
+            LOG("link failure: CLOSE with invalid connection id");
             return false;
         }
         if (g_conns[id].fd < 0) {
@@ -503,7 +294,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
 
     case PIK_TCPBRIDGE_FRAME_PAUSE:
         if (id >= MAX_CONNS) {
-            link_fail_text("PAUSE with invalid connection id", now);
+            LOG("link failure: PAUSE with invalid connection id");
             return false;
         }
         if (g_conns[id].fd < 0) {
@@ -516,7 +307,7 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
 
     case PIK_TCPBRIDGE_FRAME_RESUME:
         if (id >= MAX_CONNS) {
-            link_fail_text("RESUME with invalid connection id", now);
+            LOG("link failure: RESUME with invalid connection id");
             return false;
         }
         if (g_conns[id].fd < 0) {
@@ -528,132 +319,32 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len, int64_t now) {
         return true;
 
     default:
-        link_fail_text("unknown frame type", now);
+        LOG("link failure: unknown frame type 0x%02x", type);
         return false;
     }
-}
-
-// ── link RX ───────────────────────────────────────────────────────────────────
-static bool link_parse_rx(int64_t now) {
-    link_t *lk = &g_link;
-    pik_frame_status_t st = pik_frame_rx_consume(lk->rxbuf, &lk->rxbuf_len,
-                                                 sizeof(lk->rxbuf),
-                                                 dispatch_rx_frame, &now);
-    if (st == PIK_FRAME_CALLBACK_FAILED)
-        return false;
-    if (st == PIK_FRAME_RX_OVERFLOW) {
-        link_fail_text("RX buffer full without delimiter", now);
-        return false;
-    }
-    return true;
-}
-
-static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len) {
-    int64_t now = *(int64_t *)ctx;
-    return dispatch_frame(enc, enc_len, now);
-}
-
-static bool link_read_available(int64_t now) {
-    link_t *lk = &g_link;
-    while (lk->fd >= 0) {
-        size_t space = sizeof(lk->rxbuf) - lk->rxbuf_len;
-        if (!space) {
-            if (!link_parse_rx(now)) return false;
-            space = sizeof(lk->rxbuf) - lk->rxbuf_len;
-            if (!space) {
-                link_fail_text("RX buffer full before read", now);
-                return false;
-            }
-        }
-
-        ssize_t r = read(lk->fd, lk->rxbuf + lk->rxbuf_len, space);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN) return true;
-            link_close(now);
-            return false;
-        }
-        if (r == 0) {
-            LOG("link read: EOF");
-            link_close(now);
-            return false;
-        }
-
-        g_rx_reads++;
-        g_rx_bytes += (uint64_t)r;
-        lk->rxbuf_len += (size_t)r;
-        if (!link_parse_rx(now)) return false;
-        if (lk->tx_count) lk_drain(now);
-    }
-    return false;
 }
 
 // ── link open/close ───────────────────────────────────────────────────────────
-static void link_close(int64_t now) {
-    link_t *lk = &g_link;
-    if (lk->fd >= 0) {
-        pik_epoll_del(g_epfd, lk->fd);
-        close(lk->fd);
-        lk->fd = -1;
-        lk->epev = 0;
-    }
-    if (lk->up) {
-        lk->up = false;
-        status_notify(false);
-        LOG("link down");
-    }
+static void bridge_on_down(void *ctx) {
+    (void)ctx;
+    status_notify(false);
+    LOG("link down");
     close_all_conns(false);
-    lk->rxbuf_len = 0;
-    lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
-    lk->tx_session = 0;
-    lk->rx_session = 0;
-    lk->tx_seq = lk->rx_seq = 0;
-    lk->tx_tokens = LINK_TX_BURST;
-    lk->tx_token_ms = now;
-    lk->paused = false;
-
-    lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
+    g_conns_paused = false;
+    g_reconnect_at = pik_now_ms() + pik_backoff_next(&g_backoff_ms, RECONNECT_MAX);
 }
 
-static void link_try_open(int64_t now) {
-    link_t *lk = &g_link;
-    if (lk->fd >= 0) return;
-
-    int fd = open(lk->dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) {
-        lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
+static void bridge_try_open(int64_t now) {
+    if (g_link.fd >= 0) return;
+    /* Silent retry while the device is absent (unplugged peer); the link
+     * module logs open failures, which would flood the log at this cadence. */
+    if (access(g_dev, R_OK | W_OK) != 0 ||
+        !pik_link_open(&g_link, g_dev, now)) {
+        g_reconnect_at = now + pik_backoff_next(&g_backoff_ms, RECONNECT_MAX);
         return;
     }
-
-    if (tty_set_byte_raw(fd) < 0) {
-        LOG("termios setup failed on %s: %s", lk->dev, strerror(errno));
-        close(fd);
-        lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
-        return;
-    }
-    if (tty_flush_io(fd) < 0) {
-        LOG("termios flush failed on %s: %s", lk->dev, strerror(errno));
-        close(fd);
-        lk->reconnect_at = now + pik_backoff_next(&lk->backoff_ms, RECONNECT_MAX);
-        return;
-    }
-
-    lk->fd = fd;
-    lk->rxbuf_len = 0;
-    lk->tx_head = lk->tx_tail = lk->tx_count = lk->tx_bytes = 0;
-    lk->tx_session = pik_session_id(now);
-    lk->rx_session = 0;
-    lk->tx_seq = lk->rx_seq = 0;
-    lk->up = true;
-    lk->paused = false;
-    lk->backoff_ms = RECONNECT_MIN;
-    lk->tx_tokens = LINK_TX_BURST;
-    lk->tx_token_ms = now;
-    lk->epev = EPOLLIN;
-    pik_epoll_set(g_epfd, fd, EPOLLIN, &g_link_tag);
-
+    g_backoff_ms = RECONNECT_MIN;
     status_notify(true);
-    LOG("link opened: %s", lk->dev);
     LOG("link up");
 }
 
@@ -675,14 +366,14 @@ static void listener_accept(void) {
     for (int i = 0; i < MAX_CONNS; i++)
         if (g_conns[i].fd < 0) { id = i; break; }
     if (id < 0) { LOG("all slots full, rejecting"); close(fd); return; }
-    if (!g_link.up) { LOG("link not up, rejecting"); close(fd); return; }
+    if (g_link.fd < 0) { LOG("link not up, rejecting"); close(fd); return; }
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     g_conns[id].fd = fd;
     g_conns[id].epev = 0;
-    g_conns[id].paused = g_link.paused;
+    g_conns[id].paused = g_conns_paused;
     g_conns[id].flow_paused = false;
     g_conns[id].pause_sent = false;
     conn_epoll_update(&g_conns[id]);
@@ -695,7 +386,8 @@ static void listener_accept(void) {
 
 static void conn_on_readable(int id) {
     conn_t *c = &g_conns[id];
-    if (g_link.tx_bytes >= LINK_TX_HIGH || g_link.tx_count >= LINK_TXQ_CAP - 2) {
+    if (pik_link_tx_avail(&g_link) >= LINK_TX_HIGH ||
+        !pik_link_can_queue(&g_link, PIK_TCPBRIDGE_MAX_PAYLOAD)) {
         pause_all_conns();
         return;
     }
@@ -708,8 +400,8 @@ static void conn_on_readable(int id) {
         return;
     }
     if (!enqueue_frame(PIK_TCPBRIDGE_FRAME_DATA, (uint8_t)id, buf, (size_t)n))
-        pause_all_conns();
-    if (g_link.tx_bytes > LINK_TX_HIGH || g_link.tx_count >= LINK_TXQ_CAP - 2)
+        return;
+    if (pik_link_tx_avail(&g_link) > LINK_TX_HIGH)
         pause_all_conns();
 }
 
@@ -721,6 +413,25 @@ static void run(void) {
     if (g_epfd < 0) DIE("epoll_create1: %s", strerror(errno));
 
     for (int i = 0; i < MAX_CONNS; i++) g_conns[i].fd = -1;
+
+    pik_link_cfg_t lcfg = {
+        .name        = "tcp",
+        .nak_type    = PIK_TCPBRIDGE_FRAME_NAK,
+        .has_aux     = true,
+        .first_type  = 0,   /* first frame must carry seq 0 */
+        .max_payload = PIK_TCPBRIDGE_MAX_PAYLOAD,
+        .txbuf       = s_link_tx,       .tx_cap     = LINK_TX_CAP,
+        .rxbuf       = s_link_rx,       .rx_cap     = sizeof(s_link_rx),
+        .hist        = s_link_hist,     .hist_cap   = HIST_CAP,
+        .hist_ent    = s_link_hist_ent, .hist_slots = HIST_SLOTS,
+        .tx_rate_bps = LINK_TX_RATE_BPS,
+        .tx_burst    = LINK_TX_BURST,
+        .tx_write_budget = LINK_WRITE_BUDGET,
+        .on_frame    = bridge_on_frame,
+        .on_down     = bridge_on_down,
+        .ctx         = NULL,
+    };
+    pik_link_init(&g_link, &lcfg, g_epfd);
 
     if (g_is_listener) {
         int lfd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -769,24 +480,16 @@ static void run(void) {
     }
 
     int64_t now = pik_now_ms();
-    link_try_open(now);
+    g_backoff_ms = RECONNECT_MIN;
+    bridge_try_open(now);
 
     for (;;) {
         now = pik_now_ms();
-        if (g_link.fd >= 0) {
-            lk_refill_tokens(now);
-            if (g_link.tx_count && g_link.tx_tokens) lk_drain(now);
-        }
+        if (g_link.fd >= 0)
+            pik_link_tick(&g_link, now);
 
-        int64_t dl = INT64_MAX;
-        if (g_link.fd < 0) {
-            dl = g_link.reconnect_at;
-        } else {
-            if (g_link.tx_count && !g_link.tx_tokens) {
-                int64_t tx_dl = now + 1;
-                if (tx_dl < dl) dl = tx_dl;
-            }
-        }
+        int64_t dl = (g_link.fd < 0) ? g_reconnect_at
+                                     : pik_link_deadline(&g_link);
 
         int timeout = 5000;
         if (dl != INT64_MAX) {
@@ -803,12 +506,8 @@ static void run(void) {
             void *ptr = evs[i].data.ptr;
             uint32_t ev = evs[i].events;
 
-            if (ptr == &g_link_tag) {
-                if (ev & (EPOLLERR | EPOLLHUP)) { link_close(now); continue; }
-                if (ev & EPOLLIN) {
-                    if (!link_read_available(now)) continue;
-                }
-                if (g_link.fd >= 0 && (ev & EPOLLOUT)) lk_drain(now);
+            if (pik_link_owns_event(&g_link, ptr)) {
+                pik_link_dispatch(&g_link, ev, now);
             } else if (ptr == &g_listen_tag) {
                 listener_accept();
             } else {
@@ -830,14 +529,12 @@ static void run(void) {
 
         now = pik_now_ms();
         if (g_link.fd < 0) {
-            if (now >= g_link.reconnect_at) link_try_open(now);
+            if (now >= g_reconnect_at) bridge_try_open(now);
         }
 
-        if (!g_link.paused &&
-            (g_link.tx_bytes > LINK_TX_HIGH || g_link.tx_count >= LINK_TXQ_CAP - 2))
+        if (!g_conns_paused && pik_link_tx_avail(&g_link) > LINK_TX_HIGH)
             pause_all_conns();
-        else if (g_link.paused &&
-                 g_link.tx_bytes < LINK_TX_LOW && g_link.tx_count < LINK_TXQ_CAP / 2)
+        else if (g_conns_paused && pik_link_tx_avail(&g_link) < LINK_TX_LOW)
             resume_all_conns();
     }
 }
@@ -864,10 +561,7 @@ int main(int argc, char **argv) {
             g_status_fd = (int)fd;
     }
 
-    strncpy(g_link.dev, argv[1], sizeof(g_link.dev) - 1);
-    g_link.fd = -1;
-    g_link.backoff_ms = RECONNECT_MIN;
-    g_link.tx_tokens = LINK_TX_BURST;
+    strncpy(g_dev, argv[1], sizeof(g_dev) - 1);
 
     const char *mode = argv[2];
     if (strcmp(mode, "listen") == 0)
@@ -888,7 +582,7 @@ int main(int argc, char **argv) {
     if (!pik_parse_port(colon + 1, &g_fwd_port)) usage(argv[0]);
 
     LOG("tcpbridge %s %s %s:%d",
-        g_link.dev, g_is_listener ? "listen" : "forward",
+        g_dev, g_is_listener ? "listen" : "forward",
         g_fwd_host, g_fwd_port);
     run();
     return 0;

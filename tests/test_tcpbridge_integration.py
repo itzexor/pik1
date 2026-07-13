@@ -48,6 +48,27 @@ class PtyRelay:
         self.sel.register(self.m1, selectors.EVENT_READ, self.m2)
         self.sel.register(self.m2, selectors.EVENT_READ, self.m1)
         self.running = True
+        self.drop_src = None
+        self.drop_buf = b""
+
+    def arm_drop(self, src_fd):
+        """Drop the next complete COBS frame (through its 0x00 delimiter)
+        read from src_fd. Arm only while the stream is idle so the drop
+        starts on a frame boundary."""
+        self.drop_src = src_fd
+        self.drop_buf = b""
+
+    def write_all(self, fd, data):
+        while data and self.running:
+            try:
+                n = os.write(fd, data)
+            except BlockingIOError:
+                time.sleep(0.002)
+                continue
+            except OSError:
+                self.running = False
+                return
+            data = data[n:]
 
     def pump_until(self, deadline):
         while self.running and time.monotonic() < deadline:
@@ -64,7 +85,17 @@ class PtyRelay:
                 if not data:
                     self.running = False
                     return
-                os.write(dst, data)
+                if src == self.drop_src:
+                    self.drop_buf += data
+                    idx = self.drop_buf.find(b"\x00")
+                    if idx < 0:
+                        continue  # still inside the frame being dropped
+                    data = self.drop_buf[idx + 1:]
+                    self.drop_src = None
+                    self.drop_buf = b""
+                    if not data:
+                        continue
+                self.write_all(dst, data)
 
     def close(self):
         self.running = False
@@ -161,6 +192,96 @@ def test_data_roundtrip():
         relay.close()
 
 
+def test_frame_drop_heals():
+    """A dropped link frame mid-session must heal via NAK/retransmit
+    (FAILURE_MODEL.md, "Documented Exceptions") without losing data."""
+    relay = PtyRelay()
+    target_port = free_port()
+    listen_port = free_port()
+    target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    target.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    target.bind(("127.0.0.1", target_port))
+    target.listen(1)
+    target.setblocking(False)
+
+    procs = [
+        subprocess.Popen(
+            [TCPBRIDGE, relay.path1, "listen", f"127.0.0.1:{listen_port}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        ),
+        subprocess.Popen(
+            [TCPBRIDGE, relay.path2, "forward", f"127.0.0.1:{target_port}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        ),
+    ]
+
+    client = accepted = None
+    try:
+        client = connect_retry(listen_port)
+        client.settimeout(1)
+        client.sendall(b"warmup")
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and accepted is None:
+            relay.pump_until(time.monotonic() + 0.03)
+            try:
+                accepted, _ = target.accept()
+            except BlockingIOError:
+                pass
+        if accepted is None:
+            fail("heal test: target did not receive forwarded connection")
+        accepted.settimeout(0.2)
+
+        deadline = time.monotonic() + 3
+        data = b""
+        while time.monotonic() < deadline and len(data) < len(b"warmup"):
+            relay.pump_until(time.monotonic() + 0.03)
+            try:
+                data += accepted.recv(64)
+            except socket.timeout:
+                pass
+        if data != b"warmup":
+            fail(f"heal test: warmup received {data!r}")
+
+        # Stream is idle and synchronized: drop the next listener->forwarder
+        # frame, then push a payload large enough to span many frames.
+        relay.pump_until(time.monotonic() + 0.1)
+        relay.arm_drop(relay.m1)
+        payload = bytes((i * 7 + 13) & 0xFF for i in range(32 * 1024))
+        client.sendall(payload)
+
+        deadline = time.monotonic() + 8
+        data = b""
+        while time.monotonic() < deadline and len(data) < len(payload):
+            relay.pump_until(time.monotonic() + 0.03)
+            try:
+                data += accepted.recv(65536)
+            except socket.timeout:
+                pass
+        if data != payload:
+            fail(f"heal test: received {len(data)} of {len(payload)} bytes"
+                 + ("" if len(data) >= len(payload) else " (payload lost or corrupt)"))
+        if relay.drop_src is not None:
+            fail("heal test: relay never saw a frame to drop")
+    finally:
+        if client:
+            client.close()
+        if accepted:
+            accepted.close()
+        target.close()
+        for p in procs:
+            terminate(p)
+        relay.close()
+
+    stderr = procs[1].stderr.read() if procs[1].stderr else ""
+    if "retransmit healed" not in stderr:
+        fail("heal test: forwarder did not log a retransmit heal")
+
+
 def test_wildcard_warning():
     port = free_port()
     proc = subprocess.Popen(
@@ -196,6 +317,7 @@ def test_wildcard_warning():
 
 def main():
     test_data_roundtrip()
+    test_frame_drop_heals()
     test_wildcard_warning()
     print("test_tcpbridge_integration: ok")
 

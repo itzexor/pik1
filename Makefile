@@ -9,8 +9,8 @@ TEST_BUILD := $(BUILD)/tests
 
 COBS_SRCS   := src/nanocobs/cobs.c
 COBS_HDRS   := src/nanocobs/cobs.h
-COMMON_SRCS := src/util.c src/logging.c src/tty.c src/frame.c src/fd.c
-COMMON_HDRS := src/util.h src/logging.h src/tty.h src/frame.h src/fd.h src/version.h
+COMMON_SRCS := src/util.c src/logging.c src/tty.c src/frame.c src/fd.c src/link.c
+COMMON_HDRS := src/util.h src/logging.h src/tty.h src/frame.h src/fd.h src/link.h src/version.h
 USB_SRCS    := src/usb_discovery.c
 USB_HDRS    := src/usb_discovery.h
 CONTROL_SRCS := src/control.c

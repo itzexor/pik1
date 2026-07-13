@@ -9,7 +9,8 @@ enum {
     PIK_CONTROL_FRAME_LINK_STATE = 0x06u,
     PIK_CONTROL_FRAME_CONFIG     = 0x07u,
     /* Link-control frame, outside the sequenced stream: payload is the 2-byte
-     * LE seq the receiver expects next; the sender retransmits from there. */
+     * LE seq the receiver expects next; the sender retransmits from there.
+     * Header session is the session being healed (the sender's TX session). */
     PIK_CONTROL_FRAME_NAK        = 0x08u,
 };
 
