@@ -1,4 +1,4 @@
-// src/serialmux.c — COBS serial multiplexer, library interface
+// COBS serial multiplexer, library interface
 
 #include "serialmux.h"
 #include "serialmux_proto.h"

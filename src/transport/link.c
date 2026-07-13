@@ -1,4 +1,4 @@
-// src/link.c — shared sequenced serial link used by the mux and control links
+// Shared sequenced serial link used by the mux and control links
 
 #include "link.h"
 #include "nanocobs/cobs.h"

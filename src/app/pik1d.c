@@ -1,4 +1,4 @@
-// src/pik1d.c - daemon supervisor: USB discovery, child management, mux session loop
+// pik1d daemon supervisor: USB discovery, child management, mux session loop
 
 #include "control.h"
 #include "serialmux.h"

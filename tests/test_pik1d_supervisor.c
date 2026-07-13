@@ -36,7 +36,7 @@ int64_t test_pik_now_ms(void);
 #define pik_control_take_ack test_pik_control_take_ack
 #define LOCAL_CONTROL_DIR "/tmp/pik1-test-run"
 #define pik_now_ms test_pik_now_ms
-#include "../src/pik1d.c"
+#include "../src/app/pik1d.c"
 #undef pik_now_ms
 #undef pik_control_take_ack
 #undef pik_control_send_command

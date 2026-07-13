@@ -1,8 +1,8 @@
-// src/tcpbridge.c — multi-connection TCP-over-serial bridge
+// Multi-connection TCP-over-serial bridge
 // Wire protocol: COBS + CRC32, frame layout:
 //   [type:1][conn_id:1][session_le:4][seq_le:2][payload][crc32_le:4]
 // Sessions, sequencing, bring-up grace, and bounded link-layer retransmission
-// are handled by the shared link module (src/link.c); see FAILURE_MODEL.md,
+// are handled by the shared link module; see FAILURE_MODEL.md,
 // "Documented Exceptions".
 // Runs on ttyGS2 (K1C) / ttyACM2 (Pi).
 

@@ -1,26 +1,36 @@
 CC       ?= gcc
 CFLAGS   := -O2 -std=c11 -Wall -Wextra -D_GNU_SOURCE \
-             -ffunction-sections -fdata-sections -Isrc/nanocobs
+             -ffunction-sections -fdata-sections \
+             -Isrc/app -Isrc/core -Isrc/platform -Isrc/protocol \
+             -Isrc/transport -Isrc/vendor
 LDFLAGS  := -Wl,--gc-sections
 
 STATIC   := -static
 BUILD    := build
 TEST_BUILD := $(BUILD)/tests
 
-COBS_SRCS   := src/nanocobs/cobs.c
-COBS_HDRS   := src/nanocobs/cobs.h
-COMMON_SRCS := src/util.c src/logging.c src/tty.c src/frame.c src/fd.c src/link.c
-COMMON_HDRS := src/util.h src/logging.h src/tty.h src/frame.h src/fd.h src/link.h src/version.h
-USB_SRCS    := src/usb_discovery.c
-USB_HDRS    := src/usb_discovery.h
-CONTROL_SRCS := src/control.c
-CONTROL_HDRS := src/control.h src/control_proto.h
+COBS_SRCS   := src/vendor/nanocobs/cobs.c
+COBS_HDRS   := src/vendor/nanocobs/cobs.h
+CORE_SRCS   := src/core/util.c src/core/logging.c
+CORE_HDRS   := src/core/util.h src/core/logging.h src/core/version.h
+PLATFORM_SRCS := src/platform/tty.c src/platform/fd.c
+PLATFORM_HDRS := src/platform/tty.h src/platform/fd.h
+TRANSPORT_SRCS := src/transport/frame.c src/transport/link.c
+TRANSPORT_HDRS := src/transport/frame.h src/transport/link.h
+COMMON_SRCS := $(CORE_SRCS) $(PLATFORM_SRCS) $(TRANSPORT_SRCS)
+COMMON_HDRS := $(CORE_HDRS) $(PLATFORM_HDRS) $(TRANSPORT_HDRS)
+USB_SRCS    := src/platform/usb_discovery.c
+USB_HDRS    := src/platform/usb_discovery.h
+CONTROL_SRCS := src/protocol/control.c
+CONTROL_HDRS := src/protocol/control.h src/protocol/control_proto.h
+SERIALMUX_SRCS := src/protocol/serialmux.c
+SERIALMUX_HDRS := src/protocol/serialmux.h src/protocol/serialmux_proto.h
 
-PIK1D_SRCS  := src/pik1d.c src/serialmux.c $(CONTROL_SRCS) $(USB_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
-PIK1D_HDRS  := src/serialmux.h src/serialmux_proto.h $(CONTROL_HDRS) $(USB_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
+PIK1D_SRCS  := src/app/pik1d.c $(SERIALMUX_SRCS) $(CONTROL_SRCS) $(USB_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
+PIK1D_HDRS  := $(SERIALMUX_HDRS) $(CONTROL_HDRS) $(USB_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
 
-TB_SRCS     := src/tcpbridge.c $(COBS_SRCS) $(COMMON_SRCS)
-TB_HDRS     := src/tcpbridge_proto.h $(COBS_HDRS) $(COMMON_HDRS)
+TB_SRCS     := src/app/tcpbridge.c $(COBS_SRCS) $(COMMON_SRCS)
+TB_HDRS     := src/protocol/tcpbridge_proto.h $(COBS_HDRS) $(COMMON_HDRS)
 
 # ── Install ───────────────────────────────────────────────────────────────────
 SUDO            ?= sudo
@@ -102,29 +112,29 @@ $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
 $(BUILD)/tcpbridge: $(TB_SRCS) $(TB_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TB_SRCS)
 
-$(TEST_BUILD)/test_util: tests/test_util.c src/util.c src/util.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_util.c src/util.c
+$(TEST_BUILD)/test_util: tests/test_util.c src/core/util.c src/core/util.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_util.c src/core/util.c
 
-$(TEST_BUILD)/test_frame: tests/test_frame.c src/frame.c src/frame.h $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_frame.c src/frame.c $(COBS_SRCS)
+$(TEST_BUILD)/test_frame: tests/test_frame.c src/transport/frame.c src/transport/frame.h $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_frame.c src/transport/frame.c $(COBS_SRCS)
 
 $(TEST_BUILD)/test_cobs: tests/test_cobs.c $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_cobs.c $(COBS_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_cobs.c $(COBS_SRCS)
 
-$(TEST_BUILD)/test_logging: tests/test_logging.c src/logging.c src/logging.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_logging.c src/logging.c
+$(TEST_BUILD)/test_logging: tests/test_logging.c src/core/logging.c src/core/logging.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_logging.c src/core/logging.c
 
-$(TEST_BUILD)/test_control_names: tests/test_control_names.c src/control.c src/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_control_names.c src/control.c $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_control_names: tests/test_control_names.c src/protocol/control.c src/protocol/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_names.c src/protocol/control.c $(COBS_SRCS) $(COMMON_SRCS)
 
-$(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h src/control.c src/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_control_protocol.c src/control.c $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h src/protocol/control.c src/protocol/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_protocol.c src/protocol/control.c $(COBS_SRCS) $(COMMON_SRCS)
 
-$(TEST_BUILD)/test_pik1d_supervisor: tests/test_pik1d_supervisor.c tests/test_harness.h src/pik1d.c src/control.c src/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_pik1d_supervisor.c src/control.c $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_pik1d_supervisor: tests/test_pik1d_supervisor.c tests/test_harness.h src/app/pik1d.c src/protocol/control.c src/protocol/control.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_pik1d_supervisor.c src/protocol/control.c $(COBS_SRCS) $(COMMON_SRCS)
 
-$(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h src/serialmux.c src/serialmux.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -Isrc -o $@ tests/test_serialmux_protocol.c src/serialmux.c $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h src/protocol/serialmux.c src/protocol/serialmux.h $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_serialmux_protocol.c src/protocol/serialmux.c $(COBS_SRCS) $(COMMON_SRCS)
 
 # ── MIPSEL ────────────────────────────────────────────────────────────────────
 mipsel: $(BUILD)/pik1d.mipsel $(BUILD)/tcpbridge.mipsel
