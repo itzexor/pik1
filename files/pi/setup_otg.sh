@@ -14,7 +14,7 @@ readonly CONFIGFS_DIR="/sys/kernel/config"
 readonly GADGET_DIR="$CONFIGFS_DIR/usb_gadget/$GADGET_NAME"
 readonly CONFIG_DIR="$GADGET_DIR/configs/c.1"
 
-log() { echo "setup_pik1: $*" >&2; }
+log() { echo "setup_otg: $*" >&2; }
 
 write_file() {
     local path="$1"

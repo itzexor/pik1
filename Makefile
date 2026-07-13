@@ -49,7 +49,7 @@ AARCH64_STRIP ?= $(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-
 ARMV7_CC     ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-gcc
 ARMV7_STRIP  ?= $(TOOLCHAIN_DIR)/$(ARMV7_TRIPLE)-cross/bin/$(ARMV7_TRIPLE)-strip
 
-.PHONY: all native mipsel aarch64 armv7 test test-unit test-cli test-templates \
+.PHONY: all native mipsel aarch64 armv7 test test-unit test-cli \
         test-integration test-tcpbridge-integration toolchain clean distclean \
         render-k1-init install-k1 uninstall-k1 install-pi uninstall-pi FORCE
 
@@ -57,7 +57,7 @@ all: native
 
 native: $(BUILD)/pik1d $(BUILD)/tcpbridge
 
-test: test-unit test-cli test-templates test-integration
+test: test-unit test-cli test-integration
 
 test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_frame \
       $(TEST_BUILD)/test_logging $(TEST_BUILD)/test_control_names \
@@ -74,9 +74,6 @@ test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_fr
 
 test-cli: native
 	PIK1D=$(BUILD)/pik1d TCPBRIDGE=$(BUILD)/tcpbridge bash tests/test_cli.sh
-
-test-templates:
-	bash tests/test_templates.sh
 
 test-integration: test-tcpbridge-integration
 
@@ -153,10 +150,10 @@ $(BUILD):
 $(TEST_BUILD):
 	mkdir -p $@
 
-$(BUILD)/S99pik1: S99pik1.in FORCE | $(BUILD)
+$(BUILD)/S99pik1: files/k1/S99pik1.in FORCE | $(BUILD)
 	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
 
-$(BUILD)/shutdown_command.sh: shutdown_command.sh.in FORCE | $(BUILD)
+$(BUILD)/shutdown_command.sh: files/k1/shutdown_command.sh.in FORCE | $(BUILD)
 	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
 
 FORCE:
@@ -214,14 +211,14 @@ install-pi:
 	$(SUDO) install -d $(PI_DIR)
 	$(SUDO) install -m 755 $(BUILD)/pik1d.aarch64     $(PI_DIR)/pik1d
 	$(SUDO) install -m 755 $(BUILD)/tcpbridge.aarch64  $(PI_DIR)/tcpbridge
-	$(SUDO) install -m 755 setup_pik1.sh $(PI_DIR)/setup_pik1.sh
-	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1.service.in | \
+	$(SUDO) install -m 755 files/pi/setup_otg.sh $(PI_DIR)/setup_otg.sh
+	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' files/pi/pik1.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1.service > /dev/null
-	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1-peer-reboot.service.in | \
+	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' files/pi/pik1-peer-reboot.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-reboot.service > /dev/null
-	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' pik1-peer-poweroff.service.in | \
+	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' files/pi/pik1-peer-poweroff.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service > /dev/null
-	sed "s|@PIK1_USER@|$$(id -nu 1000)|g" pik1-polkit.rules.in | \
+	sed "s|@PIK1_USER@|$$(id -nu 1000)|g" files/pi/pik1-polkit.rules.in | \
 		$(SUDO) tee /etc/polkit-1/rules.d/49-pik1.rules > /dev/null
 	$(SUDO) systemctl daemon-reload
 	$(SUDO) systemctl enable pik1.service

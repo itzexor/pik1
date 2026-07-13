@@ -69,11 +69,12 @@ webcam streams or file transfers.
 The following files are involved:
 
 - `src/` -- C source for `pik1d`, `tcpbridge`, and the shared serial mux code
-- `S99pik1.in` -- K1 init script template, rendered to `build/S99pik1`
-- `shutdown_command.sh.in` -- K1 shutdown/reboot wrapper that propagates to the Pi
-- `pik1-polkit.rules.in` -- polkit rule letting the Pi daemon power off/reboot
-- `setup_pik1.sh` -- Pi gadget setup script
-- `pik1.service.in` -- Pi systemd service template
+- `files/k1/S99pik1.in` -- K1 init script template, rendered to `build/S99pik1`
+- `files/k1/shutdown_command.sh.in` -- K1 shutdown/reboot wrapper that propagates to the Pi
+- `files/pi/pik1-polkit.rules.in` -- polkit rule letting the Pi daemon power off/reboot
+- `files/pi/setup_otg.sh` -- Pi USB OTG gadget setup script
+- `files/pi/pik1.service.in` -- Pi systemd service template
+- `update.sh` -- on-device installer/updater: stops the service if running, uninstalls, pulls, reinstalls, restarts; auto-detects the target (`./update.sh`, or pass `k1`/`pi` to override)
 
 ### Binaries
 
@@ -130,15 +131,21 @@ make test        # native non-hardware unit and CLI smoke tests
     From the repo directory on the Pi, using the included pre-built binaries:
 
     ```bash
-    make install-pi
+    ./update.sh
     ```
 
-    This copies the binaries and setup script to `/opt/pik1/`, installs and enables
-    `pik1.service` and the peer reboot/poweroff helper units, and runs
-    `systemctl daemon-reload`. Pass `SUDO=` if running as root, or
-    `PI_DIR=/your/path` to override the install prefix.
+    This handles first installs and updates alike: it stops `pik1.service` if
+    running, uninstalls any previous version, pulls the latest revision, and
+    installs and starts the new one. Installation copies the binaries and setup
+    script to `/opt/pik1/`, installs and enables `pik1.service` and the peer
+    reboot/poweroff helper units, and runs `systemctl daemon-reload`.
 
-    The service runs `setup_pik1.sh` as root first (needed for configfs access),
+    For custom options, run the make targets directly (`make install-pi` /
+    `make uninstall-pi`), passing `SUDO=` if running as root or
+    `PI_DIR=/your/path` to override the install prefix. The same variables
+    pass through `./update.sh` from the environment.
+
+    The service runs `setup_otg.sh` as root first (needed for configfs access),
     then starts `pik1d` as UID 1000 so the PTY devices it creates
     are accessible to Klipper.
 
@@ -174,13 +181,16 @@ make test        # native non-hardware unit and CLI smoke tests
     From a slim repo clone on the K1, such as `/root/pik1`:
 
     ```bash
-    make install-k1
+    ./update.sh
     ```
 
-    This copies `build/pik1d.mipsel` and `build/tcpbridge.mipsel` to
-    `/usr/data/pik1/`, renders and installs `/etc/init.d/S99pik1`, and
-    disables the services below by renaming them with a `_` prefix so the init
-    system skips them. To use a different install directory, pass the same
+    This handles first installs and updates alike: it stops the service if
+    running, uninstalls any previous version, pulls the latest revision, and
+    installs and starts the new one. Installation copies `build/pik1d.mipsel`
+    and `build/tcpbridge.mipsel` to `/usr/data/pik1/`, renders and installs
+    `/etc/init.d/S99pik1`, and disables the services below by renaming them
+    with a `_` prefix so the init system skips them. To use a different
+    install directory, run the make targets directly, passing the same
     `K1_DIR` value at install and uninstall time:
 
     ```bash
@@ -314,10 +324,10 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     metadata, and `pik1d`/`tcpbridge` messages may appear in a slightly different
     order. The message text should look like:
     ```
-    setup_pik1: loading libcomposite
-    setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
-    setup_pik1: binding gadget to UDC: fe980000.usb
-    setup_pik1: gadget setup complete
+    setup_otg: loading libcomposite
+    setup_otg: creating gadget at /sys/kernel/config/usb_gadget/pik1
+    setup_otg: binding gadget to UDC: fe980000.usb
+    setup_otg: gadget setup complete
     [pik1] uart=pty release=0.5.0 protocol=4 channels=2 tcp=forward:127.0.0.1:7125 control=usb[0] serial=usb[1] tunnel=usb[2]
     [ctrl] link opened: /dev/ttyGS0
     [ctrl] link up: release=0.5.0 protocol=4 features=0x00000000

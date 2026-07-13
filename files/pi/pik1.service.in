@@ -8,7 +8,7 @@ Before=klipper.service shutdown.target reboot.target poweroff.target halt.target
 Type=simple
 
 # Gadget setup must run as root (writes to /sys/kernel/config)
-ExecStartPre=+@INSTALL_DIR@/setup_pik1.sh
+ExecStartPre=+@INSTALL_DIR@/setup_otg.sh
 
 # Daemon runs as the klipper user so PTY devices are accessible to klipper
 User=1000
