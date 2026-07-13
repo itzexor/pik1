@@ -8,6 +8,9 @@ enum {
     PIK_CONTROL_FRAME_ACK        = 0x05u,
     PIK_CONTROL_FRAME_LINK_STATE = 0x06u,
     PIK_CONTROL_FRAME_CONFIG     = 0x07u,
+    /* Link-control frame, outside the sequenced stream: payload is the 2-byte
+     * LE seq the receiver expects next; the sender retransmits from there. */
+    PIK_CONTROL_FRAME_NAK        = 0x08u,
 };
 
 enum {

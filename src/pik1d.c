@@ -967,7 +967,7 @@ int main(int argc, char **argv) {
 
             if (pik_control_owns_event(ptr)) {
                 if (session_active && !pik_control_dispatch(ptr, ev, now)) {
-                    LOG("control session failed, restarting USB link");
+                    LOG("control link failed, restarting session");
                     set_link_flags(0);
                     session_active = false;
                     session_confirmed = false;
@@ -994,7 +994,7 @@ int main(int argc, char **argv) {
             }
 
             if (session_confirmed && !serialmux_dispatch(ptr, ev, now)) {
-                LOG("session failed, restarting USB link");
+                LOG("serial mux failed, restarting session");
                 set_link_flags(0);
                 session_active = false;
                 session_confirmed = false;
@@ -1011,7 +1011,7 @@ int main(int argc, char **argv) {
         local_control_check_ack(now);
 
         if (session_active && !pik_control_tick(now)) {
-            LOG("control session failed, restarting USB link");
+            LOG("control link failed, restarting session");
             set_link_flags(0);
             session_active = false;
             session_confirmed = false;
@@ -1021,7 +1021,7 @@ int main(int argc, char **argv) {
         }
 
         if (session_confirmed && !serialmux_tick(now)) {
-            LOG("session failed, restarting USB link");
+            LOG("serial mux failed, restarting session");
             set_link_flags(0);
             session_active = false;
             session_confirmed = false;

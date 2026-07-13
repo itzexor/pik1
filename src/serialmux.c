@@ -32,6 +32,17 @@
 #define CHAN_RING_CAP   (1u << 16)
 #define CHAN_RING_MASK  (CHAN_RING_CAP - 1u)
 
+/* Retransmit history: encoded copies of the most recent sequenced TX frames,
+ * kept so a peer NAK can be answered byte-identically (FAILURE_MODEL.md,
+ * "Documented Exceptions"). */
+#define HIST_CAP        (1u << 18)
+#define HIST_MASK       (HIST_CAP - 1u)
+#define HIST_SLOTS      512u        /* power of two, bounds frame count */
+
+#define NAK_RETRY_MS      100       /* re-send NAK while a gap persists */
+#define GAP_BUDGET_MS     500       /* unhealed gap fails the link */
+#define STALE_GRACE_MS    2000      /* discard stale frames after link open */
+
 #define RESET_SILENCE_MS  5000
 
 // ── types ─────────────────────────────────────────────────────────────────────
@@ -59,6 +70,11 @@ typedef struct channel {
 } channel_t;
 
 typedef struct {
+    uint32_t    off;    /* free-running byte offset into hist ring */
+    uint16_t    len;
+} hist_ent_t;
+
+typedef struct {
     int         fd;
     bool        up;
     bool        paused;
@@ -75,6 +91,23 @@ typedef struct {
     uint16_t    tx_seq;
     uint16_t    rx_seq;
 
+    /* retransmit history of sent frames (encoded bytes + per-seq index) */
+    uint8_t     hist[HIST_CAP];
+    hist_ent_t  hist_ent[HIST_SLOTS];
+    uint16_t    hist_first;         /* seq of oldest frame still held */
+    uint16_t    hist_count;
+    uint32_t    hist_head, hist_tail;
+    int64_t     last_resend_ms;
+
+    /* receiver gap recovery */
+    int64_t     gap_since_ms;       /* 0 = stream in sync */
+    int64_t     last_nak_ms;
+    uint32_t    gap_discards;
+    uint32_t    dup_discards;
+
+    /* bring-up grace for stale frames from the peer's previous session */
+    int64_t     opened_ms;
+    uint32_t    stale_discards;
 } link_t;
 
 // ── globals ───────────────────────────────────────────────────────────────────
@@ -83,6 +116,15 @@ static channel_t g_chans[MAX_CHANNELS];
 static int       g_n_chans;
 static int       g_epfd = -1;
 static bool      g_session_failed;
+static int64_t   g_now_ms;   /* updated on entry to start/dispatch/tick */
+
+/* Cumulative link I/O counters (process lifetime): dumped on link failure. */
+static uint64_t g_rx_frames;
+static uint64_t g_tx_frames;
+static uint64_t g_rx_reads;
+static uint64_t g_rx_bytes;
+static uint64_t g_tx_writes;
+static uint64_t g_tx_bytes;
 
 // ── logging ───────────────────────────────────────────────────────────────────
 #define LOG(...)  pik_log("mux", __VA_ARGS__)
@@ -155,6 +197,8 @@ static bool lk_drain(link_t *lk) {
             break;
         }
         lk->tx_head += (uint32_t)w;
+        g_tx_writes++;
+        g_tx_bytes += (uint64_t)w;
         wrote = true;
     }
     uint32_t want = EPOLLIN | (lk_avail(lk) ? EPOLLOUT : 0u);
@@ -183,8 +227,31 @@ static bool link_can_queue_frame(const link_t *lk, size_t plen) {
     return lk_space(lk) >= COBS_ENCODE_MAX(PIK_SERIALMUX_FRAME_HEADER_LEN + plen + 4);
 }
 
-static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
-                           const uint8_t *payload, size_t plen) {
+static void hist_store(link_t *lk, uint16_t seq, const uint8_t *enc, size_t enc_len) {
+    while (lk->hist_count &&
+           (lk->hist_count == HIST_SLOTS ||
+            HIST_CAP - (lk->hist_tail - lk->hist_head) < (uint32_t)enc_len)) {
+        lk->hist_head += lk->hist_ent[lk->hist_first % HIST_SLOTS].len;
+        lk->hist_first++;
+        lk->hist_count--;
+    }
+    if (!lk->hist_count) {
+        lk->hist_first = seq;
+        lk->hist_head = lk->hist_tail;
+    }
+    hist_ent_t *e = &lk->hist_ent[seq % HIST_SLOTS];
+    e->off = lk->hist_tail;
+    e->len = (uint16_t)enc_len;
+    for (size_t i = 0; i < enc_len; i++)
+        lk->hist[(lk->hist_tail + i) & HIST_MASK] = enc[i];
+    lk->hist_tail += (uint32_t)enc_len;
+    lk->hist_count++;
+}
+
+/* sequenced=false is for link-control frames (NAK): they consume no sequence
+ * number and are never retransmitted, so a peer can process them mid-gap. */
+static void enqueue_frame_opt(link_t *lk, uint8_t type, uint8_t ch_id,
+                              const uint8_t *payload, size_t plen, bool sequenced) {
     if (!lk->up) return;
     if (plen > PIK_SERIALMUX_MAX_PAYLOAD) {
         LOG("oversized frame type=0x%02x ch=%u plen=%zu", type, ch_id, plen);
@@ -216,8 +283,55 @@ static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
         link_close(lk);
         return;
     }
-    lk->tx_seq++;
+    if (sequenced) {
+        hist_store(lk, lk->tx_seq, enc, enc_len);
+        lk->tx_seq++;
+    }
+    g_tx_frames++;
 
+    if (!(lk->epev & EPOLLOUT) && lk->fd >= 0) {
+        lk->epev |= EPOLLOUT;
+        pik_epoll_set(g_epfd, lk->fd, lk->epev, lk);
+    }
+}
+
+static void enqueue_frame(link_t *lk, uint8_t type, uint8_t ch_id,
+                          const uint8_t *payload, size_t plen) {
+    enqueue_frame_opt(lk, type, ch_id, payload, plen, true);
+}
+
+static void send_nak(link_t *lk, int64_t now) {
+    uint8_t p[2] = { (uint8_t)lk->rx_seq, (uint8_t)(lk->rx_seq >> 8) };
+    enqueue_frame_opt(lk, PIK_SERIALMUX_FRAME_NAK, 0, p, sizeof(p), false);
+    lk->last_nak_ms = now;
+}
+
+static void handle_nak(link_t *lk, const uint8_t *p) {
+    uint16_t expected = (uint16_t)p[0] | (uint16_t)p[1] << 8;
+    uint16_t outstanding = (uint16_t)(lk->tx_seq - expected);
+    if (outstanding == 0) return; /* peer caught up while the NAK was in flight */
+    if (outstanding > lk->hist_count) {
+        LOG("link failure: NAK beyond retransmit window expected=%u tx_seq=%u window=%u",
+            expected, lk->tx_seq, lk->hist_count);
+        link_close(lk);
+        return;
+    }
+    if (lk->last_resend_ms && g_now_ms - lk->last_resend_ms < NAK_RETRY_MS / 2)
+        return; /* duplicate NAK burst; resend already queued */
+
+    LOG("retransmit: seq=%u..%u frames=%u (peer NAK)",
+        expected, (uint16_t)(lk->tx_seq - 1u), outstanding);
+    for (uint16_t s = expected; s != lk->tx_seq; s++) {
+        const hist_ent_t *e = &lk->hist_ent[s % HIST_SLOTS];
+        if (lk_space(lk) < e->len) {
+            LOG("link TX ring full during retransmit");
+            link_close(lk);
+            return;
+        }
+        for (uint16_t i = 0; i < e->len; i++)
+            lk->txbuf[lk->tx_tail++ & LINK_RING_MASK] = lk->hist[(e->off + i) & HIST_MASK];
+    }
+    lk->last_resend_ms = g_now_ms;
     if (!(lk->epev & EPOLLOUT) && lk->fd >= 0) {
         lk->epev |= EPOLLOUT;
         pik_epoll_set(g_epfd, lk->fd, lk->epev, lk);
@@ -468,6 +582,7 @@ static int64_t ch_deadline(const channel_t *c, int64_t now) {
 static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
     static uint8_t dec[FRAME_DEC_MAX];
     pik_frame_t frame;
+    g_rx_frames++;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
                                              PIK_SERIALMUX_FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
@@ -488,14 +603,42 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
         link_close(lk);
         return;
     }
+
+    if (type == PIK_SERIALMUX_FRAME_NAK) {
+        /* Link-control: not sequenced, so it remains processable while the
+         * peer's inbound stream has a gap. Ignore unless it is provably from
+         * the live peer session. */
+        if (lk->rx_session == 0 || session != lk->rx_session) return;
+        if (plen != 2) {
+            LOG("link failure: bad NAK len=%zu", plen);
+            link_close(lk);
+            return;
+        }
+        handle_nak(lk, payload);
+        return;
+    }
+
     if (lk->rx_session == 0) {
         if (seq != 0) {
-            LOG("link failure: first frame seq=%u type=0x%02x ch=%u", seq, type, ch_id);
+            /* Stale in-flight frames from the peer's previous session are
+             * expected physics of an unsynchronized restart: discard them
+             * for a bounded window instead of failing the fresh link. */
+            if (g_now_ms - lk->opened_ms <= STALE_GRACE_MS) {
+                if (!lk->stale_discards)
+                    LOG("discarding stale bring-up frames (session=0x%08x seq=%u type=0x%02x ch=%u)",
+                        session, seq, type, ch_id);
+                lk->stale_discards++;
+                return;
+            }
+            LOG("link failure: stale frames past bring-up grace seq=%u type=0x%02x ch=%u discarded=%u",
+                seq, type, ch_id, lk->stale_discards);
             link_close(lk);
             return;
         }
         lk->rx_session = session;
         lk->rx_seq = 1;
+        if (lk->stale_discards)
+            LOG("bring-up synchronized, discarded %u stale frames", lk->stale_discards);
     } else {
         if (session != lk->rx_session) {
             LOG("link failure: session changed old=0x%08x new=0x%08x type=0x%02x ch=%u",
@@ -503,13 +646,32 @@ static void dispatch_frame(link_t *lk, const uint8_t *enc, size_t enc_len) {
             link_close(lk);
             return;
         }
-        if (seq != lk->rx_seq) {
-            LOG("link failure: seq gap session=0x%08x seq=%u expected=%u type=0x%02x ch=%u",
-                session, seq, lk->rx_seq, type, ch_id);
-            link_close(lk);
+        int16_t d = (int16_t)(seq - lk->rx_seq);
+        if (d < 0) {
+            /* duplicate from retransmission overlap; already delivered */
+            lk->dup_discards++;
+            return;
+        }
+        if (d > 0) {
+            if (!lk->gap_since_ms) {
+                lk->gap_since_ms = g_now_ms;
+                lk->gap_discards = 0;
+                LOG("seq gap session=0x%08x seq=%u expected=%u type=0x%02x ch=%u, requesting retransmit",
+                    session, seq, lk->rx_seq, type, ch_id);
+                send_nak(lk, g_now_ms);
+            }
+            lk->gap_discards++;
             return;
         }
         lk->rx_seq++;
+        if (lk->gap_since_ms) {
+            LOG("retransmit healed: seq=%u latency=%lldms discarded=%u dups=%u",
+                seq, (long long)(g_now_ms - lk->gap_since_ms),
+                lk->gap_discards, lk->dup_discards);
+            lk->gap_since_ms = 0;
+            lk->gap_discards = 0;
+            lk->dup_discards = 0;
+        }
     }
 
     channel_t *c = find_channel(ch_id);
@@ -534,6 +696,12 @@ static bool dispatch_rx_frame(void *ctx, const uint8_t *enc, size_t enc_len) {
 static void link_close(link_t *lk) {
     g_session_failed = true;
     if (lk->fd >= 0) {
+        LOG("link stats: rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu "
+            "tx_writes=%llu tx_bytes=%llu rx_seq=%u tx_seq=%u",
+            (unsigned long long)g_rx_frames, (unsigned long long)g_tx_frames,
+            (unsigned long long)g_rx_reads, (unsigned long long)g_rx_bytes,
+            (unsigned long long)g_tx_writes, (unsigned long long)g_tx_bytes,
+            lk->rx_seq, lk->tx_seq);
         pik_epoll_del(g_epfd, lk->fd);
         close(lk->fd);
         lk->fd = -1;
@@ -578,6 +746,14 @@ static bool link_open(link_t *lk, const char *dev) {
         lk->tx_session = pik_session_id(0);
     lk->rx_session = 0;
     lk->tx_seq = lk->rx_seq = 0;
+    lk->hist_first = lk->hist_count = 0;
+    lk->hist_head = lk->hist_tail = 0;
+    lk->last_resend_ms = 0;
+    lk->gap_since_ms = 0;
+    lk->last_nak_ms = 0;
+    lk->gap_discards = lk->dup_discards = 0;
+    lk->opened_ms = g_now_ms;
+    lk->stale_discards = 0;
     lk->up   = true;
     lk->epev = EPOLLIN;
     pik_epoll_set(g_epfd, lk->fd, EPOLLIN, lk);
@@ -606,6 +782,8 @@ static void link_on_readable(link_t *lk) {
         link_close(lk);
         return;
     }
+    g_rx_reads++;
+    g_rx_bytes += (uint64_t)n;
     lk->rxbuf_len += (size_t)n;
     if (!link_parse_rx(lk)) return;
 }
@@ -619,12 +797,22 @@ static void link_on_writable(link_t *lk) {
     }
 }
 
-static void link_tick(link_t *lk) {
+static void link_tick(link_t *lk, int64_t now) {
     if (lk->fd < 0) return;
     if (!lk->paused && lk_avail(lk) > LINK_HIGH_WATER) {
         lk->paused = true;
         for (int i = 0; i < g_n_chans; i++)
             chan_pause(&g_chans[i]);
+    }
+    if (lk->up && lk->gap_since_ms) {
+        if (now - lk->gap_since_ms > GAP_BUDGET_MS) {
+            LOG("link failure: seq gap not healed expected=%u after %dms discarded=%u",
+                lk->rx_seq, GAP_BUDGET_MS, lk->gap_discards);
+            link_close(lk);
+            return;
+        }
+        if (now - lk->last_nak_ms >= NAK_RETRY_MS)
+            send_nak(lk, now);
     }
 }
 
@@ -655,6 +843,7 @@ void serialmux_init(const serialmux_config_t *cfg, int epfd) {
 }
 
 bool serialmux_start(const char *link_dev, int64_t now) {
+    g_now_ms = now;
     memset(&g_link, 0, sizeof(g_link));
     g_link.fd = -1;
     g_link.tx_session = pik_session_id(now);
@@ -673,6 +862,7 @@ bool serialmux_start(const char *link_dev, int64_t now) {
 }
 
 bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
+    g_now_ms = now;
     if (g_session_failed) return false;
     if (ptr == &g_link) {
         if (events & (EPOLLERR | EPOLLHUP)) {
@@ -701,8 +891,9 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
 }
 
 bool serialmux_tick(int64_t now) {
+    g_now_ms = now;
     if (g_session_failed) return false;
-    link_tick(&g_link);
+    link_tick(&g_link, now);
     for (int i = 0; i < g_n_chans && !g_session_failed; i++)
         ch_tick(&g_chans[i], &g_link, now);
     return !g_session_failed;
@@ -713,6 +904,12 @@ int64_t serialmux_deadline(int64_t now) {
     for (int i = 0; i < g_n_chans; i++) {
         int64_t cd = ch_deadline(&g_chans[i], now);
         if (cd < dl) dl = cd;
+    }
+    if (g_link.up && g_link.gap_since_ms) {
+        int64_t a = g_link.gap_since_ms + GAP_BUDGET_MS;
+        int64_t b = g_link.last_nak_ms + NAK_RETRY_MS;
+        if (a < dl) dl = a;
+        if (b < dl) dl = b;
     }
     return dl;
 }

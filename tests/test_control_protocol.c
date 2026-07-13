@@ -257,13 +257,109 @@ static void test_late_peer_hello_retry_sequence(void) {
     fixture_cleanup(&fx);
 }
 
-static void test_sequence_gap_fails(void) {
+static bool send_peer_nak(ctrl_fixture_t *fx, uint16_t expected) {
+    uint8_t header[PIK_CONTROL_FRAME_HEADER_LEN];
+    uint8_t payload[2] = { (uint8_t)expected, (uint8_t)(expected >> 8) };
+    uint8_t enc[128];
+    size_t enc_len = 0;
+    header[0] = PIK_CONTROL_FRAME_NAK;
+    pik_put_u32le(header + 1, fx->peer_session);
+    put_u16le(header + 5, fx->peer_seq); /* link-control: seq not consumed */
+    if (!test_encode_frame(header, sizeof(header), payload, sizeof(payload),
+                           enc, sizeof(enc), &enc_len))
+        return false;
+    return test_write_all(fx->master, enc, enc_len);
+}
+
+static void test_sequence_gap_naks_and_heals(void) {
+    ctrl_fixture_t fx;
+    uint8_t enc[512], dec[512], type;
+    uint32_t session;
+    uint16_t seq;
+    size_t enc_len = 0;
+    pik_frame_t frame;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(handshake(&fx));
+
+    /* drop one frame: peer jumps a seq; link must survive and emit a NAK */
+    uint16_t lost_seq = fx.peer_seq;
+    fx.peer_seq++;
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_NAK);
+    CHECK(frame.payload_len == 2);
+    CHECK(((uint16_t)frame.payload[0] | (uint16_t)frame.payload[1] << 8) == lost_seq);
+
+    /* retransmit from the expected seq: both PINGs deliver, both PONGs return */
+    fx.peer_seq = lost_seq;
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_PONG);
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_PONG);
+    CHECK(pik_control_ready());
+    fixture_cleanup(&fx);
+}
+
+static void test_sequence_gap_budget_fails(void) {
     ctrl_fixture_t fx;
 
     CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
     CHECK(handshake(&fx));
     fx.peer_seq++;
     CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(pik_control_tick(pik_now_ms()));
+    CHECK(!pik_control_tick(pik_now_ms() + 600));
+    fixture_cleanup(&fx);
+}
+
+static void test_stale_prehello_frames_discarded(void) {
+    ctrl_fixture_t fx;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    /* stale non-HELLO traffic from a previous peer session arrives after our
+     * link opened: it must be discarded, and the handshake must still work */
+    CHECK(write_stale_config(&fx));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(handshake(&fx));
+    fixture_cleanup(&fx);
+}
+
+static void test_nak_triggers_retransmit(void) {
+    ctrl_fixture_t fx;
+    uint8_t enc[512], dec[512], type;
+    uint32_t session;
+    uint16_t seq;
+    size_t enc_len = 0;
+    pik_frame_t frame;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(handshake(&fx));
+    /* local side has sent seq 0..2 (HELLO, HELLO, CONFIG); ask for 2 again */
+    CHECK(send_peer_nak(&fx, 2));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_CONFIG);
+    CHECK(seq == 2);
+    CHECK(pik_control_ready());
+    fixture_cleanup(&fx);
+}
+
+static void test_nak_beyond_window_fails(void) {
+    ctrl_fixture_t fx;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(handshake(&fx));
+    CHECK(send_peer_nak(&fx, 100)); /* nothing near that in history */
     CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
     fixture_cleanup(&fx);
 }
@@ -361,7 +457,11 @@ int main(void) {
     test_missing_peer_handshake_times_out();
     test_stale_startup_input_is_flushed();
     test_late_peer_hello_retry_sequence();
-    test_sequence_gap_fails();
+    test_sequence_gap_naks_and_heals();
+    test_sequence_gap_budget_fails();
+    test_stale_prehello_frames_discarded();
+    test_nak_triggers_retransmit();
+    test_nak_beyond_window_fails();
     test_session_change_fails();
     test_unknown_type_fails();
     test_bad_crc_fails();

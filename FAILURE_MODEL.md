@@ -23,8 +23,8 @@ PiK1 does not:
 - validate G-code semantics;
 - enforce printer kinematics or heater safety;
 - decide whether motion, heating, or a print should continue;
-- retry printer-control traffic for correctness;
-- reconstruct lost traffic;
+- retry or reconstruct traffic above the link layer (link-layer
+  retransmission is a documented exception);
 - preserve sessions across ambiguous reconnects;
 - provide a safety interlock.
 
@@ -48,7 +48,7 @@ Avoid:
 
 - silent recovery from impossible states;
 - indefinite buffering;
-- replaying old traffic;
+- replaying traffic from a previous session or link generation;
 - guessing stream ownership;
 - preserving stale sessions;
 - keeping a connection superficially alive while useful traffic is broken;
@@ -74,6 +74,53 @@ These invariants should hold unless a narrow exception is documented and tested:
 13. PiK1 treats disconnect/reconnect as a new generation.
 14. PiK1 does not bind network services more broadly than intended.
 15. PiK1 is not required for printer thermal or motion safety.
+
+## Documented Exceptions
+
+### Link-layer retransmission (mux and control links, protocol 5+)
+
+Motivation: the K1's dwc2 USB host controller can silently drop in-flight
+bulk transfers (`dwc2_hc_chhltd_intr_dma: ChHltd set, but reason is unknown`;
+the driver retries the URB without reporting an error upward), which surfaces
+as a clean, CRC-valid gap in link sequence numbers roughly once per few hours
+of runtime. Failing the session on every such gap turns a recoverable
+transport fault into a Klipper estop.
+
+Mechanism: on a sequence gap the receiver delivers nothing past the gap,
+discards out-of-order frames, and sends a NAK link-control frame carrying the
+next expected sequence number. The sender re-sends byte-identical stored
+copies of the affected frames from a fixed-size history ring. NAK frames are
+outside the sequenced stream so they remain processable when both directions
+have gaps simultaneously.
+
+Why the invariants hold:
+
+- Delivery stays exactly-once and in-order; payloads are never generated,
+  modified, or reordered by PiK1 (invariants 1, 2). Duplicates arising from
+  retransmission overlap are detected by sequence number and discarded.
+- No replay across session boundaries: retransmit history lives and dies with
+  the link, and session change / reconnect behavior is unchanged
+  (invariants 3, 7, 13).
+- Bounded memory: history rings are fixed-size; frames age out
+  (invariants 5, 6).
+- Bounded time, then fail closed: an unhealed gap fails the link after
+  500 ms, and a NAK for a frame that has aged out of history fails the link
+  immediately (invariants 8, 11).
+- Corruption is never recovered: CRC/COBS/decode failures still fail the
+  link. Only clean, promptly-healed sequence gaps are recoverable.
+- Nothing is hidden: every gap, retransmit, heal (with latency and discard
+  counts), and budget failure is logged (invariants 9, 10).
+
+Related: for 2 s after a link opens, frames that cannot belong to a
+synchronized stream (stale first seq on the mux; non-HELLO before handshake
+on control) are discarded and counted instead of failing the fresh link,
+because an unsynchronized restart leaves the peer's stale frames in flight
+and fail-closing on them causes restart flapping. After the window the old
+fail-closed behavior applies unchanged.
+
+Tested in tests/test_serialmux_protocol.c and tests/test_control_protocol.c:
+gap→NAK→heal, budget expiry, NAK beyond window, duplicate discard,
+byte-identical retransmit, stale bring-up traffic, and grace expiry.
 
 ## Failure Classes
 
@@ -310,7 +357,6 @@ PiK1 should not:
 - spoof keepalives;
 - hide MCU disconnects;
 - keep a dead control path appearing alive;
-- retry printer-control traffic in a way that changes command timing;
 - delay emergency stop traffic behind stale buffered data;
 - prevent host shutdown behavior from triggering.
 

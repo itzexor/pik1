@@ -23,9 +23,25 @@
 #define TX_RING_CAP   8192u
 #define TX_RING_MASK  (TX_RING_CAP - 1u)
 
+/* Retransmit history: encoded copies of the most recent sequenced TX frames,
+ * kept so a peer NAK can be answered byte-identically (FAILURE_MODEL.md,
+ * "Documented Exceptions"). */
+#define HIST_CAP        4096u
+#define HIST_MASK       (HIST_CAP - 1u)
+#define HIST_SLOTS      64u         /* power of two, bounds frame count */
+
+#define NAK_RETRY_MS    100         /* re-send NAK while a gap persists */
+#define GAP_BUDGET_MS   500         /* unhealed gap fails the link */
+#define STALE_GRACE_MS  2000        /* discard stale frames after link open */
+
 #define HELLO_RETRY_MS 2000
 #define PING_IDLE_MS  3000
 #define LINK_DEAD_MS  10000
+
+typedef struct {
+    uint32_t off;   /* free-running byte offset into hist ring */
+    uint16_t len;
+} hist_ent_t;
 
 typedef struct {
     int fd;
@@ -43,6 +59,24 @@ typedef struct {
     uint32_t rx_session;
     uint16_t tx_seq;
     uint16_t rx_seq;
+
+    /* retransmit history of sent frames (encoded bytes + per-seq index) */
+    uint8_t hist[HIST_CAP];
+    hist_ent_t hist_ent[HIST_SLOTS];
+    uint16_t hist_first;            /* seq of oldest frame still held */
+    uint16_t hist_count;
+    uint32_t hist_head, hist_tail;
+    int64_t last_resend_ms;
+
+    /* receiver gap recovery */
+    int64_t gap_since_ms;           /* 0 = stream in sync */
+    int64_t last_nak_ms;
+    uint32_t gap_discards;
+    uint32_t dup_discards;
+
+    /* bring-up grace for stale frames from the peer's previous session */
+    int64_t opened_ms;
+    uint32_t stale_discards;
 
     int64_t last_tx_ms;
     int64_t last_rx_ms;
@@ -70,6 +104,16 @@ typedef struct {
 static control_t g_ctrl;
 static int g_epfd = -1;
 static int g_ctrl_tag;
+static int64_t g_now_ms;    /* updated on entry to start/dispatch/tick */
+
+/* Cumulative I/O counters (process lifetime, like tcpbridge's): dumped on
+ * every link failure so a dead link leaves evidence of what it was doing. */
+static uint64_t g_rx_frames;
+static uint64_t g_tx_frames;
+static uint64_t g_rx_reads;
+static uint64_t g_rx_bytes;
+static uint64_t g_tx_writes;
+static uint64_t g_tx_bytes;
 
 #define LOG(...) pik_log("ctrl", __VA_ARGS__)
 
@@ -142,7 +186,31 @@ static void update_epoll(void) {
     pik_epoll_set(g_epfd, g_ctrl.fd, want, &g_ctrl_tag);
 }
 
-static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
+static void hist_store(uint16_t seq, const uint8_t *enc, size_t enc_len) {
+    while (g_ctrl.hist_count &&
+           (g_ctrl.hist_count == HIST_SLOTS ||
+            HIST_CAP - (g_ctrl.hist_tail - g_ctrl.hist_head) < (uint32_t)enc_len)) {
+        g_ctrl.hist_head += g_ctrl.hist_ent[g_ctrl.hist_first % HIST_SLOTS].len;
+        g_ctrl.hist_first++;
+        g_ctrl.hist_count--;
+    }
+    if (!g_ctrl.hist_count) {
+        g_ctrl.hist_first = seq;
+        g_ctrl.hist_head = g_ctrl.hist_tail;
+    }
+    hist_ent_t *e = &g_ctrl.hist_ent[seq % HIST_SLOTS];
+    e->off = g_ctrl.hist_tail;
+    e->len = (uint16_t)enc_len;
+    for (size_t i = 0; i < enc_len; i++)
+        g_ctrl.hist[(g_ctrl.hist_tail + i) & HIST_MASK] = enc[i];
+    g_ctrl.hist_tail += (uint32_t)enc_len;
+    g_ctrl.hist_count++;
+}
+
+/* sequenced=false is for link-control frames (NAK): they consume no sequence
+ * number and are never retransmitted, so a peer can process them mid-gap. */
+static bool enqueue_frame_opt(uint8_t type, const uint8_t *payload, size_t plen,
+                              bool sequenced) {
     if (plen > PIK_CONTROL_MAX_PAYLOAD) {
         LOG("oversized frame type=0x%02x plen=%zu", type, plen);
         close_link();
@@ -170,7 +238,52 @@ static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
         close_link();
         return false;
     }
-    g_ctrl.tx_seq++;
+    if (sequenced) {
+        hist_store(g_ctrl.tx_seq, enc, enc_len);
+        g_ctrl.tx_seq++;
+    }
+    g_tx_frames++;
+    update_epoll();
+    return true;
+}
+
+static bool enqueue_frame(uint8_t type, const uint8_t *payload, size_t plen) {
+    return enqueue_frame_opt(type, payload, plen, true);
+}
+
+static void send_nak(int64_t now) {
+    uint8_t p[2] = { (uint8_t)g_ctrl.rx_seq, (uint8_t)(g_ctrl.rx_seq >> 8) };
+    enqueue_frame_opt(PIK_CONTROL_FRAME_NAK, p, sizeof(p), false);
+    g_ctrl.last_nak_ms = now;
+}
+
+static bool handle_nak(const uint8_t *p) {
+    uint16_t expected = (uint16_t)p[0] | (uint16_t)p[1] << 8;
+    uint16_t outstanding = (uint16_t)(g_ctrl.tx_seq - expected);
+    if (outstanding == 0) return true; /* peer caught up while the NAK was in flight */
+    if (outstanding > g_ctrl.hist_count) {
+        LOG("link failure: NAK beyond retransmit window expected=%u tx_seq=%u window=%u",
+            expected, g_ctrl.tx_seq, g_ctrl.hist_count);
+        close_link();
+        return false;
+    }
+    if (g_ctrl.last_resend_ms && g_now_ms - g_ctrl.last_resend_ms < NAK_RETRY_MS / 2)
+        return true; /* duplicate NAK burst; resend already queued */
+
+    LOG("retransmit: seq=%u..%u frames=%u (peer NAK)",
+        expected, (uint16_t)(g_ctrl.tx_seq - 1u), outstanding);
+    for (uint16_t s = expected; s != g_ctrl.tx_seq; s++) {
+        const hist_ent_t *e = &g_ctrl.hist_ent[s % HIST_SLOTS];
+        if (space() < e->len) {
+            LOG("TX ring full during retransmit");
+            close_link();
+            return false;
+        }
+        for (uint16_t i = 0; i < e->len; i++)
+            g_ctrl.txbuf[g_ctrl.tx_tail++ & TX_RING_MASK] =
+                g_ctrl.hist[(e->off + i) & HIST_MASK];
+    }
+    g_ctrl.last_resend_ms = g_now_ms;
     update_epoll();
     return true;
 }
@@ -267,6 +380,12 @@ static bool handle_config(const uint8_t *p, size_t len) {
 static void close_link(void) {
     g_ctrl.failed = true;
     if (g_ctrl.fd >= 0) {
+        LOG("link stats: rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu "
+            "tx_writes=%llu tx_bytes=%llu rx_seq=%u tx_seq=%u",
+            (unsigned long long)g_rx_frames, (unsigned long long)g_tx_frames,
+            (unsigned long long)g_rx_reads, (unsigned long long)g_rx_bytes,
+            (unsigned long long)g_tx_writes, (unsigned long long)g_tx_bytes,
+            g_ctrl.rx_seq, g_ctrl.tx_seq);
         pik_epoll_del(g_epfd, g_ctrl.fd);
         close(g_ctrl.fd);
         g_ctrl.fd = -1;
@@ -322,11 +441,14 @@ static bool handle_hello(const uint8_t *p, size_t len) {
 static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
     static uint8_t dec[FRAME_DEC_MAX];
     pik_frame_t frame;
+    g_rx_frames++;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, FRAME_ENC_MAX + 1,
                                              PIK_CONTROL_FRAME_HEADER_LEN, dec, sizeof(dec), &frame);
     if (st != PIK_FRAME_OK) {
-        LOG("frame failure: %s", pik_frame_status_text(st));
+        LOG("frame failure: %s enc_len=%zu first=0x%02x",
+            pik_frame_status_text(st), enc_len, enc_len ? enc[0] : 0);
+        pik_log_bad_frame_sample("ctrl", enc, enc_len);
         close_link();
         return false;
     }
@@ -342,27 +464,73 @@ static bool dispatch_frame(const uint8_t *enc, size_t enc_len) {
         close_link();
         return false;
     }
+
+    if (type == PIK_CONTROL_FRAME_NAK) {
+        /* Link-control: not sequenced, so it remains processable while the
+         * peer's inbound stream has a gap. Ignore unless it is provably from
+         * the live peer session. */
+        if (g_ctrl.rx_session == 0 || session != g_ctrl.rx_session) return true;
+        if (len != 2) {
+            LOG("bad NAK len=%zu", len);
+            close_link();
+            return false;
+        }
+        return handle_nak(p);
+    }
+
     if (g_ctrl.rx_session == 0) {
         if (type != PIK_CONTROL_FRAME_HELLO) {
-            LOG("bad first control frame type=0x%02x seq=%u", type, seq);
+            /* Stale in-flight frames from the peer's previous session are
+             * expected physics of an unsynchronized restart: discard them
+             * for a bounded window instead of failing the fresh link. */
+            if (g_now_ms - g_ctrl.opened_ms <= STALE_GRACE_MS) {
+                if (!g_ctrl.stale_discards)
+                    LOG("discarding stale bring-up frames (session=0x%08x seq=%u type=0x%02x)",
+                        session, seq, type);
+                g_ctrl.stale_discards++;
+                return true;
+            }
+            LOG("bad first control frame type=0x%02x seq=%u discarded=%u",
+                type, seq, g_ctrl.stale_discards);
             close_link();
             return false;
         }
         g_ctrl.rx_session = session;
         g_ctrl.rx_seq = seq + 1;
+        if (g_ctrl.stale_discards)
+            LOG("bring-up synchronized, discarded %u stale frames", g_ctrl.stale_discards);
     } else if (session != g_ctrl.rx_session) {
         LOG("control session changed old=0x%08x new=0x%08x type=0x%02x",
             g_ctrl.rx_session, session, type);
         close_link();
         return false;
     } else {
-        if (seq != g_ctrl.rx_seq) {
-            LOG("control seq gap seq=%u expected=%u type=0x%02x",
-                seq, g_ctrl.rx_seq, type);
-            close_link();
-            return false;
+        int16_t d = (int16_t)(seq - g_ctrl.rx_seq);
+        if (d < 0) {
+            /* duplicate from retransmission overlap; already delivered */
+            g_ctrl.dup_discards++;
+            return true;
+        }
+        if (d > 0) {
+            if (!g_ctrl.gap_since_ms) {
+                g_ctrl.gap_since_ms = g_now_ms;
+                g_ctrl.gap_discards = 0;
+                LOG("control seq gap seq=%u expected=%u type=0x%02x, requesting retransmit",
+                    seq, g_ctrl.rx_seq, type);
+                send_nak(g_now_ms);
+            }
+            g_ctrl.gap_discards++;
+            return !g_ctrl.failed;
         }
         g_ctrl.rx_seq++;
+        if (g_ctrl.gap_since_ms) {
+            LOG("retransmit healed: seq=%u latency=%lldms discarded=%u dups=%u",
+                seq, (long long)(g_now_ms - g_ctrl.gap_since_ms),
+                g_ctrl.gap_discards, g_ctrl.dup_discards);
+            g_ctrl.gap_since_ms = 0;
+            g_ctrl.gap_discards = 0;
+            g_ctrl.dup_discards = 0;
+        }
     }
 
     switch (type) {
@@ -486,6 +654,8 @@ static bool read_available(int64_t now) {
             return false;
         }
         g_ctrl.last_rx_ms = now;
+        g_rx_reads++;
+        g_rx_bytes += (uint64_t)n;
         g_ctrl.rxbuf_len += (size_t)n;
         if (!parse_rx()) return false;
     }
@@ -507,6 +677,8 @@ static bool drain_tx(int64_t now) {
         }
         g_ctrl.tx_head += (uint32_t)w;
         g_ctrl.last_tx_ms = now;
+        g_tx_writes++;
+        g_tx_bytes += (uint64_t)w;
     }
     update_epoll();
     return true;
@@ -543,6 +715,7 @@ bool pik_control_start(const char *dev, int64_t now) {
         return false;
     }
 
+    g_now_ms = now;
     g_ctrl.fd = fd;
     g_ctrl.ready = false;
     g_ctrl.failed = false;
@@ -552,6 +725,14 @@ bool pik_control_start(const char *dev, int64_t now) {
     g_ctrl.tx_session = pik_session_id(now);
     g_ctrl.rx_session = 0;
     g_ctrl.tx_seq = g_ctrl.rx_seq = 0;
+    g_ctrl.hist_first = g_ctrl.hist_count = 0;
+    g_ctrl.hist_head = g_ctrl.hist_tail = 0;
+    g_ctrl.last_resend_ms = 0;
+    g_ctrl.gap_since_ms = 0;
+    g_ctrl.last_nak_ms = 0;
+    g_ctrl.gap_discards = g_ctrl.dup_discards = 0;
+    g_ctrl.opened_ms = now;
+    g_ctrl.stale_discards = 0;
     g_ctrl.config_sent = false;
     g_ctrl.last_rx_ms = g_ctrl.last_tx_ms = now;
     pik_epoll_set(g_epfd, fd, EPOLLIN, &g_ctrl_tag);
@@ -565,6 +746,7 @@ bool pik_control_owns_event(void *ptr) {
 
 bool pik_control_dispatch(void *ptr, uint32_t events, int64_t now) {
     if (!pik_control_owns_event(ptr)) return true;
+    g_now_ms = now;
     if (events & (EPOLLERR | EPOLLHUP)) {
         close_link();
         return false;
@@ -577,9 +759,21 @@ bool pik_control_dispatch(void *ptr, uint32_t events, int64_t now) {
 }
 
 bool pik_control_tick(int64_t now) {
+    g_now_ms = now;
     if (g_ctrl.fd < 0 || g_ctrl.failed) return false;
     if (avail())
         drain_tx(now);
+    if (g_ctrl.gap_since_ms) {
+        if (now - g_ctrl.gap_since_ms > GAP_BUDGET_MS) {
+            LOG("link failure: seq gap not healed expected=%u after %dms discarded=%u",
+                g_ctrl.rx_seq, GAP_BUDGET_MS, g_ctrl.gap_discards);
+            close_link();
+            return false;
+        }
+        if (now - g_ctrl.last_nak_ms >= NAK_RETRY_MS)
+            send_nak(now);
+        if (g_ctrl.failed) return false;
+    }
     if (!g_ctrl.ready) {
         if (!avail() && (now - g_ctrl.last_tx_ms) > HELLO_RETRY_MS)
             send_hello();
@@ -608,14 +802,22 @@ bool pik_control_ready(void) {
 
 int64_t pik_control_deadline(void) {
     if (g_ctrl.fd < 0) return INT64_MAX;
+    int64_t a, b;
     if (!g_ctrl.ready) {
-        int64_t a = g_ctrl.last_tx_ms + HELLO_RETRY_MS;
-        int64_t b = g_ctrl.last_rx_ms + LINK_DEAD_MS;
-        return a < b ? a : b;
+        a = g_ctrl.last_tx_ms + HELLO_RETRY_MS;
+        b = g_ctrl.last_rx_ms + LINK_DEAD_MS;
+    } else {
+        a = g_ctrl.last_tx_ms + PING_IDLE_MS;
+        b = g_ctrl.last_rx_ms + LINK_DEAD_MS;
     }
-    int64_t a = g_ctrl.last_tx_ms + PING_IDLE_MS;
-    int64_t b = g_ctrl.last_rx_ms + LINK_DEAD_MS;
-    return a < b ? a : b;
+    int64_t dl = a < b ? a : b;
+    if (g_ctrl.gap_since_ms) {
+        int64_t c = g_ctrl.gap_since_ms + GAP_BUDGET_MS;
+        int64_t d = g_ctrl.last_nak_ms + NAK_RETRY_MS;
+        if (c < dl) dl = c;
+        if (d < dl) dl = d;
+    }
+    return dl;
 }
 
 void pik_control_cleanup(void) {
