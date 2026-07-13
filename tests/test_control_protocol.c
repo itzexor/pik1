@@ -388,22 +388,62 @@ static void test_unknown_type_fails(void) {
     fixture_cleanup(&fx);
 }
 
-static void test_bad_crc_fails(void) {
-    ctrl_fixture_t fx;
+static bool send_corrupt_ping(ctrl_fixture_t *fx) {
     uint8_t header[PIK_CONTROL_FRAME_HEADER_LEN];
     uint8_t enc[512];
     size_t enc_len = 0;
+    header[0] = PIK_CONTROL_FRAME_PING;
+    pik_put_u32le(header + 1, fx->peer_session);
+    put_u16le(header + 5, fx->peer_seq++);
+    if (!test_encode_frame(header, sizeof(header), NULL, 0,
+                           enc, sizeof(enc), &enc_len))
+        return false;
+    enc[1] ^= 0x40;
+    return test_write_all(fx->master, enc, enc_len);
+}
+
+static void test_bringup_corrupt_discarded(void) {
+    ctrl_fixture_t fx;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    /* torn residue of the peer's previous session arrives before the
+     * handshake: it is discarded and the handshake still completes */
+    CHECK(send_corrupt_ping(&fx));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    fx.peer_seq = 0;
+    CHECK(handshake(&fx));
+    fixture_cleanup(&fx);
+}
+
+static void test_synced_corrupt_frame_heals(void) {
+    ctrl_fixture_t fx;
+    uint8_t enc[512], dec[512], type;
+    uint32_t session;
+    uint16_t seq;
+    size_t enc_len = 0;
+    pik_frame_t frame;
 
     CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
     CHECK(handshake(&fx));
-    header[0] = PIK_CONTROL_FRAME_PING;
-    pik_put_u32le(header + 1, fx.peer_session);
-    put_u16le(header + 5, fx.peer_seq++);
-    CHECK(test_encode_frame(header, sizeof(header), NULL, 0,
-                            enc, sizeof(enc), &enc_len));
-    enc[1] ^= 0x40;
-    CHECK(test_write_all(fx.master, enc, enc_len));
-    CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+
+    /* a damaged frame past sync is a lost frame: NAK'd, not fatal */
+    uint16_t lost_seq = fx.peer_seq;
+    CHECK(send_corrupt_ping(&fx));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(pik_control_ready());
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_NAK);
+    CHECK(frame.payload_len == 2);
+    CHECK(((uint16_t)frame.payload[0] | (uint16_t)frame.payload[1] << 8) == lost_seq);
+
+    /* retransmit heals; the stream continues */
+    fx.peer_seq = lost_seq;
+    CHECK(send_peer_frame(&fx, PIK_CONTROL_FRAME_PING, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_control, 1000));
+    CHECK(read_local_frame(&fx, enc, sizeof(enc), &enc_len));
+    CHECK(decode_control(enc, enc_len, &type, &session, &seq, &frame, dec, sizeof(dec)));
+    CHECK(type == PIK_CONTROL_FRAME_PONG);
     fixture_cleanup(&fx);
 }
 
@@ -467,7 +507,8 @@ int main(void) {
     test_nak_beyond_window_fails();
     test_session_change_fails();
     test_unknown_type_fails();
-    test_bad_crc_fails();
+    test_bringup_corrupt_discarded();
+    test_synced_corrupt_frame_heals();
     test_command_callback_and_bad_action_ack();
     test_bad_ack_status_fails();
 

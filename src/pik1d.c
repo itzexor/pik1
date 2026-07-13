@@ -878,9 +878,10 @@ int main(int argc, char **argv) {
                     session_active = true;
                     session_confirmed = false;
                     usb_retry_at = 0;
-                    LOG("control session started: control=%s serial=%s%s%s",
-                        control_dev, serial_dev, has_tcp ? " tunnel=" : "",
-                        has_tcp ? tunnel_dev : "");
+                    if (pik_control_handshake_failures() == 0)
+                        LOG("control session started: control=%s serial=%s%s%s",
+                            control_dev, serial_dev, has_tcp ? " tunnel=" : "",
+                            has_tcp ? tunnel_dev : "");
                 } else {
                     pik_control_cleanup();
                     serialmux_cleanup();
@@ -967,13 +968,17 @@ int main(int argc, char **argv) {
 
             if (pik_control_owns_event(ptr)) {
                 if (session_active && !pik_control_dispatch(ptr, ev, now)) {
-                    LOG("control link failed, restarting session");
+                    /* quiet after the first failure of a dead-peer handshake
+                     * loop; control logs a periodic summary instead */
+                    if (pik_control_handshake_failures() <= 1) {
+                        LOG("control link failed, restarting session");
+                        last_usb_state = USB_WAIT_UNKNOWN;
+                    }
                     set_link_flags(0);
                     session_active = false;
                     session_confirmed = false;
                     session_teardown();
                     usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
-                    last_usb_state = USB_WAIT_UNKNOWN;
                 }
                 continue;
             }
@@ -1011,13 +1016,15 @@ int main(int argc, char **argv) {
         local_control_check_ack(now);
 
         if (session_active && !pik_control_tick(now)) {
-            LOG("control link failed, restarting session");
+            if (pik_control_handshake_failures() <= 1) {
+                LOG("control link failed, restarting session");
+                last_usb_state = USB_WAIT_UNKNOWN;
+            }
             set_link_flags(0);
             session_active = false;
             session_confirmed = false;
             session_teardown();
             usb_retry_at = now + pik_backoff_next(&usb_backoff_ms, RETRY_MAX_MS);
-            last_usb_state = USB_WAIT_UNKNOWN;
         }
 
         if (session_confirmed && !serialmux_tick(now)) {

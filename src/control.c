@@ -23,6 +23,10 @@
 #define PING_IDLE_MS  3000
 #define LINK_DEAD_MS  10000
 
+/* While the peer stays unreachable the handshake fails every LINK_DEAD_MS;
+ * log the first failure, then one summary line per this interval. */
+#define HANDSHAKE_REPORT_MS 600000
+
 typedef struct {
     pik_link_t lk;
 
@@ -45,6 +49,10 @@ typedef struct {
     size_t local_channel_count;
     pik_control_tcp_role_t local_tcp_role;
     bool config_sent;
+
+    uint32_t handshake_fails;          /* consecutive handshake RX timeouts */
+    uint32_t handshake_fails_reported;
+    int64_t  handshake_report_ms;
 } control_t;
 
 static control_t g_ctrl;
@@ -225,6 +233,12 @@ static bool handle_hello(const uint8_t *p, size_t len) {
 
     if (!g_ctrl.ready) {
         g_ctrl.ready = true;
+        if (g_ctrl.handshake_fails) {
+            LOG("handshake recovered after %u failed attempts", g_ctrl.handshake_fails);
+            g_ctrl.handshake_fails = 0;
+            g_ctrl.handshake_fails_reported = 0;
+            g_ctrl.lk.quiet = false;
+        }
         LOG("link up: release=%s protocol=%u features=0x%08x",
             release, proto, features);
         if (!send_hello())
@@ -331,6 +345,7 @@ void pik_control_init(int epfd, pik_control_role_t role,
         .nak_type    = PIK_CONTROL_FRAME_NAK,
         .has_aux     = false,
         .first_type  = PIK_CONTROL_FRAME_HELLO,
+        .heal_from_zero = true, /* handshake frames are idempotent */
         .max_payload = PIK_CONTROL_MAX_PAYLOAD,
         .txbuf       = s_txbuf,    .tx_cap     = TX_RING_CAP,
         .rxbuf       = s_rxbuf,    .rx_cap     = sizeof(s_rxbuf),
@@ -344,6 +359,7 @@ void pik_control_init(int epfd, pik_control_role_t role,
 }
 
 bool pik_control_start(const char *dev, int64_t now) {
+    g_ctrl.lk.quiet = g_ctrl.handshake_fails > 0;
     if (!pik_link_open(&g_ctrl.lk, dev, now))
         return false;
     g_ctrl.ready = false;
@@ -368,7 +384,17 @@ bool pik_control_tick(int64_t now) {
             (now - g_ctrl.lk.last_tx_ms) > HELLO_RETRY_MS)
             send_hello();
         if ((now - g_ctrl.lk.last_rx_ms) > LINK_DEAD_MS) {
-            LOG("handshake RX timeout");
+            g_ctrl.handshake_fails++;
+            if (g_ctrl.handshake_fails == 1) {
+                LOG("handshake RX timeout");
+                g_ctrl.handshake_report_ms = now;
+            } else if (now - g_ctrl.handshake_report_ms >= HANDSHAKE_REPORT_MS) {
+                LOG("handshake still failing: %u attempts in the last %llds",
+                    g_ctrl.handshake_fails - g_ctrl.handshake_fails_reported,
+                    (long long)((now - g_ctrl.handshake_report_ms) / 1000));
+                g_ctrl.handshake_report_ms = now;
+                g_ctrl.handshake_fails_reported = g_ctrl.handshake_fails;
+            }
             pik_link_fail(&g_ctrl.lk);
             return false;
         }
@@ -389,6 +415,10 @@ bool pik_control_tick(int64_t now) {
 
 bool pik_control_ready(void) {
     return g_ctrl.ready;
+}
+
+uint32_t pik_control_handshake_failures(void) {
+    return g_ctrl.handshake_fails;
 }
 
 int64_t pik_control_deadline(void) {

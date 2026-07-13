@@ -1,5 +1,5 @@
 #pragma once
 
 #define PIK1_RELEASE_VERSION "0.7.0"
-#define PIK1_PROTOCOL_VERSION 6u
+#define PIK1_PROTOCOL_VERSION 7u
 #define PIK1_FEATURE_FLAGS 0u

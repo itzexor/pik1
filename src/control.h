@@ -44,6 +44,9 @@ bool pik_control_dispatch(void *ptr, uint32_t events, int64_t now);
 bool pik_control_owns_event(void *ptr);
 bool pik_control_tick(int64_t now);
 bool pik_control_ready(void);
+/* Consecutive handshake RX timeouts since the last successful handshake; the
+ * supervisor uses this to quiet its per-attempt logging in a dead-peer loop. */
+uint32_t pik_control_handshake_failures(void);
 int64_t pik_control_deadline(void);
 void pik_control_cleanup(void);
 

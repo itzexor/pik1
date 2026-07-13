@@ -377,6 +377,9 @@ void serialmux_init(const serialmux_config_t *cfg, int epfd) {
         .nak_type    = PIK_SERIALMUX_FRAME_NAK,
         .has_aux     = true,
         .first_type  = 0,   /* first frame must carry seq 0 */
+        .heal_from_zero = true, /* mux sessions restart in lockstep via the
+                                 * control link, so a whole-session heal can
+                                 * only reach a peer that consumed nothing */
         .max_payload = PIK_SERIALMUX_MAX_PAYLOAD,
         .txbuf       = s_link_tx,       .tx_cap     = LINK_RING_CAP,
         .rxbuf       = s_link_rx,       .rx_cap     = sizeof(s_link_rx),

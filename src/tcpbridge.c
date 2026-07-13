@@ -419,6 +419,9 @@ static void run(void) {
         .nak_type    = PIK_TCPBRIDGE_FRAME_NAK,
         .has_aux     = true,
         .first_type  = 0,   /* first frame must carry seq 0 */
+        .heal_from_zero = false, /* bridges restart independently: restart
+                                  * with a fresh session rather than replay
+                                  * tunneled TCP a dead peer already relayed */
         .max_payload = PIK_TCPBRIDGE_MAX_PAYLOAD,
         .txbuf       = s_link_tx,       .tx_cap     = LINK_TX_CAP,
         .rxbuf       = s_link_rx,       .rx_cap     = sizeof(s_link_rx),

@@ -225,6 +225,32 @@ static void test_stale_bringup_frames_discarded_then_sync(void) {
     fixture_cleanup(&fx);
 }
 
+static void test_bringup_missed_start_naks_and_heals(void) {
+    mux_fixture_t fx;
+    captured_frame_t f;
+    CHECK(fixture_init(&fx));
+
+    /* the peer's live session is a few frames in when the link opens: the
+     * mux must ask it to heal from seq 0 instead of failing at grace expiry */
+    fx.peer_seq = 3;
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    CHECK(access(fx.pty_link, F_OK) != 0);
+    CHECK(read_mux_frame(&fx, &f));
+    CHECK(f.type == PIK_SERIALMUX_FRAME_NAK);
+    CHECK(f.session == fx.peer_session); /* heals the observed session */
+    CHECK(f.payload_len == 2);
+    CHECK(((uint16_t)f.payload[0] | (uint16_t)f.payload[1] << 8) == 0);
+
+    /* the peer retransmits from seq 0: the link synchronizes */
+    fx.peer_seq = 0;
+    for (int i = 0; i < 4; i++)
+        CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    CHECK(access(fx.pty_link, F_OK) == 0);
+    fixture_cleanup(&fx);
+}
+
 static void test_stale_frames_past_grace_fail(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
@@ -372,11 +398,54 @@ static void test_session_change_fails(void) {
     fixture_cleanup(&fx);
 }
 
-static void test_bad_crc_fails(void) {
+static void test_bringup_corrupt_frame_discarded(void) {
+    mux_fixture_t fx;
+    CHECK(fixture_init(&fx));
+
+    /* torn residue of the peer's previous session: discarded within grace */
+    CHECK(send_corrupt_frame(&fx));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+
+    /* a clean start still synchronizes */
+    fx.peer_seq = 0;
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    CHECK(access(fx.pty_link, F_OK) == 0);
+    fixture_cleanup(&fx);
+}
+
+static void test_bringup_corrupt_past_grace_fails(void) {
     mux_fixture_t fx;
     CHECK(fixture_init(&fx));
     CHECK(send_corrupt_frame(&fx));
-    CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    g_now_offset = 2001;
+    CHECK(!test_epoll_dispatch_one(fx.epfd, dispatch_mux_offset, 1000));
+    g_now_offset = 0;
+    fixture_cleanup(&fx);
+}
+
+static void test_synced_corrupt_frame_heals(void) {
+    mux_fixture_t fx;
+    captured_frame_t f;
+    CHECK(fixture_init(&fx));
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_READY, 7, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    CHECK(access(fx.pty_link, F_OK) == 0);
+
+    /* a damaged frame past sync is a lost frame: NAK'd, not fatal */
+    uint16_t lost_seq = fx.peer_seq;
+    CHECK(send_corrupt_frame(&fx));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    CHECK(read_mux_frame(&fx, &f));
+    CHECK(f.type == PIK_SERIALMUX_FRAME_NAK);
+    CHECK(f.payload_len == 2);
+    CHECK(((uint16_t)f.payload[0] | (uint16_t)f.payload[1] << 8) == lost_seq);
+
+    /* retransmit heals; the stream continues */
+    fx.peer_seq = lost_seq;
+    CHECK(send_peer_frame(&fx, PIK_SERIALMUX_FRAME_FLUSH, 7, NULL, 0));
+    CHECK(test_epoll_dispatch_one(fx.epfd, dispatch_mux, 1000));
+    CHECK(access(fx.pty_link, F_OK) != 0);
     fixture_cleanup(&fx);
 }
 
@@ -395,6 +464,7 @@ int main(void) {
     test_unknown_channel_fails();
     test_unknown_type_fails();
     test_stale_bringup_frames_discarded_then_sync();
+    test_bringup_missed_start_naks_and_heals();
     test_stale_frames_past_grace_fail();
     test_seq_gap_naks_and_heals();
     test_seq_gap_budget_fails();
@@ -402,7 +472,9 @@ int main(void) {
     test_nak_triggers_byte_identical_retransmit();
     test_nak_beyond_window_fails();
     test_session_change_fails();
-    test_bad_crc_fails();
+    test_bringup_corrupt_frame_discarded();
+    test_bringup_corrupt_past_grace_fails();
+    test_synced_corrupt_frame_heals();
     test_link_hup_fails();
 
     if (failures) {

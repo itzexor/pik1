@@ -81,18 +81,31 @@ These invariants should hold unless a narrow exception is documented and tested:
 
 Motivation: the K1's dwc2 USB host controller can silently drop in-flight
 bulk transfers (`dwc2_hc_chhltd_intr_dma: ChHltd set, but reason is unknown`;
-the driver retries the URB without reporting an error upward), which surfaces
-as a clean, CRC-valid gap in link sequence numbers roughly once per few hours
-of runtime. Failing the session on every such gap turns a recoverable
-transport fault into a Klipper estop.
+the driver retries the URB without reporting an error upward). When the
+dropped transfer aligns with frame boundaries this surfaces as a clean,
+CRC-valid gap in link sequence numbers; when it does not, the surviving
+fragments splice into a torn frame that fails CRC. Failing the session on
+every such fault turns a recoverable transport fault into a Klipper estop.
 
 Mechanism: on a sequence gap the receiver delivers nothing past the gap,
 discards out-of-order frames, and sends a NAK link-control frame carrying the
-next expected sequence number. The sender re-sends byte-identical stored
-copies of the affected frames from a fixed-size history ring. NAK frames are
-outside the sequenced stream so they remain processable when both directions
-have gaps simultaneously, and they carry the session they are healing so the
-sender can verify them even when its own inbound direction has been silent.
+next expected sequence number. A synchronized receiver treats a frame that
+fails CRC/COBS/decode as a lost frame (protocol 7+): the damaged frame is
+dropped, never delivered, and the same NAK path heals it. The sender re-sends
+byte-identical stored copies of the affected frames from a fixed-size history
+ring. NAK frames are outside the sequenced stream so they remain processable
+when both directions have gaps simultaneously, and they carry the session
+they are healing so the sender can verify them even when its own inbound
+direction has been silent.
+
+A whole-session NAK (expected seq 0) can only come from a peer that saw none
+of the session — a restarted bring-up receiver (below). The mux and control
+links answer it from history: their sessions restart in lockstep, so the
+requester can never have consumed part of the session through a previous
+incarnation. The TCP bridge restarts independently of its peer, so it fails
+the link and reopens with a fresh session instead, guaranteeing tunneled TCP
+is never replayed toward endpoints that may already have seen it
+(invariant 3).
 
 Why the invariants hold:
 
@@ -107,23 +120,32 @@ Why the invariants hold:
 - Bounded time, then fail closed: an unhealed gap fails the link after
   500 ms, and a NAK for a frame that has aged out of history fails the link
   immediately (invariants 8, 11).
-- Corruption is never recovered: CRC/COBS/decode failures still fail the
-  link. Only clean, promptly-healed sequence gaps are recoverable.
+- Corrupted input is never delivered: a frame that fails CRC/COBS/decode is
+  dropped without being parsed further (invariant 4). Post-sync it opens the
+  same 500 ms heal-or-fail gap window, so a persistently garbled link still
+  fails closed; pre-sync it is discarded within the bring-up grace window
+  and fails the link after it.
 - Nothing is hidden: every gap, retransmit, heal (with latency and discard
   counts), and budget failure is logged (invariants 9, 10).
 
 Related: for 2 s after a link opens, frames that cannot belong to a
-synchronized stream (stale first seq on the mux; non-HELLO before handshake
-on control) are discarded and counted instead of failing the fresh link,
-because an unsynchronized restart leaves the peer's stale frames in flight
-and fail-closing on them causes restart flapping. After the window the old
-fail-closed behavior applies unchanged.
+synchronized stream (stale first seq or torn residue on the mux and bridge;
+non-HELLO before handshake on control) are discarded and counted instead of
+failing the fresh link, because an unsynchronized restart leaves the peer's
+stale frames in flight and fail-closing on them causes restart flapping. On
+handshake-less links (mux, bridge) the receiver also NAKs the observed
+session for seq 0 while discarding (protocol 7+): a live session it opened
+into mid-stream is healed from history or forced onto a fresh session by the
+whole-session rule above, while residue of a dead session ignores the NAK.
+After the window the old fail-closed behavior applies unchanged.
 
 Tested in tests/test_serialmux_protocol.c and tests/test_control_protocol.c
 (gap→NAK→heal, budget expiry, NAK beyond window, duplicate discard,
-byte-identical retransmit, stale bring-up traffic, and grace expiry) and in
-tests/test_tcpbridge_integration.py (end-to-end frame drop healed without
-data loss).
+byte-identical retransmit, stale/torn bring-up traffic, grace expiry,
+missed-start bring-up heal, and corrupt-frame heal) and in
+tests/test_tcpbridge_integration.py (end-to-end frame drop and frame
+corruption healed without data loss; forwarder restart mid-session forces a
+fresh listener session and recovers).
 
 ## Failure Classes
 

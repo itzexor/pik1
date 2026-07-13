@@ -28,6 +28,11 @@ typedef struct {
     bool        has_aux;    /* header carries an aux byte after type */
     uint8_t     first_type; /* nonzero: first sequenced frame must be this type
                              * (seq adopted); zero: first frame must carry seq 0 */
+    bool        heal_from_zero; /* answer a whole-session NAK (expected seq 0)
+                                 * with a retransmit from history; false fails
+                                 * the link instead so it reopens with a fresh
+                                 * session, guaranteeing no replay of frames a
+                                 * previous peer incarnation already consumed */
     size_t      max_payload;
 
     /* caller-owned buffers; ring capacities must be powers of two */
@@ -56,6 +61,8 @@ typedef struct {
     int      epfd;
     int      fd;
     bool     failed;
+    bool     quiet;         /* suppress per-attempt open/stats logs while the
+                             * owner is in a known-down retry loop */
     uint32_t epev;
     size_t   header_len;
     size_t   enc_max;       /* per-frame encoded ceiling incl. delimiter */

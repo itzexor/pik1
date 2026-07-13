@@ -60,12 +60,13 @@ static void update_epoll(pik_link_t *lk) {
 void pik_link_fail(pik_link_t *lk) {
     lk->failed = true;
     if (lk->fd < 0) return;
-    LOGL(lk, "link stats: rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu "
-         "tx_writes=%llu tx_bytes=%llu rx_seq=%u tx_seq=%u",
-         (unsigned long long)lk->rx_frames, (unsigned long long)lk->tx_frames,
-         (unsigned long long)lk->rx_reads, (unsigned long long)lk->rx_bytes,
-         (unsigned long long)lk->tx_writes, (unsigned long long)lk->tx_bytes,
-         lk->rx_seq, lk->tx_seq);
+    if (!lk->quiet)
+        LOGL(lk, "link stats: rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu "
+             "tx_writes=%llu tx_bytes=%llu rx_seq=%u tx_seq=%u",
+             (unsigned long long)lk->rx_frames, (unsigned long long)lk->tx_frames,
+             (unsigned long long)lk->rx_reads, (unsigned long long)lk->rx_bytes,
+             (unsigned long long)lk->tx_writes, (unsigned long long)lk->tx_bytes,
+             lk->rx_seq, lk->tx_seq);
     pik_epoll_del(lk->epfd, lk->fd);
     close(lk->fd);
     lk->fd = -1;
@@ -97,11 +98,12 @@ static void hist_store(pik_link_t *lk, uint16_t seq, const uint8_t *enc, size_t 
 
 /* sequenced=false is for link-control frames (NAK): they consume no sequence
  * number and are never retransmitted, so a peer can process them mid-gap.
- * They carry the session they are healing (our RX session, i.e. the peer's TX
- * session) so the peer can verify them against its own TX session even when
- * it has never received a sequenced frame from us. */
+ * They carry the session they are healing (the peer's TX session) so the peer
+ * can verify them against its own TX session even when it has never received
+ * a sequenced frame from us. */
 static bool enqueue_opt(pik_link_t *lk, uint8_t type, uint8_t aux,
-                        const uint8_t *payload, size_t plen, bool sequenced) {
+                        const uint8_t *payload, size_t plen,
+                        bool sequenced, uint32_t session) {
     if (lk->fd < 0 || lk->failed) return false;
     if (plen > lk->cfg.max_payload) {
         LOGL(lk, "oversized frame type=0x%02x aux=%u plen=%zu", type, aux, plen);
@@ -114,7 +116,7 @@ static bool enqueue_opt(pik_link_t *lk, uint8_t type, uint8_t aux,
     size_t aux_off = lk->cfg.has_aux ? 1u : 0u;
     header[0] = type;
     if (lk->cfg.has_aux) header[1] = aux;
-    pik_put_u32le(header + 1 + aux_off, sequenced ? lk->tx_session : lk->rx_session);
+    pik_put_u32le(header + 1 + aux_off, session);
     header[hl - 2] = (uint8_t)lk->tx_seq;
     header[hl - 1] = (uint8_t)(lk->tx_seq >> 8);
 
@@ -145,19 +147,33 @@ static bool enqueue_opt(pik_link_t *lk, uint8_t type, uint8_t aux,
 
 bool pik_link_enqueue(pik_link_t *lk, uint8_t type, uint8_t aux,
                       const uint8_t *payload, size_t plen) {
-    return enqueue_opt(lk, type, aux, payload, plen, true);
+    return enqueue_opt(lk, type, aux, payload, plen, true, lk->tx_session);
+}
+
+static void send_nak_for(pik_link_t *lk, uint32_t session, uint16_t expected,
+                         int64_t now) {
+    uint8_t p[2] = { (uint8_t)expected, (uint8_t)(expected >> 8) };
+    enqueue_opt(lk, lk->cfg.nak_type, 0, p, sizeof(p), false, session);
+    lk->last_nak_ms = now;
 }
 
 static void send_nak(pik_link_t *lk, int64_t now) {
-    uint8_t p[2] = { (uint8_t)lk->rx_seq, (uint8_t)(lk->rx_seq >> 8) };
-    enqueue_opt(lk, lk->cfg.nak_type, 0, p, sizeof(p), false);
-    lk->last_nak_ms = now;
+    send_nak_for(lk, lk->rx_session, lk->rx_seq, now);
 }
 
 static void handle_nak(pik_link_t *lk, const uint8_t *p) {
     uint16_t expected = (uint16_t)p[0] | (uint16_t)p[1] << 8;
     uint16_t outstanding = (uint16_t)(lk->tx_seq - expected);
     if (outstanding == 0) return; /* peer caught up while the NAK was in flight */
+    if (expected == 0 && !lk->cfg.heal_from_zero) {
+        /* A whole-session heal request means the peer saw none of this
+         * session (a synchronized peer's NAKs always carry expected >= 1):
+         * a fresh session avoids replaying frames a previous peer
+         * incarnation may already have consumed. */
+        LOGL(lk, "link failure: peer requested whole-session retransmit, restarting");
+        pik_link_fail(lk);
+        return;
+    }
     if (outstanding > lk->hist_count) {
         LOGL(lk, "link failure: NAK beyond retransmit window expected=%u tx_seq=%u window=%u",
              expected, lk->tx_seq, lk->hist_count);
@@ -192,6 +208,30 @@ static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
                                              lk->header_len, s_dec, sizeof(s_dec),
                                              &frame);
     if (st != PIK_FRAME_OK) {
+        if (lk->rx_session == 0 &&
+            lk->now_ms - lk->opened_ms <= PIK_LINK_STALE_GRACE_MS) {
+            /* torn residue of the peer's previous session: same physics as
+             * stale bring-up frames, discard within the grace window */
+            if (!lk->stale_discards)
+                LOGL(lk, "discarding stale bring-up garbage (%s enc_len=%zu)",
+                     pik_frame_status_text(st), enc_len);
+            lk->stale_discards++;
+            return;
+        }
+        if (lk->rx_session != 0) {
+            /* a damaged frame is a lost frame: drop it and let the NAK
+             * machinery heal it, bounded by the same gap budget */
+            if (!lk->gap_since_ms) {
+                lk->gap_since_ms = lk->now_ms;
+                lk->gap_discards = 0;
+                LOGL(lk, "bad frame (%s enc_len=%zu), requesting retransmit",
+                     pik_frame_status_text(st), enc_len);
+                pik_log_bad_frame_sample(lk->cfg.name, enc, enc_len);
+                send_nak(lk, lk->now_ms);
+            }
+            lk->gap_discards++;
+            return;
+        }
         LOGL(lk, "link failure: %s enc_len=%zu first=0x%02x",
              pik_frame_status_text(st), enc_len, enc_len ? enc[0] : 0);
         pik_log_bad_frame_sample(lk->cfg.name, enc, enc_len);
@@ -241,6 +281,12 @@ static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
                     LOGL(lk, "discarding stale bring-up frames (session=0x%08x seq=%u type=0x%02x aux=%u)",
                          session, seq, type, aux);
                 lk->stale_discards++;
+                /* If these frames are a live session whose start we missed,
+                 * ask the peer to heal it from seq 0 (or restart if it no
+                 * longer can); residue of a dead session ignores the NAK. */
+                if (!lk->cfg.first_type &&
+                    lk->now_ms - lk->last_nak_ms >= PIK_LINK_NAK_RETRY_MS)
+                    send_nak_for(lk, session, 0, lk->now_ms);
                 return;
             }
             LOGL(lk, "link failure: stale frames past bring-up grace seq=%u type=0x%02x aux=%u discarded=%u",
@@ -424,7 +470,8 @@ bool pik_link_open(pik_link_t *lk, const char *dev, int64_t now) {
     lk->tx_token_ms = now;
     lk->last_rx_ms = lk->last_tx_ms = now;
     pik_epoll_set(lk->epfd, fd, EPOLLIN, lk);
-    LOGL(lk, "link opened: %s", dev);
+    if (!lk->quiet)
+        LOGL(lk, "link opened: %s", dev);
     return true;
 }
 
@@ -482,6 +529,7 @@ void pik_link_cleanup(pik_link_t *lk) {
         lk->fd = -1;
     }
     lk->failed = false;
+    lk->quiet = false;
     lk->epev = 0;
     lk->tx_head = lk->tx_tail = 0;
     lk->rxbuf_len = 0;
