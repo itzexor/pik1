@@ -26,7 +26,7 @@ TCP_PORT="7125"
 DAEMON_ARGS="--usb $USB_ID \
     mcu:0:$CH0_DEV:$CH0_BAUD \
     mcu:1:$CH1_DEV:$CH1_BAUD \
-    listen:$TCP_ADDR:$TCP_PORT"
+    @TCP_SPEC@"
 
 case "$1" in
     start)

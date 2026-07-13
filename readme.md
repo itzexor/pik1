@@ -261,6 +261,13 @@ unreliable enough that you will eventually lose display functionality mid-print.
 The tunnel runs over the same wired USB connection as the control and MCU
 bridges and stays up as long as the physical connection does.
 
+If you don't use a K1 screen UI, install with `./update.sh --no-screen`
+(short: `-n`) **on both devices**, or `make install-k1 SCREEN=0` /
+`make install-pi SCREEN=0` when using the make targets directly: it disables
+the K1 screen services (`S99guppyscreen`, `S99grumpyscreen`) and omits the TCP
+tunnel channel from both daemons. By default the screen services are left
+alone and the tunnel is enabled.
+
 The tunnel is low-bandwidth and intended for Moonraker API traffic only
 (temperatures, print status, controls). Do not route webcam streams or file
 transfers through it.

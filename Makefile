@@ -29,7 +29,22 @@ K1_DIR          ?= /usr/data/pik1
 K1_INIT_DIR     := /etc/init.d
 K1_DISABLE_SVCS := S50nginx_service S50unslung S50webcam \
                    S55klipper_mcu S55klipper_service \
-                   S56moonraker_service S99guppyscreen
+                   S56moonraker_service
+K1_SCREEN_SVCS  := S99guppyscreen S99grumpyscreen
+
+# Screen support. The K1 screen UIs reach Moonraker on the Pi through the
+# TCP tunnel, so the tunnel and the screen services travel together: pass
+# SCREEN=0 (to install on both ends) to disable the screen services on the
+# K1 and omit the TCP tunnel channel from both daemons.
+SCREEN ?= 1
+ifeq ($(SCREEN),0)
+K1_DISABLE_SVCS += $(K1_SCREEN_SVCS)
+K1_TCP_SPEC     :=
+PI_TCP_SPEC     :=
+else
+K1_TCP_SPEC     := listen:$$TCP_ADDR:$$TCP_PORT
+PI_TCP_SPEC     := forward:127.0.0.1:7125
+endif
 
 PI_DIR          ?= /opt/pik1
 PI_SYSTEMD_DIR  ?= /etc/systemd/system
@@ -151,7 +166,7 @@ $(TEST_BUILD):
 	mkdir -p $@
 
 $(BUILD)/S99pik1: files/k1/S99pik1.in FORCE | $(BUILD)
-	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
+	sed -e 's|@INSTALL_DIR@|$(K1_DIR)|g' -e 's|@TCP_SPEC@|$(K1_TCP_SPEC)|g' $< > $@
 
 $(BUILD)/shutdown_command.sh: files/k1/shutdown_command.sh.in FORCE | $(BUILD)
 	sed 's|@INSTALL_DIR@|$(K1_DIR)|g' $< > $@
@@ -196,7 +211,7 @@ install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
 uninstall-k1:
 	rm -f $(K1_INIT_DIR)/S99pik1
 	rm -f $(K1_DIR)/pik1d $(K1_DIR)/tcpbridge $(K1_DIR)/shutdown_command.sh
-	@for svc in $(K1_DISABLE_SVCS); do \
+	@for svc in $(sort $(K1_DISABLE_SVCS) $(K1_SCREEN_SVCS)); do \
 		if [ -f $(K1_INIT_DIR)/_$$svc ]; then \
 			echo "Restoring $$svc"; \
 			mv $(K1_INIT_DIR)/_$$svc $(K1_INIT_DIR)/$$svc; \
@@ -212,7 +227,8 @@ install-pi:
 	$(SUDO) install -m 755 $(BUILD)/pik1d.aarch64     $(PI_DIR)/pik1d
 	$(SUDO) install -m 755 $(BUILD)/tcpbridge.aarch64  $(PI_DIR)/tcpbridge
 	$(SUDO) install -m 755 files/pi/setup_otg.sh $(PI_DIR)/setup_otg.sh
-	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' files/pi/pik1.service.in | \
+	sed -e 's|@INSTALL_DIR@|$(PI_DIR)|g' -e 's|@TCP_SPEC@|$(PI_TCP_SPEC)|g' \
+		files/pi/pik1.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1.service > /dev/null
 	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' files/pi/pik1-peer-reboot.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-reboot.service > /dev/null

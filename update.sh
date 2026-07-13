@@ -6,21 +6,37 @@
 set -eu
 
 usage() {
-    echo "usage: $0 [k1|pi]" >&2
+    echo "usage: $0 [-n|--no-screen] [k1|pi]" >&2
+    echo "  -n, --no-screen   disable the K1 screen services and omit the TCP tunnel" >&2
     exit 1
 }
 
-[ $# -le 1 ] || usage
-if [ $# -eq 1 ]; then
-    target=$1
-elif command -v systemctl > /dev/null 2>&1; then
-    target=pi
-else
-    target=k1
+screen=1
+target=
+for arg in "$@"; do
+    case "$arg" in
+    k1|pi)
+        target=$arg
+        ;;
+    -n|--no-screen)
+        screen=0
+        ;;
+    *)
+        usage
+        ;;
+    esac
+done
+
+if [ -z "$target" ]; then
+    if command -v systemctl > /dev/null 2>&1; then
+        target=pi
+    else
+        target=k1
+    fi
 fi
 cd "$(dirname "$0")"
 
-echo "updating $target install"
+echo "updating $target install (screen=$screen)"
 case "$target" in
 k1)
     installed=0
@@ -32,7 +48,7 @@ k1)
         make uninstall-k1
     fi
     git pull --ff-only
-    make install-k1
+    make install-k1 SCREEN=$screen
     /etc/init.d/S99pik1 start
     echo "update.sh: done"
     if [ "$installed" = 0 ]; then
@@ -49,11 +65,8 @@ pi)
         make uninstall-pi
     fi
     git pull --ff-only
-    make install-pi
+    make install-pi SCREEN=$screen
     sudo systemctl start pik1.service
     echo "update.sh: done"
-    ;;
-*)
-    usage
     ;;
 esac
