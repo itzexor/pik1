@@ -28,7 +28,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$target" ]; then
-    if command -v systemctl > /dev/null 2>&1; then
+    if [ -d /etc/systemd ]; then
         target=pi
     else
         target=k1
