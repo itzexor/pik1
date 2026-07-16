@@ -7,9 +7,13 @@
 ## Overview
 
 `pik1d` is a small C daemon that bridges the K1 MCU serial ports to PTYs on the
-Pi over a USB CDC ACM link. It uses the `serialmux` code for the MCU channels and
-can also launch a sibling `tcpbridge` process for a second CDC ACM link used by
-the touchscreen Moonraker tunnel.
+Pi over one vendor bulk USB link. All traffic is multiplexed onto that one
+sequenced link by channel: wire channel 0 is the control service (version
+checks, link liveness, and remote restart/shutdown commands -- see
+[Peer commands](#peer-commands)), wire channels 1-8 carry the MCU serial mux
+(`mcu:N` / `pty:N` use user-facing channels 0-7), and wire channel 15 carries
+the touchscreen Moonraker TCP tunnel. A priority scheduler keeps control and
+MCU traffic ahead of tunnel bursts on the shared pipe.
 
 The TCP tunnel is intended for low-bandwidth Moonraker API traffic from the K1
 touchscreen to the Pi. It should not be used for high-bandwidth traffic such as
@@ -67,23 +71,26 @@ webcam streams or file transfers.
 
 The following files are involved:
 
-- `src/` -- C source for `pik1d`, `tcpbridge`, and the shared serial mux code
-- `S99pik1.in` -- K1 init script template, rendered to `build/S99pik1`
-- `setup_pik1.sh` -- Pi gadget setup script
-- `pik1.service.in` -- Pi systemd service template
+- `src/` -- C source for `pik1d` (session, control, serial mux, and TCP tunnel services)
+- `files/k1/S99pik1.in` -- K1 init script template, rendered to `build/S99pik1`
+- `files/k1/shutdown_command.sh.in` -- K1 shutdown/reboot wrapper that propagates to the Pi
+- `files/pi/pik1-polkit.rules.in` -- polkit rule letting the Pi daemon power off/reboot
+- `files/pi/pik1.service.in` -- Pi systemd service template; `pik1d` owns
+  configfs, FunctionFS descriptors, UDC binding, and PTY permissions
+- `update.sh` -- on-device installer/updater: stops the service if running, uninstalls, pulls, reinstalls, restarts; auto-detects the target (`./update.sh`, or pass `k1`/`pi` to override)
 
 ### Binaries
 
-Pre-built binaries for K1 (`build/pik1d.mipsel`, `build/tcpbridge.mipsel`) and
-Pi (`build/pik1d.aarch64`, `build/tcpbridge.aarch64`) are included in the repo
-and are updated with each release. Normal installs use these included files.
-On a development machine, you can optionally rebuild them from source with the
-cross-compiler targets:
+Pre-built binaries for K1 (`build/pik1d.mipsel`) and Pi
+(`build/pik1d.aarch64`) are included in the repo and are updated with each
+release. Normal installs use these included files. On a development machine,
+you can optionally rebuild them from source with the cross-compiler targets:
 
 ```bash
 make toolchain   # one-time: downloads musl.cc cross-compilers into .toolchain/
-make mipsel      # K1 binaries → build/pik1d.mipsel, build/tcpbridge.mipsel
-make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
+make mipsel      # K1 binary → build/pik1d.mipsel
+make aarch64     # Pi binary → build/pik1d.aarch64
+make test        # native non-hardware unit and CLI smoke tests
 ```
 
 ### Raspberry Pi side
@@ -126,24 +133,24 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
     From the repo directory on the Pi, using the included pre-built binaries:
 
     ```bash
-    make install-pi
+    ./update.sh
     ```
 
-    This copies the binaries and setup script to `/opt/pik1/`, installs and enables
-    `pik1.service`, and runs `systemctl daemon-reload`. Pass `SUDO=` if running as
-    root, or `PI_DIR=/your/path` to override the install prefix.
+    This handles first installs and updates alike: it stops `pik1.service` if
+    running, uninstalls any previous version, pulls the latest revision, and
+    installs and starts the new one. Installation copies the binary to
+    `/opt/pik1/`, installs and enables `pik1.service` and the peer
+    reboot/poweroff helper units, removes stale script-era files, and runs
+    `systemctl daemon-reload`.
 
-    The service runs `setup_pik1.sh` as root first (needed for configfs access),
-    then starts `pik1d` as UID 1000 so the PTY devices it creates
-    are accessible to Klipper.
+    For custom options, run the make targets directly (`make install-pi` /
+    `make uninstall-pi`), passing `SUDO=` if running as root or
+    `PI_DIR=/your/path` to override the install prefix. The same variables
+    pass through `./update.sh` from the environment.
 
-    If there are any weird permissions errors then make sure UID 1000 (your klipper user,
-    typically `pi` or similar) is in the `dialout` group so it can open `/dev/ttyGS0`
-    and `/dev/ttyGS1`:
-
-    ```bash
-    sudo usermod -aG dialout $(id -un 1000)
-    ```
+    The service runs `pik1d` as root because the daemon owns configfs,
+    FunctionFS descriptors, UDC binding, and PTY permissions for the symlinks
+    Klipper opens.
 
 4. #### Configure printer.cfg
     Add or update the MCU serial paths in your `printer.cfg`:
@@ -169,13 +176,16 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
     From a slim repo clone on the K1, such as `/root/pik1`:
 
     ```bash
-    make install-k1
+    ./update.sh
     ```
 
-    This copies `build/pik1d.mipsel` and `build/tcpbridge.mipsel` to
-    `/usr/data/pik1/`, renders and installs `/etc/init.d/S99pik1`, and
-    disables the services below by renaming them with a `_` prefix so the init
-    system skips them. To use a different install directory, pass the same
+    This handles first installs and updates alike: it stops the service if
+    running, uninstalls any previous version, pulls the latest revision, and
+    installs and starts the new one. Installation copies `build/pik1d.mipsel`
+    to `/usr/data/pik1/`, renders and installs
+    `/etc/init.d/S99pik1`, and disables the services below by renaming them
+    with a `_` prefix so the init system skips them. To use a different
+    install directory, run the make targets directly, passing the same
     `K1_DIR` value at install and uninstall time:
 
     ```bash
@@ -202,9 +212,8 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
     make render-k1-init K1_DIR="$K1_DIR"
     ssh root@<k1-ip> "mkdir -p $K1_DIR"
     scp build/pik1d.mipsel root@<k1-ip>:$K1_DIR/pik1d
-    scp build/tcpbridge.mipsel root@<k1-ip>:$K1_DIR/tcpbridge
     scp build/S99pik1 root@<k1-ip>:/etc/init.d/S99pik1
-    ssh root@<k1-ip> "chmod +x $K1_DIR/pik1d $K1_DIR/tcpbridge /etc/init.d/S99pik1"
+    ssh root@<k1-ip> "chmod +x $K1_DIR/pik1d /etc/init.d/S99pik1"
     ```
 
     Then disable the K1-side services that should not start in bridge mode:
@@ -240,28 +249,39 @@ make aarch64     # Pi binaries → build/pik1d.aarch64, build/tcpbridge.aarch64
 ## K1 touchscreen TCP tunnel
 
 The TCP tunnel forwards the Simple AF K1 touchscreen's (guppyscreen) Moonraker
-requests to the Pi over the second USB CDC ACM link. This is strongly recommended over the
-alternative of pointing guppyscreen at the Pi's WiFi IP address -- WiFi is
-unreliable enough that you will eventually lose display functionality mid-print.
-The tunnel runs over the same wired USB link as the MCU bridge and stays up as
-long as the physical connection does.
+requests to the Pi over a dedicated channel of the shared USB link. This is
+strongly recommended over the alternative of pointing guppyscreen at the Pi's
+WiFi IP address -- WiFi is unreliable enough that you will eventually lose
+display functionality mid-print. The tunnel runs over the same wired USB
+connection as the control and MCU services and stays up as long as the
+physical connection does. Tunnel frames are kept small and scheduled behind
+control and MCU traffic, so a busy screen cannot delay printing.
+
+If you don't use a K1 screen UI, install with `./update.sh --no-screen`
+(short: `-n`) **on both devices**, or `make install-k1 SCREEN=0` /
+`make install-pi SCREEN=0` when using the make targets directly: it disables
+the K1 screen services (`S99guppyscreen`, `S99grumpyscreen`) and omits the TCP
+tunnel channel from both daemons. By default the screen services are left
+alone and the tunnel is enabled.
 
 The tunnel is low-bandwidth and intended for Moonraker API traffic only
 (temperatures, print status, controls). Do not route webcam streams or file
 transfers through it.
 
-The included K1 init script and Pi systemd service enable this tunnel by default
-with matching `tcp:` specs. guppyscreen requires no configuration changes -- it
-continues talking to `localhost:7125` as normal and the tunnel forwards those
-connections to the Pi transparently.
+The included K1 init script and Pi systemd service enable this tunnel by default.
+The K1 side uses `listen:` because guppyscreen connects there; the Pi side uses
+`forward:` because it connects onward to Moonraker. guppyscreen requires no
+configuration changes -- it continues talking to `localhost:7125` as normal and
+the tunnel forwards those connections to the Pi transparently.
 
-**K1 init script** -- `/etc/init.d/S99pik1` starts `pik1d` in MCU-exporting mode:
+**K1 init script** -- `/etc/init.d/S99pik1` starts `pik1d` with physical MCU UARTs
+and a local TCP listener:
 
 ```sh
-DAEMON_ARGS="--usb $USB_ID \
+DAEMON_ARGS="--usb \
     mcu:0:$CH0_DEV:$CH0_BAUD \
     mcu:1:$CH1_DEV:$CH1_BAUD \
-    tcp:$TCP_ADDR:$TCP_PORT"
+    listen:$TCP_ADDR:$TCP_PORT"
 ```
 
 Also re-enable guppyscreen if you disabled it:
@@ -271,16 +291,18 @@ mv /etc/init.d/_S99guppyscreen /etc/init.d/S99guppyscreen
 
 `TCP_ADDR` is `127.0.0.1` by default so only local touchscreen requests are
 accepted on the K1. Set it to `0.0.0.0` only if you deliberately want the
-forwarded listener exposed on the K1 network interface.
+forwarded listener exposed on the K1 network interface. The TCP tunnel is not
+authenticated; wildcard binds expose raw forwarded Moonraker traffic to any
+client that can reach that port.
 
-**Pi systemd service** -- `/etc/systemd/system/pik1.service` starts `pik1d` in
-PTY-hosting mode:
+**Pi systemd service** -- `/etc/systemd/system/pik1.service` starts `pik1d` with
+PTY destinations and a TCP forwarder:
 
 ```ini
-ExecStart=/opt/pik1/pik1d --usb 1d6b:0104 \
+ExecStart=/opt/pik1/pik1d --ffs \
     pty:0:/tmp/klipper_mcu \
     pty:1:/tmp/klipper_toolhead \
-    tcp:127.0.0.1:7125
+    forward:127.0.0.1:7125
 ```
 
 Then reload and restart:
@@ -301,22 +323,19 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     journalctl -u pik1 -f
     ```
     After rebooting both devices, it should show `active (running)`. Journal
-    lines include systemd timestamps and process
-    metadata, and `pik1d`/`tcpbridge` messages may appear in a slightly different
-    order. The message text should look like:
+    lines include systemd timestamps and process metadata. The message text
+    should look like:
     ```
-    setup_pik1: loading libcomposite
-    setup_pik1: creating gadget at /sys/kernel/config/usb_gadget/pik1
-    setup_pik1: binding gadget to UDC: fe980000.usb
-    setup_pik1: ttyGS0 ready
-    setup_pik1: ttyGS1 ready
-    [pik1] mode=host channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyGS1
-    [pik1] child: spawned /opt/pik1/tcpbridge pid=...
-    [mux] link opened: /dev/ttyGS0
-    [tcp] tcpbridge /dev/ttyGS1 forward 127.0.0.1:7125
-    [tcp] link opened: /dev/ttyGS1
-    [mux] link up
-    [tcp] link up
+    [pik1] uart=pty release=0.8.0 protocol=8 channels=2 tcp=forward:127.0.0.1:7125 link=ffs
+    [ffs] loading USB gadget modules
+    [ffs] creating gadget at /sys/kernel/config/usb_gadget/pik1
+    [ffs] bound gadget to UDC: fe980000.usb
+    [ffs] FunctionFS transport ready at /run/pik1-ffs
+    [pik1] session started: ffs=/run/pik1-ffs
+    [ffs] endpoints enabled
+    [ctrl] link up: release=0.8.0 protocol=8 features=0x00000000
+    [pik1] data session started
+    [ctrl] peer data links: serial=up tcp=up
     [mux] ch0 PTY /tmp/klipper_mcu -> /dev/pts/2
     [mux] ch1 PTY /tmp/klipper_toolhead -> /dev/pts/3
     ```
@@ -325,19 +344,18 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
     ```bash
     cat /tmp/pik1.log
     ```
-    A normal startup looks like. Because `pik1d` and `tcpbridge` write to the
-    same log, adjacent lines may occasionally interleave:
+    A normal startup looks like:
     ```
-    [pik1] mode=exporter channels=2 tcp=127.0.0.1:7125 tunnel=/dev/ttyACM1
-    [pik1] child: spawned /usr/data/pik1/tcpbridge pid=...
-    [mux] link opened: /dev/ttyACM0
-    [tcp] tcpbridge /dev/ttyACM1 listen 127.0.0.1:7125
-    [tcp] listening on port 7125
-    [tcp] link opened: /dev/ttyACM1
-    [mux] link up
-    [tcp] link up
-    [mux] ch0 MCU active
-    [mux] ch1 MCU active
+    2026-07-15 19:41:50 [pik1] uart=mcu release=0.8.0 protocol=8 channels=2 tcp=listen:127.0.0.1:7125 link=usb-bulk
+    2026-07-15 19:41:50 [usb] opened /dev/bus/usb/001/007 iface=0 in=0x81 out=0x01
+    2026-07-15 19:41:50 [usb] bulk transport ready: vidpid=1d6b:51c1
+    2026-07-15 19:41:50 [pik1] session started: usb=1d6b:51c1
+    2026-07-15 19:41:50 [ctrl] link up: release=0.8.0 protocol=8 features=0x00000000
+    2026-07-15 19:41:50 [tun] listening on 127.0.0.1:7125
+    2026-07-15 19:41:50 [pik1] data session started
+    2026-07-15 19:41:50 [ctrl] peer data links: serial=up tcp=up
+    2026-07-15 19:41:50 [mux] ch0 MCU active
+    2026-07-15 19:41:50 [mux] ch1 MCU active
     ```
     If you changed `TCP_ADDR` in `/etc/init.d/S99pik1`, the logged TCP address
     will match that configured value.
@@ -383,6 +401,50 @@ talking to `127.0.0.1:7125` as if Moonraker were local.
 
     You can run both the Pi and K1 standalone simultaneously (e.g. for camera
     services) without conflict as long as the pik1 init script is disabled.
+
+## Peer commands
+
+Both daemons expose a local command socket at `/run/pik1/control.sock`
+(created by systemd on the Pi, by the init script on the K1). Commands are
+sent to the *other* side of the USB link and complete when the peer
+acknowledges:
+
+    pik1d --control status-peer     # peer version, protocol, link states
+    pik1d --control restart-peer    # peer daemon re-execs itself
+    pik1d --control reboot-peer     # peer runs /sbin/reboot
+    pik1d --control poweroff-peer   # peer runs /sbin/poweroff
+
+Replies are `OK`, `OK <payload>`, or `ERR <reason>`. One command may be
+outstanding at a time (`ERR busy` otherwise).
+
+### Shutdown propagation
+
+Shutdown initiated on either side propagates to the other exactly once —
+the *initiating* side is always the one that relays:
+
+- **Pi-initiated** (`sudo poweroff`, `sudo reboot`, etc.): the
+  `pik1-peer-poweroff`/`pik1-peer-reboot` systemd units run during shutdown
+  and send the matching peer command to the K1.
+- **K1-initiated** (e.g. from the touchscreen): call the installed wrapper
+  instead of plain `poweroff`/`reboot`:
+
+      /usr/data/pik1/shutdown_command.sh shutdown   # or: reboot
+
+  It sends `poweroff-peer`/`reboot-peer` to the Pi, waits for the peer's
+  acknowledgement, then performs the local action. If the Pi is
+  unreachable it warns and still shuts the K1 down.
+
+Two pieces keep this loop-free and working on the systemd Pi:
+
+- A peer-commanded reboot/poweroff drops a marker at
+  `/run/pik1/peer-initiated` before executing; the Pi's peer-* hook units
+  are gated with `ConditionPathExists=!` on it, so they never relay a
+  shutdown back to the side that asked for it.
+- `make install-pi` installs `/etc/polkit-1/rules.d/49-pik1.rules`
+  (rendered from `pik1-polkit.rules.in`), which lets the unprivileged
+  daemon user invoke `systemctl poweroff`/`reboot` via logind. Without it,
+  K1-commanded Pi shutdowns are denied by polkit and the daemon just
+  restarts.
 
 ## Optional extras
 

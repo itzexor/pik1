@@ -1,0 +1,32 @@
+[Unit]
+Description=PiK1 FunctionFS gadget and bridge
+DefaultDependencies=no
+After=sysinit.target local-fs.target systemd-udevd.service
+Before=klipper.service shutdown.target reboot.target poweroff.target halt.target
+
+[Service]
+Type=simple
+
+# The daemon owns configfs, FunctionFS descriptors, UDC binding, and PTY
+# permissions, so it must keep root privileges.
+RuntimeDirectory=pik1
+# Keep /run/pik1 (and the peer-initiated marker) when the daemon exec's
+# into systemctl for a peer-commanded reboot/poweroff -- the peer-* hook
+# units evaluate their ConditionPathExists against it during shutdown.
+RuntimeDirectoryPreserve=yes
+
+ExecStart=@INSTALL_DIR@/pik1d --ffs \
+    pty:0:/tmp/klipper_mcu \
+    pty:1:/tmp/klipper_toolhead \
+    @TCP_SPEC@
+
+Restart=always
+RestartKillSignal=SIGUSR1
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pik1
+
+[Install]
+WantedBy=multi-user.target

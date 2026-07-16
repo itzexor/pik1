@@ -1,0 +1,16 @@
+[Unit]
+Description=Propagate Pi poweroff to PiK1 peer
+DefaultDependencies=no
+After=pik1.service
+Before=poweroff.target halt.target
+# Skip when this shutdown was itself commanded by the peer -- relaying it
+# back would power off the initiator a second time.
+ConditionPathExists=!/run/pik1/peer-initiated
+
+[Service]
+Type=oneshot
+ExecStart=-@INSTALL_DIR@/pik1d --control poweroff-peer
+TimeoutStartSec=5
+
+[Install]
+WantedBy=poweroff.target halt.target

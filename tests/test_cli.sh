@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PIK1D=${PIK1D:-build/pik1d}
+
+fail() {
+    echo "test_cli: $*" >&2
+    exit 1
+}
+
+contains() {
+    local haystack=$1
+    local needle=$2
+    [[ "$haystack" == *"$needle"* ]] || fail "expected output to contain: $needle"
+}
+
+not_contains() {
+    local haystack=$1
+    local needle=$2
+    [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
+}
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+export PIK1_CONTROL_SOCK="$tmpdir/control.sock"
+
+release=$(sed -n 's/#define PIK1_RELEASE_VERSION "\(.*\)"/\1/p' src/core/product.h)
+[[ -n "$release" ]] || fail "could not read PIK1_RELEASE_VERSION from src/core/product.h"
+out=$("$PIK1D" --version)
+protocol=$(sed -n 's/#define PIK1_PROTOCOL_VERSION \([0-9]*\)u/\1/p' src/core/product.h)
+[[ -n "$protocol" ]] || fail "could not read PIK1_PROTOCOL_VERSION from src/core/product.h"
+contains "$out" "pik1d $release protocol=$protocol"
+
+set +e
+out=$("$PIK1D" --control status-peer 2>&1)
+rc=$?
+set -e
+[[ $rc -eq 1 ]] || fail "--control status-peer with no daemon exited with $rc"
+contains "$out" "connect"
+
+set +e
+out=$("$PIK1D" --usb mcu:0:/dev/null:230400 tcp:127.0.0.1:7125 2>&1)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "legacy tcp: form unexpectedly succeeded"
+contains "$out" "bad mcu spec: tcp:127.0.0.1:7125"
+
+set +e
+out=$(timeout 0.2s "$PIK1D" --usb mcu:0:/dev/null:230400 listen:127.0.0.1:7125 2>&1)
+rc=$?
+set -e
+[[ $rc -eq 124 ]] || fail "mcu/listen smoke exited with $rc"
+contains "$out" "uart=mcu"
+contains "$out" "tcp=listen:127.0.0.1:7125"
+contains "$out" "waiting for USB bulk device"
+[[ "$out" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ \[pik1\] ]] || \
+    fail "mcu logs did not start with timestamp"
+
+set +e
+out=$(timeout 0.2s "$PIK1D" --usb mcu:0:/dev/null:230400 2>&1)
+rc=$?
+set -e
+[[ $rc -eq 124 ]] || fail "mcu/no-tcp smoke exited with $rc"
+contains "$out" "uart=mcu"
+not_contains "$out" "tcp="
+
+set +e
+out=$("$PIK1D" --ffs pty:0:/tmp/test forward:127.0.0.1:7125 2>&1)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "pty/forward smoke unexpectedly kept running"
+contains "$out" "uart=pty"
+contains "$out" "tcp=forward:127.0.0.1:7125"
+[[ ! "$out" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ \[pik1\] ]] || \
+    fail "pty logs unexpectedly started with timestamp"
+
+set +e
+out=$("$PIK1D" --usb mcu:300:/dev/null:230400 2>&1)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "invalid mcu channel unexpectedly succeeded"
+contains "$out" "bad mcu channel id"
+
+set +e
+out=$("$PIK1D" --usb mcu:0:/dev/null:0 2>&1)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "invalid mcu baud unexpectedly succeeded"
+contains "$out" "bad mcu baud"
+
+set +e
+out=$("$PIK1D" --ffs pty:0:/tmp/a pty:0:/tmp/b 2>&1)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "duplicate pty channel unexpectedly succeeded"
+contains "$out" "duplicate channel id: 0"
+
+set +e
+out=$("$PIK1D" --ffs pty:0:/tmp/test forward:127.0.0.1:0 2>&1)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "invalid forward port unexpectedly succeeded"
+contains "$out" "bad tcp spec"
+
+set +e
+out=$("$PIK1D" --usb mcu:9:/dev/null:230400 2>&1)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "out-of-range channel id unexpectedly succeeded"
+contains "$out" "channel id out of range"
+
+echo "test_cli: ok"
