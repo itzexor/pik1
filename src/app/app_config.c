@@ -10,7 +10,7 @@
 
 #define DIE(...) pik_die("pik1", __VA_ARGS__)
 
-void pik_app_config_usage(const char *prog) {
+_Noreturn void pik_app_config_usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s --version\n"

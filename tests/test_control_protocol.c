@@ -65,6 +65,18 @@ static void test_role_mismatch_fails(void) {
     sfx_cleanup(&fx);
 }
 
+static void test_invalid_peer_role_fails(void) {
+    session_fixture_t fx;
+    sfx_frame_t f;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(sfx_read_frame(&fx, &f));
+    CHECK(sfx_send_peer_hello(&fx, (pik_control_role_t)0,
+                              PIK1_PROTOCOL_VERSION));
+    CHECK(!sfx_dispatch_one(&fx, 1000));
+    sfx_cleanup(&fx);
+}
+
 static void test_missing_peer_handshake_times_out(void) {
     session_fixture_t fx;
     sfx_frame_t f;
@@ -321,10 +333,69 @@ static void test_bad_ack_status_fails(void) {
     sfx_cleanup(&fx);
 }
 
+static void test_oversized_ack_fails(void) {
+    session_fixture_t fx;
+    uint8_t ack[PIK_CTRL_MAX_PAYLOAD + 1u] = { 0 };
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(sfx_handshake(&fx));
+    pik_put_u32le(ack, 1);
+    ack[4] = PIK_CONTROL_ACK_OK;
+    CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_ACK, PIK_CH_CONTROL,
+                              ack, sizeof(ack)));
+    CHECK(!sfx_dispatch_one(&fx, 1000));
+    sfx_cleanup(&fx);
+}
+
+static void test_unconsumed_ack_cannot_be_overwritten(void) {
+    session_fixture_t fx;
+    uint8_t ack[5] = { 0 };
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(sfx_handshake(&fx));
+    pik_put_u32le(ack, 1);
+    ack[4] = PIK_CONTROL_ACK_OK;
+    CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_ACK, PIK_CH_CONTROL,
+                              ack, sizeof(ack)));
+    CHECK(pik_session_up());
+
+    pik_put_u32le(ack, 2);
+    CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_ACK, PIK_CH_CONTROL,
+                              ack, sizeof(ack)));
+    CHECK(!pik_session_up());
+    sfx_cleanup(&fx);
+}
+
+static void test_invalid_service_state_fails(void) {
+    session_fixture_t fx;
+    uint8_t state[4];
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(sfx_handshake(&fx));
+    pik_put_u32le(state, 1u << 31);
+    CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_SERVICE_STATE,
+                              PIK_CH_CONTROL, state, sizeof(state)));
+    CHECK(!pik_session_up());
+    sfx_cleanup(&fx);
+}
+
+static void test_invalid_config_channel_fails(void) {
+    session_fixture_t fx;
+    uint8_t config[] = { PIK_CONTROL_TCP_NONE, 1, PIK_MUX_CLI_LAST + 1u };
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(sfx_handshake(&fx));
+    CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_CONFIG, PIK_CH_CONTROL,
+                              config, sizeof(config)));
+    CHECK(!pik_session_up());
+    sfx_cleanup(&fx);
+}
+
 int main(void) {
     test_successful_handshake_and_ping();
     test_protocol_mismatch_fails();
     test_role_mismatch_fails();
+    test_invalid_peer_role_fails();
     test_missing_peer_handshake_times_out();
     test_stale_startup_input_is_flushed();
     test_late_peer_hello_retry_sequence();
@@ -340,6 +411,10 @@ int main(void) {
     test_synced_corrupt_frame_heals();
     test_command_callback_and_bad_action_ack();
     test_bad_ack_status_fails();
+    test_oversized_ack_fails();
+    test_unconsumed_ack_cannot_be_overwritten();
+    test_invalid_service_state_fails();
+    test_invalid_config_channel_fails();
 
     if (failures) {
         fprintf(stderr, "test_control_protocol: %d failure(s)\n", failures);

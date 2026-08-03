@@ -20,7 +20,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-// ── sizing ────────────────────────────────────────────────────────────────────
 #define MUX_HIGH_WATER  (PIK_SESSION_MUX_QUEUE_CAP / 2u)
 #define MUX_LOW_WATER   (PIK_SESSION_MUX_QUEUE_CAP / 4u)
 
@@ -33,7 +32,6 @@
  */
 #define RESET_SILENCE_MS  5000
 
-// ── types ─────────────────────────────────────────────────────────────────────
 typedef enum { MCU_INIT, MCU_ACTIVE, MCU_RESETTING } mcu_state_t;
 
 typedef struct channel {
@@ -46,27 +44,23 @@ typedef struct channel {
     uint8_t     txbuf[CHAN_RING_CAP];
     uint32_t    tx_head, tx_tail;
 
-    // MCU
     char        dev[128];
     int         baud;
     mcu_state_t mcu_state;
     int64_t     last_byte_ms;
 
-    // PTY
     char        pty_path[128];
     int         slave_fd;
     bool        pty_peer_open;
     bool        pty_drop_logged;
 } channel_t;
 
-// ── globals ───────────────────────────────────────────────────────────────────
 static bool       g_started;       /* session handshake completed */
 static bool       g_link_paused;   /* high-water pause of all channels */
 static channel_t  g_chans[MAX_CHANNELS];
 static int        g_n_chans;
 static int        g_epfd = -1;
 
-// ── logging ───────────────────────────────────────────────────────────────────
 #define LOG(...)  pik_log("mux", __VA_ARGS__)
 
 static uint8_t wire_ch(const channel_t *c) {
@@ -79,7 +73,6 @@ static void pty_log_drop(channel_t *c, size_t n) {
     c->pty_drop_logged = true;
 }
 
-// ── channel ring helpers ──────────────────────────────────────────────────────
 static uint32_t chan_avail(const channel_t *c) { return c->tx_tail - c->tx_head; }
 static uint32_t chan_space(const channel_t *c) { return CHAN_RING_CAP - chan_avail(c); }
 
@@ -99,6 +92,7 @@ static bool chan_drain(channel_t *c) {
             if (w < 0 && c->type == CH_PTY && errno == EIO) {
                 pty_log_drop(c, chan_avail(c));
                 c->tx_head = c->tx_tail;
+                c->pty_peer_open = false;
                 break;
             }
             if (w < 0 && errno != EAGAIN && errno != EINTR) {
@@ -114,23 +108,37 @@ static bool chan_drain(channel_t *c) {
     return true;
 }
 
-static void chan_epoll_update(channel_t *c) {
-    if (c->fd < 0) return;
+static bool chan_epoll_update(channel_t *c) {
+    if (c->fd < 0) return true;
     uint32_t want = (!c->paused ? EPOLLIN : 0u) | (chan_avail(c) ? EPOLLOUT : 0u);
     if (c->type == CH_PTY && want)
         want |= EPOLLET;
-    if (want == c->epev) return;
+    if (want == c->epev) return true;
     c->epev = want;
-    if (want)
-        pik_epoll_set(g_epfd, c->fd, want, c);
-    else
+    if (want && !pik_epoll_set(g_epfd, c->fd, want, c)) {
+        LOG("ch%u epoll update: %s", c->ch_id, strerror(errno));
+        pik_session_fail();
+        return false;
+    }
+    if (!want)
         pik_epoll_del(g_epfd, c->fd);
+    return true;
 }
 
-static void chan_pause(channel_t *c)  { if (!c->paused) { c->paused = true;  chan_epoll_update(c); } }
-static void chan_resume(channel_t *c) { if ( c->paused) { c->paused = false; chan_epoll_update(c); } }
+static void chan_pause(channel_t *c) {
+    if (!c->paused) {
+        c->paused = true;
+        (void)chan_epoll_update(c);
+    }
+}
 
-// ── serial port ───────────────────────────────────────────────────────────────
+static void chan_resume(channel_t *c) {
+    if (c->paused) {
+        c->paused = false;
+        (void)chan_epoll_update(c);
+    }
+}
+
 static int open_serial(const char *path, int baud) {
     int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
@@ -141,7 +149,6 @@ static int open_serial(const char *path, int baud) {
     return fd;
 }
 
-// ── MCU channel ───────────────────────────────────────────────────────────────
 static void mcu_announce(channel_t *c) {
     if (c->mcu_state == MCU_ACTIVE)
         pik_session_enqueue(PIK_SESSION_CLASS_MUX, PIK_FRAME_MUX_READY,
@@ -157,7 +164,7 @@ static void mcu_open(channel_t *c, int64_t now) {
     if (c->fd < 0) return;
     c->last_byte_ms = now;
     c->epev = 0;
-    chan_epoll_update(c);
+    if (!chan_epoll_update(c)) return;
     if (g_started) mcu_announce(c);
 }
 
@@ -193,6 +200,9 @@ static void mcu_on_readable(channel_t *c, int64_t now) {
         close(c->fd);
         c->fd = -1;
         c->epev = 0;
+        c->mcu_state = MCU_INIT;
+        pik_session_enqueue(PIK_SESSION_CLASS_MUX, PIK_FRAME_MUX_FLUSH,
+                            wire_ch(c), NULL, 0);
         return;
     }
     c->last_byte_ms = now;
@@ -221,8 +231,7 @@ static bool mcu_on_writable(channel_t *c) {
         LOG("ch%u MCU write failure, closing link", c->ch_id);
         return false;
     }
-    chan_epoll_update(c);
-    return true;
+    return chan_epoll_update(c);
 }
 
 static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
@@ -239,8 +248,7 @@ static bool mcu_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, siz
         return false;
     }
     chan_push(c, payload, plen);
-    chan_epoll_update(c);
-    return true;
+    return chan_epoll_update(c);
 }
 
 static void mcu_tick(channel_t *c, int64_t now) {
@@ -262,7 +270,6 @@ static int64_t mcu_deadline(const channel_t *c, int64_t now) {
     return INT64_MAX;
 }
 
-// ── PTY channel ───────────────────────────────────────────────────────────────
 static void pty_open(channel_t *c) {
     if (c->fd >= 0) return;
     char name[64];
@@ -280,7 +287,14 @@ static void pty_open(channel_t *c) {
     }
     if (chmod(name, 0666) < 0)
         LOG("ch%u chmod %s: %s", c->ch_id, name, strerror(errno));
-    pik_fd_set_nonblock(c->fd);
+    if (!pik_fd_set_nonblock(c->fd)) {
+        LOG("ch%u PTY nonblocking setup: %s", c->ch_id, strerror(errno));
+        close(c->fd);
+        close(c->slave_fd);
+        c->fd = -1;
+        c->slave_fd = -1;
+        return;
+    }
     unlink(c->pty_path);
     if (symlink(name, c->pty_path) < 0)
         LOG("ch%u symlink %s: %s", c->ch_id, c->pty_path, strerror(errno));
@@ -289,7 +303,7 @@ static void pty_open(channel_t *c) {
     close(c->slave_fd);
     c->slave_fd = -1;
     c->epev = 0;
-    chan_epoll_update(c);
+    (void)chan_epoll_update(c);
 }
 
 static void pty_close(channel_t *c) {
@@ -317,13 +331,12 @@ static bool pty_probe_peer(channel_t *c) {
         if (n <= 0) {
             if (n < 0 && errno == EAGAIN) {
                 c->pty_peer_open = true;
-                chan_epoll_update(c);
-                return true;
+                return chan_epoll_update(c);
             }
             if (n < 0 && errno == EINTR) continue;
             if (n < 0 && errno == EIO) {
                 c->pty_peer_open = false;
-                chan_epoll_update(c);
+                (void)chan_epoll_update(c);
                 return false;
             }
             pty_close(c);
@@ -333,7 +346,7 @@ static bool pty_probe_peer(channel_t *c) {
         c->pty_peer_open = true;
         c->pty_drop_logged = false;
         ch_send_data(c, buf, (size_t)n);
-        chan_epoll_update(c);
+        if (!chan_epoll_update(c)) return false;
     }
 }
 
@@ -346,8 +359,7 @@ static bool pty_on_writable(channel_t *c) {
         pty_close(c);
         return true;
     }
-    chan_epoll_update(c);
-    return true;
+    return chan_epoll_update(c);
 }
 
 static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, size_t plen) {
@@ -366,10 +378,22 @@ static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, siz
             return false;
         }
         chan_push(c, payload, plen);
-        chan_epoll_update(c);
+        if (!chan_epoll_update(c)) return false;
         break;
-    case PIK_FRAME_MUX_FLUSH: pty_close(c); break;
-    case PIK_FRAME_MUX_READY: pty_open(c);  break;
+    case PIK_FRAME_MUX_FLUSH:
+        if (plen != 0) {
+            LOG("ch%u malformed FLUSH len=%zu", c->ch_id, plen);
+            return false;
+        }
+        pty_close(c);
+        break;
+    case PIK_FRAME_MUX_READY:
+        if (plen != 0) {
+            LOG("ch%u malformed READY len=%zu", c->ch_id, plen);
+            return false;
+        }
+        pty_open(c);
+        break;
     default:
         LOG("ch%u unexpected PTY frame type=0x%02x", c->ch_id, type);
         return false;
@@ -377,7 +401,6 @@ static bool pty_on_frame(channel_t *c, uint8_t type, const uint8_t *payload, siz
     return true;
 }
 
-// ── channel dispatch ──────────────────────────────────────────────────────────
 static channel_t *find_channel(uint8_t ch_id) {
     for (int i = 0; i < g_n_chans; i++)
         if (g_chans[i].ch_id == ch_id) return &g_chans[i];
@@ -405,7 +428,6 @@ static int64_t ch_deadline(const channel_t *c, int64_t now) {
     return INT64_MAX;
 }
 
-// ── session service hooks ─────────────────────────────────────────────────────
 bool serialmux_on_frame(uint8_t type, uint8_t wire_id,
                         const uint8_t *payload, size_t plen) {
     channel_t *c = find_channel(pik_mux_wire_to_cli(wire_id));
@@ -427,7 +449,6 @@ void serialmux_on_link_down(void) {
     }
 }
 
-// ── component API ─────────────────────────────────────────────────────────────
 void serialmux_init(const serialmux_config_t *cfg, int epfd) {
     g_epfd = epfd;
     g_started = false;
@@ -462,7 +483,7 @@ void serialmux_start(int64_t now) {
         if (c->type == CH_MCU) {
             if (c->fd >= 0) {
                 c->epev = 0;
-                chan_epoll_update(c);
+                (void)chan_epoll_update(c);
             }
             c->mcu_state = MCU_INIT;
             c->last_byte_ms = now;
@@ -482,8 +503,9 @@ static void resume_channels_if_drained(void) {
 }
 
 bool serialmux_owns_event(const void *ptr) {
-    return ptr >= (const void *)&g_chans[0] &&
-           ptr < (const void *)&g_chans[g_n_chans];
+    for (int i = 0; i < g_n_chans; i++)
+        if (ptr == &g_chans[i]) return true;
+    return false;
 }
 
 bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
@@ -495,8 +517,7 @@ bool serialmux_dispatch(void *ptr, uint32_t events, int64_t now) {
                 pty_log_drop(c, chan_avail(c));
                 c->tx_head = c->tx_tail;
             }
-            chan_epoll_update(c);
-            return true;
+            return chan_epoll_update(c) && pik_session_up();
         }
     }
     if (events & (EPOLLERR | EPOLLHUP)) {

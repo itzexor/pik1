@@ -37,8 +37,8 @@ const char *pik_frame_status_text(pik_frame_status_t status) {
     case PIK_FRAME_ENCODE_FAILED:    return "encode failed";
     case PIK_FRAME_RX_OVERFLOW:      return "RX buffer full without delimiter";
     case PIK_FRAME_CALLBACK_FAILED:  return "frame callback failed";
-    case PIK_FRAME_OK:
-    default:                         return "ok";
+    case PIK_FRAME_OK:               return "ok";
+    default:                         return "unknown frame status";
     }
 }
 

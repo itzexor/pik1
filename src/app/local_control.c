@@ -26,6 +26,8 @@ typedef struct {
     bool command_pending;
     uint32_t request_id;
     int64_t deadline_ms;
+    char input[64];
+    size_t input_len;
 } local_control_t;
 
 static local_control_t g_local = {
@@ -110,6 +112,7 @@ static void local_control_close_client(void) {
         g_local.client_fd = -1;
     }
     g_local.command_pending = false;
+    g_local.input_len = 0;
 }
 
 bool pik_local_control_start(int epfd) {
@@ -151,7 +154,14 @@ bool pik_local_control_start(int epfd) {
         unlink(sock_path);
         return false;
     }
-    pik_epoll_set(epfd, g_local.listen_fd, EPOLLIN, &g_local_listen_tag);
+    if (!pik_epoll_set(epfd, g_local.listen_fd, EPOLLIN,
+                       &g_local_listen_tag)) {
+        LOG("epoll add local control listener: %s", strerror(errno));
+        close(g_local.listen_fd);
+        g_local.listen_fd = -1;
+        unlink(sock_path);
+        return false;
+    }
     return true;
 }
 
@@ -244,21 +254,17 @@ void pik_local_control_accept(void) {
         return;
     }
     g_local.client_fd = fd;
-    pik_epoll_set(g_local.epfd, fd, EPOLLIN, &g_local);
+    g_local.input_len = 0;
+    if (!pik_epoll_set(g_local.epfd, fd, EPOLLIN, &g_local)) {
+        LOG("epoll add local control client: %s", strerror(errno));
+        close(fd);
+        g_local.client_fd = -1;
+    }
 }
 
-void pik_local_control_read(int64_t now, bool command_busy) {
-    char buf[64];
-    ssize_t n = read(g_local.client_fd, buf, sizeof(buf) - 1);
-    if (n <= 0) {
-        local_control_close_client();
-        return;
-    }
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) n--;
-    buf[n] = '\0';
-
+static void local_control_process_command(int64_t now, bool command_busy) {
     pik_control_action_t action;
-    if (!pik_parse_control_action(buf, &action)) {
+    if (!pik_parse_control_action(g_local.input, &action)) {
         local_control_reply_and_close("ERR unknown command\n");
         return;
     }
@@ -272,6 +278,43 @@ void pik_local_control_read(int64_t now, bool command_busy) {
     }
     g_local.command_pending = true;
     g_local.deadline_ms = now + PIK_COMMAND_ACK_TIMEOUT_MS;
+}
+
+void pik_local_control_read(int64_t now, bool command_busy) {
+    while (true) {
+        if (g_local.input_len == sizeof(g_local.input) - 1u) {
+            local_control_reply_and_close("ERR command too long\n");
+            return;
+        }
+
+        ssize_t n = read(g_local.client_fd,
+                         g_local.input + g_local.input_len,
+                         sizeof(g_local.input) - 1u - g_local.input_len);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        if (n <= 0) {
+            local_control_close_client();
+            return;
+        }
+        g_local.input_len += (size_t)n;
+
+        char *newline = memchr(g_local.input, '\n', g_local.input_len);
+        if (!newline)
+            continue;
+        if ((size_t)(newline - g_local.input) + 1u != g_local.input_len) {
+            local_control_reply_and_close("ERR one command per connection\n");
+            return;
+        }
+
+        size_t len = (size_t)(newline - g_local.input);
+        if (len && g_local.input[len - 1u] == '\r')
+            len--;
+        g_local.input[len] = '\0';
+        local_control_process_command(now, command_busy);
+        return;
+    }
 }
 
 bool pik_local_control_pending(void) {

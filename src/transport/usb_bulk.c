@@ -339,8 +339,6 @@ static bool handle_urb_done(struct usbdevfs_urb *urb, int64_t now) {
         fail_usb();
         return false;
     }
-    if (urb->status == -ENOENT || urb->status == -ECONNRESET)
-        return true;
     if (urb->status < 0) {
         LOG("URB ep=0x%02x status=%d (%s) actual=%d requested=%d",
             urb->endpoint, urb->status, urb_status_name(urb->status),
@@ -350,13 +348,27 @@ static bool handle_urb_done(struct usbdevfs_urb *urb, int64_t now) {
     }
 
     if (urb->endpoint & USB_DIR_IN) {
+        if (urb->actual_length < 0 ||
+            (size_t)urb->actual_length > sizeof(u->buf)) {
+            LOG("invalid RX completion: actual=%d capacity=%zu",
+                urb->actual_length, sizeof(u->buf));
+            fail_usb();
+            return false;
+        }
         if (urb->actual_length > 0 &&
             !pik_link_feed(g_usb.lk, u->buf, (size_t)urb->actual_length, now))
             return false;
         if (pik_link_is_open(g_usb.lk) && !submit_rx(u))
             return false;
     } else {
-        pik_link_tx_consume(g_usb.lk, u->len, now);
+        if (urb->actual_length <= 0 ||
+            (uint32_t)urb->actual_length > u->len) {
+            LOG("invalid TX completion: actual=%d requested=%u",
+                urb->actual_length, u->len);
+            fail_usb();
+            return false;
+        }
+        pik_link_tx_consume(g_usb.lk, (uint32_t)urb->actual_length, now);
         u->len = 0;
     }
 
@@ -406,7 +418,11 @@ bool pik_usb_bulk_start(pik_link_t *lk, int epfd, int64_t now) {
     LOG("usbfs caps=0x%x zero_packet=%s", caps,
         g_usb.zero_packet ? "yes" : "no");
 
-    pik_epoll_set(epfd, g_usb.fd, USB_EPOLL_EVENTS, &g_usb_tag);
+    if (!pik_epoll_set(epfd, g_usb.fd, USB_EPOLL_EVENTS, &g_usb_tag)) {
+        LOG("epoll add usbfs fd: %s", strerror(errno));
+        pik_usb_bulk_cleanup();
+        return false;
+    }
     pik_link_begin(lk, now);
     for (unsigned i = 0; i < RX_URBS; i++) {
         if (!submit_rx(&g_usb.rx[i])) {

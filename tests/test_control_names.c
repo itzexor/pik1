@@ -33,8 +33,8 @@ static void test_public_enum_values(void) {
     CHECK(PIK_CONTROL_TCP_NONE == 0);
     CHECK(PIK_CONTROL_TCP_LISTEN == 1);
     CHECK(PIK_CONTROL_TCP_FORWARD == 2);
-    CHECK(PIK_CONTROL_LINK_SERIAL == (1u << 0));
-    CHECK(PIK_CONTROL_LINK_TCP == (1u << 1));
+    CHECK(PIK_CONTROL_SERVICE_SERIAL == (1u << 0));
+    CHECK(PIK_CONTROL_SERVICE_TUNNEL == (1u << 1));
 }
 
 int main(void) {

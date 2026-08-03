@@ -170,7 +170,7 @@ static bool write_descriptors(int ep0) {
 
     iface_desc(p); p += IFACE_LEN;
     ep_desc(p, 0x01, PIK_USB_HS_MAX_PACKET); p += EP_LEN;  /* OUT */
-    ep_desc(p, 0x82, PIK_USB_HS_MAX_PACKET); p += EP_LEN;  /* IN */
+    ep_desc(p, 0x82, PIK_USB_HS_MAX_PACKET);               /* IN */
 
     return write_all(ep0, d, sizeof(d));
 }
@@ -331,6 +331,12 @@ static bool handle_rx_complete(ffs_aio_req_t *req, int64_t res, int64_t now) {
         pik_link_fail(g_ffs.lk);
         return false;
     }
+    if ((uint64_t)res > req->len) {
+        LOG("OUT aio: invalid completion result=%lld requested=%u",
+            (long long)res, req->len);
+        pik_link_fail(g_ffs.lk);
+        return false;
+    }
     if (res > 0) {
         if (!pik_link_feed(g_ffs.lk, req->buf, (size_t)res, now))
             return false;
@@ -345,15 +351,13 @@ static bool handle_tx_complete(ffs_aio_req_t *req, int64_t res, int64_t now) {
         pik_link_fail(g_ffs.lk);
         return false;
     }
-    if (res == 0) {
-        LOG("IN aio: zero-length completion");
+    if (res <= 0 || (uint64_t)res > req->len) {
+        LOG("IN aio: invalid completion result=%lld requested=%u",
+            (long long)res, req->len);
         pik_link_fail(g_ffs.lk);
         return false;
     }
-    if (res > 0) {
-        uint32_t done = res > req->len ? req->len : (uint32_t)res;
-        pik_link_tx_consume(g_ffs.lk, done, now);
-    }
+    pik_link_tx_consume(g_ffs.lk, (uint32_t)res, now);
     return pump_tx();
 }
 
@@ -376,6 +380,12 @@ static bool process_aio(int64_t now) {
         for (int i = 0; i < n; i++) {
             ffs_aio_req_t *req = (ffs_aio_req_t *)(uintptr_t)events[i].data;
             if (!req) continue;
+            if (events[i].res2 != 0) {
+                LOG("aio completion secondary result=%lld",
+                    (long long)events[i].res2);
+                pik_link_fail(g_ffs.lk);
+                return false;
+            }
             bool ok = req->dir == FFS_AIO_RX
                 ? handle_rx_complete(req, events[i].res, now)
                 : handle_tx_complete(req, events[i].res, now);
@@ -487,8 +497,12 @@ bool pik_ffs_start(pik_link_t *lk, int epfd, int64_t now) {
         return false;
     }
 
-    pik_epoll_set(epfd, g_ffs.ep0, EPOLLIN, &g_ep0_tag);
-    pik_epoll_set(epfd, g_ffs.event_fd, EPOLLIN, &g_aio_tag);
+    if (!pik_epoll_set(epfd, g_ffs.ep0, EPOLLIN, &g_ep0_tag) ||
+        !pik_epoll_set(epfd, g_ffs.event_fd, EPOLLIN, &g_aio_tag)) {
+        LOG("epoll add FunctionFS fd: %s", strerror(errno));
+        pik_ffs_cleanup();
+        return false;
+    }
     pik_link_begin(lk, now);
     if (!bind_udc()) {
         pik_ffs_cleanup();

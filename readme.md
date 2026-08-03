@@ -1,455 +1,297 @@
 # Connecting a Creality K1 to a Raspberry Pi
 
-> This guide covers the current `pik1d`-based setup which replaces the
-> earlier socat approach documented in the
-> [original guide](https://rentry.co/k1-with-pi).
+`pik1d` moves the K1's MCU serial ports to PTYs on a Raspberry Pi over one
+USB connection. The Pi runs Klipper and Moonraker; the K1 remains the bridge
+for its physical MCUs and, optionally, its touchscreen.
 
-## Overview
+> This modifies the printer's normal software layout. Make sure you can
+> restore the K1 before proceeding. Creality publishes
+> [recovery images and instructions](https://github.com/CrealityOfficial/K1_Series_Annex/releases/tag/V1.0.0).
 
-`pik1d` is a small C daemon that bridges the K1 MCU serial ports to PTYs on the
-Pi over one vendor bulk USB link. All traffic is multiplexed onto that one
-sequenced link by channel: wire channel 0 is the control service (version
-checks, link liveness, and remote restart/shutdown commands -- see
-[Peer commands](#peer-commands)), wire channels 1-8 carry the MCU serial mux
-(`mcu:N` / `pty:N` use user-facing channels 0-7), and wire channel 15 carries
-the touchscreen Moonraker TCP tunnel. A priority scheduler keeps control and
-MCU traffic ahead of tunnel bursts on the shared pipe.
+## Architecture
 
-The TCP tunnel is intended for low-bandwidth Moonraker API traffic from the K1
-touchscreen to the Pi. It should not be used for high-bandwidth traffic such as
-webcam streams or file transfers.
+There is exactly one bidirectional USB bulk link:
 
-## Prerequisites
+```text
+K1 USB host                         Raspberry Pi USB gadget
+usbfs bulk URBs  <==== USB cable ====>  configfs + FunctionFS
+        \                                  /
+         +------ one sequenced link ------+
+                  |      |       |
+               control  MCU   TCP tunnel
+```
 
-- **Make sure your K1 mainboard has a populated micro-USB header. This is very
-  risky to do unless you have a way to recover your K1 to stock.** See
-  [Creality's recovery flashing instructions](https://github.com/CrealityOfficial/K1_Series_Annex/releases/tag/V1.0.0).
-- You should already be using a probe supported by
-  [Simple AF](https://pellcorp.github.io/creality-wiki/) because stock Klipper
-  does not support the K1's multiple load cells. This guide assumes a
-  Cartographer over USB, but most probes should work.
-- You will need an SBC that supports USB OTG mode. This guide assumes a
-  Raspberry Pi 4, but other devices are technically possible.
+The Pi creates one vendor-specific FunctionFS interface with one bulk OUT
+endpoint and one bulk IN endpoint. The K1 finds that interface by VID:PID,
+claims it through usbfs, and keeps bulk receive URBs posted. Both transports
+feed and drain the same byte-oriented link; neither transport owns a separate
+protocol session.
+
+The link applies COBS framing, CRC32 integrity, session IDs, sequence numbers,
+and bounded retransmission. After the channel-0 HELLO handshake succeeds, the
+session router starts and routes:
+
+| Wire channel | Logical service |
+|---|---|
+| 0 | Handshake, liveness, service state, and peer commands |
+| 1–8 | MCU serial mux (`mcu:0`–`mcu:7` / `pty:0`–`pty:7`) |
+| 15 | Optional touchscreen TCP tunnel |
+
+Outbound traffic waits in bounded per-service queues. Control has highest
+priority, MCU traffic is next, and tunnel traffic is last. Only a shallow
+amount is admitted to the transport at once, so a touchscreen burst cannot
+fill the USB path ahead of MCU traffic.
+
+Any transport, framing, sequencing, or reliable-service failure tears down
+the whole session. Queued bytes and logical endpoints are discarded, the
+transport reconnects with bounded backoff, and services restart only after a
+new HELLO handshake. See [FAILURE_MODEL.md](FAILURE_MODEL.md) for the failure
+contract.
+
+The TCP tunnel is for low-bandwidth Moonraker API traffic only. Do not use it
+for webcam streams or file transfers.
+
+## Requirements
+
+- A K1 mainboard with the required internal USB connection.
+- An SBC with a USB controller that supports peripheral/OTG mode. The supplied
+  service targets a Raspberry Pi.
+- A probe and K1/Pi software setup compatible with
+  [Simple AF](https://pellcorp.github.io/creality-wiki/).
+- A recovery path for the printer.
 
 ## Hardware
 
-1. #### Power considerations
-    The Pi may backfeed power to the K1 via the VCC+ line of the USB cable. **This is very
-    risky and can cause all sorts of hard-to-debug issues.** The Pi and K1 must still share
-    ground, so only the VCC+ line should be cut -- leave shielding and GND intact.
+### Power
 
-    Preventing backfeeding (pick one):
-    - Kapton tape over the VCC+ pin of the USB cable plugged into the printer
-    - Cable surgery to snip the VCC+ wire on the cable
-    - A USB power blocker dongle (widely available)
-    - [A printed jig](https://www.thingiverse.com/thing:3044586/files) to block the VCC+ pin
-    - JST connectors wired to the K1 mainboard's USB header with the VCC+ wire removed
+The Pi and K1 must share USB ground, but the USB VBUS line can backfeed power
+between them. Block or disconnect VBUS on the printer-facing data cable while
+leaving ground and shielding intact. Common options are a USB power blocker,
+Kapton tape over the VBUS contact, or a purpose-built cable without the VBUS
+wire.
 
-    Powering the Pi (its USB-C port is occupied by OTG, pick one):
-    - A USB-C power/data splitter (still needs VCC+ cut on the K1 side)
-    - A PoE adapter or HAT
-    - Regulated voltage to the GPIO power pins if you know exactly what you are doing
+Power the Pi independently through a USB-C power/data splitter, PoE, or a
+properly regulated supply. Pi 5 power requirements are stricter than Pi 4
+requirements.
 
-    > **Note for Pi 5 users:** The Pi 5 has unique power requirements and software-side
-    > checks. A USB-C power splitter can supply rated power with an appropriate supply.
+### Data connections
 
-2. #### Data cables
-    - Connect the Pi's USB-C port to the K1's USB header, **having addressed the VCC+ issue
-      above**. Shielded cables are strongly recommended.
-        - Simple: USB-A male to USB-C male into the K1's front USB port
-        - Neat: a JST to USB cable plugged directly into the K1 mainboard header
-        - Combined: a USB-C power + data splitter for the Pi plus a JST to USB cable with
-          the power wire snipped
-    - Connect the Cartographer to the Pi over USB using the included cable
-    - Recommended: unplug the camera cable from the K1, adapt it from JST to USB, and plug
-      into the Pi
-    - Optional: redirect the K1's front USB port to the Pi using the same JST adapter
+- Connect the Pi's OTG-capable USB-C port to the K1 USB connection using a
+  shielded data cable with VBUS blocked.
+- Connect USB probes directly to the Pi.
+- Move other USB devices, such as the camera, to the Pi if the K1 services
+  that used them will be disabled.
 
-    You may also need male/male or female/female JST adapter cables.
+## Build and install
 
-## Software
-
-The following files are involved:
-
-- `src/` -- C source for `pik1d` (session, control, serial mux, and TCP tunnel services)
-- `files/k1/S99pik1.in` -- K1 init script template, rendered to `build/S99pik1`
-- `files/k1/shutdown_command.sh.in` -- K1 shutdown/reboot wrapper that propagates to the Pi
-- `files/pi/pik1-polkit.rules.in` -- polkit rule letting the Pi daemon power off/reboot
-- `files/pi/pik1.service.in` -- Pi systemd service template; `pik1d` owns
-  configfs, FunctionFS descriptors, UDC binding, and PTY permissions
-- `update.sh` -- on-device installer/updater: stops the service if running, uninstalls, pulls, reinstalls, restarts; auto-detects the target (`./update.sh`, or pass `k1`/`pi` to override)
-
-### Binaries
-
-Pre-built binaries for K1 (`build/pik1d.mipsel`) and Pi
-(`build/pik1d.aarch64`) are included in the repo and are updated with each
-release. Normal installs use these included files. On a development machine,
-you can optionally rebuild them from source with the cross-compiler targets:
+Prebuilt K1 and Pi binaries are tracked as `build/pik1d.mipsel` and
+`build/pik1d.aarch64`. To rebuild them:
 
 ```bash
-make toolchain   # one-time: downloads musl.cc cross-compilers into .toolchain/
-make mipsel      # K1 binary → build/pik1d.mipsel
-make aarch64     # Pi binary → build/pik1d.aarch64
-make test        # native non-hardware unit and CLI smoke tests
+make toolchain
+make mipsel
+make aarch64
+make test
 ```
 
-### Raspberry Pi side
+`make toolchain` downloads the musl cross-compilers into `.toolchain/`.
+Both endpoints must run the same protocol version, so deploy the K1 and Pi
+binaries as a pair.
 
-1. #### Install Simple AF for RPi
-    Install [Simple AF for RPi](https://pellcorp.github.io/creality-wiki/rpi/).
+### Raspberry Pi
 
-2. #### Enable USB OTG mode
-    Run the following script once to configure the Pi to act as a USB gadget. This
-    puts the USB-C port into OTG/peripheral mode, which disables host mode on that
-    port.
+1. Install [Simple AF for RPi](https://pellcorp.github.io/creality-wiki/rpi/).
 
-    ```bash
-    #!/usr/bin/env bash
-    set -euo pipefail
+2. Enable the Pi's USB controller in peripheral mode. On current Raspberry Pi
+   OS images, add:
 
-    BOOT=/boot/firmware   # Use /boot for pre-Bookworm images
-    CFG="$BOOT/config.txt"
-    CMD="$BOOT/cmdline.txt"
+   ```text
+   dtoverlay=dwc2
+   ```
 
-    # Enable dwc2 overlay (puts USB-C into OTG mode)
-    grep -qxF 'dtoverlay=dwc2' "$CFG" || echo 'dtoverlay=dwc2' | tee -a "$CFG"
+   to `/boot/firmware/config.txt`, add `modules-load=dwc2` to the single line
+   in `/boot/firmware/cmdline.txt`, and add `libcomposite` to `/etc/modules`.
+   Older images may use `/boot` instead of `/boot/firmware`. If enumeration
+   still fails, use `dtoverlay=dwc2,dr_mode=peripheral`.
 
-    # Add dwc2 to kernel cmdline (guard against running twice)
-    grep -qF 'modules-load=dwc2' "$CMD" || sed -i.bak -E 's/$/ modules-load=dwc2/' "$CMD"
+3. Reboot, clone this repository, and run:
 
-    # Autoload libcomposite at boot
-    grep -qxF 'libcomposite' /etc/modules || echo 'libcomposite' | tee -a /etc/modules
+   ```bash
+   ./update.sh
+   ```
 
-    echo "Done. Reboot for changes to take effect."
-    ```
+   The updater auto-detects the Pi, stops and uninstalls an existing service,
+   pulls with `git pull --ff-only`, installs the tracked AArch64 binary and
+   systemd units, and starts `pik1.service`.
 
-    Reboot the Pi after running this.
+   To install without the updater:
 
-    > **If the gadget fails to bind after reboot**, try changing `dtoverlay=dwc2`
-    > to `dtoverlay=dwc2,dr_mode=peripheral` in `/boot/firmware/config.txt`. Some
-    > Pi configurations require the mode to be set explicitly.
+   ```bash
+   make install-pi
+   ```
 
-3. #### Install pik1
-    From the repo directory on the Pi, using the included pre-built binaries:
+   `PI_DIR`, `PI_SYSTEMD_DIR`, and `SUDO` can override the defaults.
 
-    ```bash
-    ./update.sh
-    ```
+4. Point Klipper at the PTYs:
 
-    This handles first installs and updates alike: it stops `pik1.service` if
-    running, uninstalls any previous version, pulls the latest revision, and
-    installs and starts the new one. Installation copies the binary to
-    `/opt/pik1/`, installs and enables `pik1.service` and the peer
-    reboot/poweroff helper units, removes stale script-era files, and runs
-    `systemctl daemon-reload`.
+   ```ini
+   [mcu]
+   serial: /tmp/klipper_mcu
+   restart_method: command
 
-    For custom options, run the make targets directly (`make install-pi` /
-    `make uninstall-pi`), passing `SUDO=` if running as root or
-    `PI_DIR=/your/path` to override the install prefix. The same variables
-    pass through `./update.sh` from the environment.
+   [mcu nozzle_mcu]
+   serial: /tmp/klipper_toolhead
+   restart_method: command
+   ```
 
-    The service runs `pik1d` as root because the daemon owns configfs,
-    FunctionFS descriptors, UDC binding, and PTY permissions for the symlinks
-    Klipper opens.
+   `restart_method: command` is required because the serial mux does not carry
+   DTR or RTS.
 
-4. #### Configure printer.cfg
-    Add or update the MCU serial paths in your `printer.cfg`:
+The Pi service runs as root because `pik1d` owns configfs, the FunctionFS
+mount and descriptors, UDC binding, and PTY permissions.
 
-    ```ini
-    [mcu]
-    serial: /tmp/klipper_mcu
-    restart_method: command
+### K1
 
-    [mcu nozzle_mcu]
-    serial: /tmp/klipper_toolhead
-    restart_method: command
-    ```
+1. Install [Simple AF](https://pellcorp.github.io/creality-wiki/) on the K1.
 
-    > `restart_method: command` is required. Hardware reset via DTR/RTS does not work over the serialmux tunnel as no hardware control lines are available.
+2. Clone this repository on the K1 and run:
 
-### K1 side
+   ```sh
+   ./update.sh
+   ```
 
-1. #### Install Simple AF
-    Install [Simple AF](https://pellcorp.github.io/creality-wiki/) on the K1.
+   The updater installs `build/pik1d.mipsel` under `/usr/data/pik1`, installs
+   `/etc/init.d/S99pik1`, and disables these stock services while the K1 is in
+   bridge mode:
 
-2. #### Install pik1
-    From a slim repo clone on the K1, such as `/root/pik1`:
+   - `S50nginx_service`
+   - `S50unslung`
+   - `S50webcam`
+   - `S55klipper_mcu`
+   - `S55klipper_service`
+   - `S56moonraker_service`
 
-    ```bash
-    ./update.sh
-    ```
+   Direct installation is also available:
 
-    This handles first installs and updates alike: it stops the service if
-    running, uninstalls any previous version, pulls the latest revision, and
-    installs and starts the new one. Installation copies `build/pik1d.mipsel`
-    to `/usr/data/pik1/`, renders and installs
-    `/etc/init.d/S99pik1`, and disables the services below by renaming them
-    with a `_` prefix so the init system skips them. To use a different
-    install directory, run the make targets directly, passing the same
-    `K1_DIR` value at install and uninstall time:
+   ```sh
+   make install-k1
+   ```
 
-    ```bash
-    make install-k1 K1_DIR=/your/install/path
-    make uninstall-k1 K1_DIR=/your/install/path
-    ```
+   Set `K1_DIR` consistently for install and uninstall if you do not want the
+   default path.
 
-    | Service | Reason |
-    |---|---|
-    | `S55klipper_service` | Must not run — K1 is now bridge-only |
-    | `S56moonraker_service` | Must not run — no local Klipper |
-    | `S55klipper_mcu` | Host MCU software, not needed |
-    | `S50nginx_service` | Proxied Moonraker, no longer relevant |
-    | `S50unslung` | Unrelated to printing |
-    | `S50webcam` | Camera can be moved to the Pi |
-    | `S99guppyscreen` | See optional TCP tunnel section below |
+3. Reboot both devices. The K1 daemon logs to `/tmp/pik1.log`; the Pi daemon
+   logs to the systemd journal.
 
-    If transferring via scp rather than running from a repo clone on the K1,
-    render the init script locally with the same install path you will use on
-    the printer:
+## Touchscreen tunnel
 
-    ```sh
-    K1_DIR=/usr/data/pik1
-    make render-k1-init K1_DIR="$K1_DIR"
-    ssh root@<k1-ip> "mkdir -p $K1_DIR"
-    scp build/pik1d.mipsel root@<k1-ip>:$K1_DIR/pik1d
-    scp build/S99pik1 root@<k1-ip>:/etc/init.d/S99pik1
-    ssh root@<k1-ip> "chmod +x $K1_DIR/pik1d /etc/init.d/S99pik1"
-    ```
+Screen support is enabled by default. The K1 listens only on
+`127.0.0.1:7125`, where guppyscreen already expects Moonraker. The Pi side
+forwards that logical stream to `127.0.0.1:7125` on the Pi:
 
-    Then disable the K1-side services that should not start in bridge mode:
+```text
+guppyscreen -> K1 localhost:7125 -> shared USB link -> Pi Moonraker:7125
+```
 
-    ```sh
-    ssh root@<k1-ip> '
-    for svc in S50nginx_service S50unslung S50webcam \
-        S55klipper_mcu S55klipper_service S56moonraker_service S99guppyscreen; do
-        if [ -f /etc/init.d/$svc ]; then
-            mv /etc/init.d/$svc /etc/init.d/_$svc
-        fi
-    done
-    '
-    ```
-
-3. #### Reboot both devices
-    Reboot the K1 so the renamed init scripts take effect. Reboot the Pi as well
-    so the USB gadget and `pik1.service` start from a clean boot sequence.
-
-    On the K1:
-
-    ```sh
-    reboot
-    ```
-
-    On the Pi:
-
-    ```bash
-    sudo reboot
-    ```
-    Upon start, the K1 daemon logs to `/tmp/pik1.log`.
-
-## K1 touchscreen TCP tunnel
-
-The TCP tunnel forwards the Simple AF K1 touchscreen's (guppyscreen) Moonraker
-requests to the Pi over a dedicated channel of the shared USB link. This is
-strongly recommended over the alternative of pointing guppyscreen at the Pi's
-WiFi IP address -- WiFi is unreliable enough that you will eventually lose
-display functionality mid-print. The tunnel runs over the same wired USB
-connection as the control and MCU services and stays up as long as the
-physical connection does. Tunnel frames are kept small and scheduled behind
-control and MCU traffic, so a busy screen cannot delay printing.
-
-If you don't use a K1 screen UI, install with `./update.sh --no-screen`
-(short: `-n`) **on both devices**, or `make install-k1 SCREEN=0` /
-`make install-pi SCREEN=0` when using the make targets directly: it disables
-the K1 screen services (`S99guppyscreen`, `S99grumpyscreen`) and omits the TCP
-tunnel channel from both daemons. By default the screen services are left
-alone and the tunnel is enabled.
-
-The tunnel is low-bandwidth and intended for Moonraker API traffic only
-(temperatures, print status, controls). Do not route webcam streams or file
-transfers through it.
-
-The included K1 init script and Pi systemd service enable this tunnel by default.
-The K1 side uses `listen:` because guppyscreen connects there; the Pi side uses
-`forward:` because it connects onward to Moonraker. guppyscreen requires no
-configuration changes -- it continues talking to `localhost:7125` as normal and
-the tunnel forwards those connections to the Pi transparently.
-
-**K1 init script** -- `/etc/init.d/S99pik1` starts `pik1d` with physical MCU UARTs
-and a local TCP listener:
+The generated daemon arguments are equivalent to:
 
 ```sh
-DAEMON_ARGS="--usb \
-    mcu:0:$CH0_DEV:$CH0_BAUD \
-    mcu:1:$CH1_DEV:$CH1_BAUD \
-    listen:$TCP_ADDR:$TCP_PORT"
-```
+# K1
+pik1d --usb \
+    mcu:0:/dev/ttyS7:230400 \
+    mcu:1:/dev/ttyS1:230400 \
+    listen:127.0.0.1:7125
 
-Also re-enable guppyscreen if you disabled it:
-```sh
-mv /etc/init.d/_S99guppyscreen /etc/init.d/S99guppyscreen
-```
-
-`TCP_ADDR` is `127.0.0.1` by default so only local touchscreen requests are
-accepted on the K1. Set it to `0.0.0.0` only if you deliberately want the
-forwarded listener exposed on the K1 network interface. The TCP tunnel is not
-authenticated; wildcard binds expose raw forwarded Moonraker traffic to any
-client that can reach that port.
-
-**Pi systemd service** -- `/etc/systemd/system/pik1.service` starts `pik1d` with
-PTY destinations and a TCP forwarder:
-
-```ini
-ExecStart=/opt/pik1/pik1d --ffs \
+# Pi
+pik1d --ffs \
     pty:0:/tmp/klipper_mcu \
     pty:1:/tmp/klipper_toolhead \
     forward:127.0.0.1:7125
 ```
 
-Then reload and restart:
+Do not bind the K1 listener to `0.0.0.0` unless remote access is intentional.
+The tunnel has no authentication of its own.
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart pik1
+To omit the tunnel and disable the K1 screen services, use the same option on
+both devices:
+
+```sh
+./update.sh --no-screen
 ```
 
-No changes are needed to guppyscreen's configuration -- it continues
-talking to `127.0.0.1:7125` as if Moonraker were local.
+The equivalent make option is `SCREEN=0`.
 
-## Post-install verification
+## Verification
 
-1. #### Pi service
-    ```bash
-    sudo systemctl status pik1
-    journalctl -u pik1 -f
-    ```
-    After rebooting both devices, it should show `active (running)`. Journal
-    lines include systemd timestamps and process metadata. The message text
-    should look like:
-    ```
-    [pik1] uart=pty release=0.8.0 protocol=8 channels=2 tcp=forward:127.0.0.1:7125 link=ffs
-    [ffs] loading USB gadget modules
-    [ffs] creating gadget at /sys/kernel/config/usb_gadget/pik1
-    [ffs] bound gadget to UDC: fe980000.usb
-    [ffs] FunctionFS transport ready at /run/pik1-ffs
-    [pik1] session started: ffs=/run/pik1-ffs
-    [ffs] endpoints enabled
-    [ctrl] link up: release=0.8.0 protocol=8 features=0x00000000
-    [pik1] data session started
-    [ctrl] peer data links: serial=up tcp=up
-    [mux] ch0 PTY /tmp/klipper_mcu -> /dev/pts/2
-    [mux] ch1 PTY /tmp/klipper_toolhead -> /dev/pts/3
-    ```
+On the Pi:
 
-2. #### K1 log
-    ```bash
-    cat /tmp/pik1.log
-    ```
-    A normal startup looks like:
-    ```
-    2026-07-15 19:41:50 [pik1] uart=mcu release=0.8.0 protocol=8 channels=2 tcp=listen:127.0.0.1:7125 link=usb-bulk
-    2026-07-15 19:41:50 [usb] opened /dev/bus/usb/001/007 iface=0 in=0x81 out=0x01
-    2026-07-15 19:41:50 [usb] bulk transport ready: vidpid=1d6b:51c1
-    2026-07-15 19:41:50 [pik1] session started: usb=1d6b:51c1
-    2026-07-15 19:41:50 [ctrl] link up: release=0.8.0 protocol=8 features=0x00000000
-    2026-07-15 19:41:50 [tun] listening on 127.0.0.1:7125
-    2026-07-15 19:41:50 [pik1] data session started
-    2026-07-15 19:41:50 [ctrl] peer data links: serial=up tcp=up
-    2026-07-15 19:41:50 [mux] ch0 MCU active
-    2026-07-15 19:41:50 [mux] ch1 MCU active
-    ```
-    If you changed `TCP_ADDR` in `/etc/init.d/S99pik1`, the logged TCP address
-    will match that configured value.
+```bash
+systemctl status pik1
+journalctl -u pik1 -f
+```
 
-3. #### dmesg (Pi)
-    ```
-    [    7.614279] dwc2 fe980000.usb: bound driver configfs-gadget.pik1
-    [    7.846025] dwc2 fe980000.usb: new device is high-speed
-    [    7.900000] dwc2 fe980000.usb: new address ...
-    ```
+On the K1:
 
-4. #### Klipper behaviour
-    Klipper should connect to both MCUs within about 15 seconds of the K1 booting --
-    this is the GD32 bootloader dwell time and is normal. `FIRMWARE_RESTART` also takes
-    approximately 15 seconds for the same reason.
+```sh
+cat /tmp/pik1.log
+```
 
-    A good indicator of successful first-boot setup is the printer's LEDs turning off
-    and then back on as the MCUs initialise under Klipper control.
+A healthy startup shows:
 
-## Switching back to standalone K1 / Simple AF
+- the Pi preparing and binding one FunctionFS gadget;
+- the K1 opening the matching vendor bulk interface;
+- a successful control HELLO on both sides;
+- the serial service starting and the expected MCU/PTY channels becoming
+  active;
+- the tunnel listener starting when screen support is enabled.
 
-1. #### Uninstall pik1 from K1
-    ```sh
-    make uninstall-k1
-    ```
-    This removes the init script and binaries and restores all disabled services.
-    Alternatively:
-    ```sh
-    mv /etc/init.d/S99pik1 /etc/init.d/_S99pik1
-    mv /etc/init.d/_S55klipper_service  /etc/init.d/S55klipper_service
-    mv /etc/init.d/_S56moonraker_service /etc/init.d/S56moonraker_service
-    # restore any other services as needed
-    ```
-
-2. #### Stop Pi service
-    ```bash
-    sudo systemctl stop pik1
-    ```
-    Optional -- the service will just sit idle if left running.
-
-3. #### Revert printer.cfg and recable
-    Revert `printer.cfg` serial paths and reconfigure cables as needed.
-
-    You can run both the Pi and K1 standalone simultaneously (e.g. for camera
-    services) without conflict as long as the pik1 init script is disabled.
+Klipper may take about 15 seconds to reconnect while the GD32 bootloader is
+active. `FIRMWARE_RESTART` can have the same delay.
 
 ## Peer commands
 
-Both daemons expose a local command socket at `/run/pik1/control.sock`
-(created by systemd on the Pi, by the init script on the K1). Commands are
-sent to the *other* side of the USB link and complete when the peer
-acknowledges:
+Each daemon exposes a root-only Unix socket at `/run/pik1/control.sock`.
+Commands other than `status-peer` are acknowledged before the peer acts:
 
-    pik1d --control status-peer     # peer version, protocol, link states
-    pik1d --control restart-peer    # peer daemon re-execs itself
-    pik1d --control reboot-peer     # peer runs /sbin/reboot
-    pik1d --control poweroff-peer   # peer runs /sbin/poweroff
+```sh
+pik1d --control status-peer
+pik1d --control restart-peer
+pik1d --control reboot-peer
+pik1d --control poweroff-peer
+```
 
-Replies are `OK`, `OK <payload>`, or `ERR <reason>`. One command may be
-outstanding at a time (`ERR busy` otherwise).
+`status-peer` returns one bounded summary containing the peer side, release,
+protocol, active logical services, and the peer's last received service state.
+Only one outbound command may be pending at a time.
 
 ### Shutdown propagation
 
-Shutdown initiated on either side propagates to the other exactly once —
-the *initiating* side is always the one that relays:
+Pi shutdown/reboot helper units send the matching command to the K1. A
+K1-initiated action should use:
 
-- **Pi-initiated** (`sudo poweroff`, `sudo reboot`, etc.): the
-  `pik1-peer-poweroff`/`pik1-peer-reboot` systemd units run during shutdown
-  and send the matching peer command to the K1.
-- **K1-initiated** (e.g. from the touchscreen): call the installed wrapper
-  instead of plain `poweroff`/`reboot`:
+```sh
+/usr/data/pik1/shutdown_command.sh shutdown
+/usr/data/pik1/shutdown_command.sh reboot
+```
 
-      /usr/data/pik1/shutdown_command.sh shutdown   # or: reboot
+The receiving side writes `/run/pik1/peer-initiated` before acting. The Pi
+helper units check that marker so they do not relay the action back to its
+origin.
 
-  It sends `poweroff-peer`/`reboot-peer` to the Pi, waits for the peer's
-  acknowledgement, then performs the local action. If the Pi is
-  unreachable it warns and still shuts the K1 down.
+## Return the K1 to standalone mode
 
-Two pieces keep this loop-free and working on the systemd Pi:
+On the K1:
 
-- A peer-commanded reboot/poweroff drops a marker at
-  `/run/pik1/peer-initiated` before executing; the Pi's peer-* hook units
-  are gated with `ConditionPathExists=!` on it, so they never relay a
-  shutdown back to the side that asked for it.
-- `make install-pi` installs `/etc/polkit-1/rules.d/49-pik1.rules`
-  (rendered from `pik1-polkit.rules.in`), which lets the unprivileged
-  daemon user invoke `systemctl poweroff`/`reboot` via logind. Without it,
-  K1-commanded Pi shutdowns are denied by polkit and the daemon just
-  restarts.
+```sh
+make uninstall-k1
+reboot
+```
 
-## Optional extras
+This removes PiK1 and restores the services disabled by the install. On the
+Pi:
 
-- **Pi mount:** Once everything is working you can print
-  [a nice combined mount](https://www.printables.com/model/585116-motherboard-cover-optional-rpi-mount-extension-cre)
-  for the K1 mainboard and a Raspberry Pi.
-- **KlipperScreen:** The Pi runs KlipperScreen by default. Connect an HDMI
-  touchscreen to the Pi's HDMI port to use it, or uninstall it if not needed.
+```bash
+make uninstall-pi
+```
+
+Restore the original Klipper serial configuration and USB cabling as needed.

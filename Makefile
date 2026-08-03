@@ -42,7 +42,7 @@ APP_HDRS    := src/app/app_config.h src/app/local_control.h src/app/daemon_contr
 PIK1D_SRCS  := $(APP_SRCS) $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
 PIK1D_HDRS  := $(APP_HDRS) $(PROTO_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
 
-# ── Install ───────────────────────────────────────────────────────────────────
+# Install
 SUDO            ?= sudo
 
 K1_DIR          ?= /usr/data/pik1
@@ -69,7 +69,7 @@ endif
 PI_DIR          ?= /opt/pik1
 PI_SYSTEMD_DIR  ?= /etc/systemd/system
 
-# ── Cross toolchains ─────────────────────────────────────────────────────────
+# Cross toolchains
 TOOLCHAIN_DIR  := $(CURDIR)/.toolchain
 MUSL_CC_BASE   := https://musl.cc
 
@@ -101,14 +101,14 @@ test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_fr
 	$(TEST_BUILD)/test_logging
 	$(TEST_BUILD)/test_control_names
 	$(TEST_BUILD)/test_control_protocol
-	PIK1_CONTROL_SOCK=$(CURDIR)/$(TEST_BUILD)/app-control.sock $(TEST_BUILD)/test_app_control
+	PIK1_CONTROL_SOCK=$(abspath $(TEST_BUILD))/app-control.sock $(TEST_BUILD)/test_app_control
 	$(TEST_BUILD)/test_serialmux_protocol
 	$(TEST_BUILD)/test_tunnel_protocol
 
 test-cli: native
 	PIK1D=$(BUILD)/pik1d bash tests/test_cli.sh
 
-# ── Native builds ─────────────────────────────────────────────────────────────
+# Native builds
 $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(PIK1D_SRCS)
 
@@ -139,14 +139,14 @@ $(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/tes
 $(TEST_BUILD)/test_tunnel_protocol: tests/test_tunnel_protocol.c tests/test_harness.h tests/test_session_harness.h $(PROTO_SRCS) $(PROTO_HDRS) $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_tunnel_protocol.c $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
 
-# ── MIPSEL ────────────────────────────────────────────────────────────────────
+# MIPSEL
 mipsel: $(BUILD)/pik1d.mipsel
 
 $(BUILD)/pik1d.mipsel: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
 	$(MIPSEL_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
 	-$(MIPSEL_STRIP) $@
 
-# ── AARCH64 ──────────────────────────────────────────────────────────────────
+# AARCH64
 aarch64: $(BUILD)/pik1d.aarch64
 
 $(BUILD)/pik1d.aarch64: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
@@ -169,7 +169,7 @@ FORCE:
 
 render-k1-init: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
 
-# ── Toolchain download ────────────────────────────────────────────────────────
+# Toolchain download
 define fetch_toolchain
 $(TOOLCHAIN_DIR)/$(1)-cross/bin/$(1)-gcc:
 	mkdir -p $(TOOLCHAIN_DIR)
@@ -182,7 +182,7 @@ toolchain: \
 	$(TOOLCHAIN_DIR)/$(MIPSEL_TRIPLE)-cross/bin/$(MIPSEL_TRIPLE)-gcc \
 	$(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-gcc
 
-# ── Install targets ───────────────────────────────────────────────────────────
+# Install targets
 install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
 	@test -x $(BUILD)/pik1d.mipsel || \
 		{ echo "Missing $(BUILD)/pik1d.mipsel; run 'make mipsel' first"; exit 1; }
@@ -219,8 +219,6 @@ install-pi:
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-reboot.service > /dev/null
 	sed 's|@INSTALL_DIR@|$(PI_DIR)|g' files/pi/pik1-peer-poweroff.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service > /dev/null
-	sed "s|@PIK1_USER@|$$(id -nu 1000)|g" files/pi/pik1-polkit.rules.in | \
-		$(SUDO) tee /etc/polkit-1/rules.d/49-pik1.rules > /dev/null
 	$(SUDO) systemctl daemon-reload
 	$(SUDO) systemctl enable pik1.service
 	$(SUDO) systemctl enable pik1-peer-reboot.service

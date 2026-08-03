@@ -2,6 +2,7 @@
 
 #include "local_control.h"
 #include "logging.h"
+#include "pik_proto.h"
 #include "product.h"
 #include "util.h"
 
@@ -12,7 +13,7 @@
 
 typedef struct {
     const char *uart_name;
-    uint32_t link_flags;
+    uint32_t service_flags;
     pik_control_action_t remote_action;
     bool remote_action_pending;
     int64_t remote_action_at_ms;
@@ -24,24 +25,21 @@ typedef struct {
 
 static daemon_control_state_t g_ctl;
 
-static void append_link_names(char *buf, size_t cap, uint32_t flags) {
-    if (flags == 0) {
-        snprintf(buf, cap, "none");
-    } else if ((flags & (PIK_CONTROL_LINK_SERIAL | PIK_CONTROL_LINK_TCP)) ==
-               (PIK_CONTROL_LINK_SERIAL | PIK_CONTROL_LINK_TCP)) {
-        snprintf(buf, cap, "serial,tcp");
-    } else if (flags & PIK_CONTROL_LINK_SERIAL) {
+static void append_service_names(char *buf, size_t cap, uint32_t flags) {
+    uint32_t known = PIK_CONTROL_SERVICE_SERIAL | PIK_CONTROL_SERVICE_TUNNEL;
+    if ((flags & known) == known)
+        snprintf(buf, cap, "serial,tunnel");
+    else if (flags & PIK_CONTROL_SERVICE_SERIAL)
         snprintf(buf, cap, "serial");
-    } else if (flags & PIK_CONTROL_LINK_TCP) {
-        snprintf(buf, cap, "tcp");
-    } else {
-        snprintf(buf, cap, "unknown");
-    }
+    else if (flags & PIK_CONTROL_SERVICE_TUNNEL)
+        snprintf(buf, cap, "tunnel");
+    else
+        snprintf(buf, cap, "none");
 }
 
 void pik_daemon_control_init(const char *uart_name) {
     g_ctl.uart_name = uart_name;
-    g_ctl.link_flags = 0;
+    g_ctl.service_flags = 0;
     g_ctl.remote_action = 0;
     g_ctl.remote_action_pending = false;
     g_ctl.remote_action_at_ms = 0;
@@ -51,48 +49,54 @@ void pik_daemon_control_init(const char *uart_name) {
     g_ctl.signal_deadline_ms = 0;
 }
 
-void pik_daemon_set_link_flags(uint32_t flags) {
-    if (g_ctl.link_flags == flags) return;
-    g_ctl.link_flags = flags;
-    if (pik_control_ready() && !pik_control_send_link_state(g_ctl.link_flags))
-        LOG("failed to send link state update");
+void pik_daemon_set_service_flags(uint32_t flags) {
+    if (g_ctl.service_flags == flags) return;
+    g_ctl.service_flags = flags;
+    if (pik_control_ready() &&
+        !pik_control_send_service_state(g_ctl.service_flags))
+        LOG("failed to send service state update");
 }
 
-void pik_daemon_set_link_flag(uint32_t flag, bool up) {
-    uint32_t flags = up ? (g_ctl.link_flags | flag) : (g_ctl.link_flags & ~flag);
-    pik_daemon_set_link_flags(flags);
-}
-
-uint32_t pik_daemon_link_flags(void) {
-    return g_ctl.link_flags;
+void pik_daemon_set_service_flag(uint32_t flag, bool up) {
+    uint32_t flags = up ? (g_ctl.service_flags | flag)
+                        : (g_ctl.service_flags & ~flag);
+    pik_daemon_set_service_flags(flags);
 }
 
 void pik_daemon_on_control_command(pik_control_action_t action, uint32_t request_id) {
     LOG("received command %s request=%u", pik_control_action_name(action), request_id);
     if (action == PIK_CONTROL_ACTION_STATUS) {
-        char links[24];
-        char peer_links[24];
+        char services[24];
+        char peer_services[24];
         uint32_t peer_flags;
-        append_link_names(links, sizeof(links), g_ctl.link_flags);
-        if (pik_control_peer_link_state(&peer_flags))
-            append_link_names(peer_links, sizeof(peer_links), peer_flags);
+        append_service_names(services, sizeof(services), g_ctl.service_flags);
+        if (pik_control_peer_service_state(&peer_flags))
+            append_service_names(peer_services, sizeof(peer_services), peer_flags);
         else
-            snprintf(peer_links, sizeof(peer_links), "unknown");
+            snprintf(peer_services, sizeof(peer_services), "unknown");
 
-        char status[128];
+        char status[PIK_CTRL_ACK_MAX_PAYLOAD + 1u];
         int n = snprintf(status, sizeof(status),
-                         "uart=%s release=%s proto=%u feat=0x%08x links=%s peer=%s",
-                         g_ctl.uart_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
-                         PIK1_FEATURE_FLAGS, links, peer_links);
-        if (n < 0) {
-            if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR, NULL, 0))
+                         "side=%s release=%s protocol=%u services=%s peer_services=%s",
+                         g_ctl.uart_name, PIK1_RELEASE_VERSION,
+                         PIK1_PROTOCOL_VERSION, services, peer_services);
+        if (n < 0 || (size_t)n >= sizeof(status)) {
+            if (!pik_control_send_ack(request_id,
+                                      PIK_CONTROL_ACK_INTERNAL_ERROR, NULL, 0))
                 LOG("failed to send status error ACK request=%u", request_id);
             return;
         }
-        size_t len = (size_t)n < sizeof(status) ? (size_t)n : sizeof(status) - 1;
         if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK,
-                                  (const uint8_t *)status, len))
+                                  (const uint8_t *)status, (size_t)n))
             LOG("failed to send status ACK request=%u", request_id);
+        return;
+    }
+
+    if (g_ctl.remote_action_pending) {
+        static const uint8_t busy[] = "action already pending";
+        if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR,
+                                  busy, sizeof(busy) - 1u))
+            LOG("failed to send busy ACK request=%u", request_id);
         return;
     }
 

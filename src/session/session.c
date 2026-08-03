@@ -1,4 +1,4 @@
-// Single shared link: service router and priority TX scheduler
+// Single-link service router and priority TX scheduler
 
 #include "session.h"
 #include "pik_proto.h"
@@ -11,7 +11,6 @@
 
 #define LOG(...) pik_log("link", __VA_ARGS__)
 
-// ── sizing ────────────────────────────────────────────────────────────────────
 #define LINK_TX_CAP   (1u << 19)    /* must exceed HIST_CAP retransmit bursts */
 #define LINK_RX_CAP   (1u << 16)
 #define HIST_CAP      (1u << 18)
@@ -48,7 +47,6 @@ static classq_t g_q[PIK_SESSION_CLASS_COUNT] = {
 
 static uint8_t s_pop_payload[PIK_LINK_MAX_PAYLOAD];
 
-// ── class queues ──────────────────────────────────────────────────────────────
 static uint32_t q_avail(const classq_t *q) { return q->tail - q->head; }
 static uint32_t q_space(const classq_t *q) { return q->cap - q_avail(q); }
 
@@ -116,7 +114,6 @@ uint32_t pik_session_backlog(pik_session_class_t cls) {
     return q_avail(&g_q[cls]);
 }
 
-// ── inbound routing ───────────────────────────────────────────────────────────
 static bool session_on_frame(uint8_t type, uint8_t ch,
                              const uint8_t *payload, size_t plen) {
     switch (type & 0xf0u) {
@@ -150,7 +147,6 @@ static void session_on_down(void) {
     pik_control_on_link_down();
 }
 
-// ── lifecycle ─────────────────────────────────────────────────────────────────
 void pik_session_init(void) {
     pik_link_cfg_t cfg = {
         .name        = "link",

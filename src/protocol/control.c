@@ -30,11 +30,11 @@ typedef struct {
     bool ack_pending;
     uint32_t ack_request_id;
     pik_control_ack_status_t ack_status;
-    uint8_t ack_payload[PIK_CTRL_MAX_PAYLOAD - 5u];
+    uint8_t ack_payload[PIK_CTRL_ACK_MAX_PAYLOAD];
     size_t ack_payload_len;
 
-    bool peer_link_known;
-    uint32_t peer_link_flags;
+    bool peer_service_known;
+    uint32_t peer_service_flags;
 
     uint8_t local_channels[PIK_CTRL_MAX_PAYLOAD - 2u];
     size_t local_channel_count;
@@ -163,7 +163,10 @@ static bool handle_config(const uint8_t *p, size_t len) {
     bool peer_present[UINT8_MAX + 1] = { false };
     for (size_t i = 2; i < len; i++) {
         uint8_t id = p[i];
-        if (peer_present[id]) continue;
+        if (!pik_mux_cli_valid(id) || peer_present[id]) {
+            LOG("bad CONFIG channel id=%u", id);
+            return false;
+        }
         peer_present[id] = true;
         if (!local_channel_present(id))
             LOG("warning: channel id %u is not configured on this side", id);
@@ -211,8 +214,10 @@ static bool handle_hello(const uint8_t *p, size_t len) {
             PIK1_PROTOCOL_VERSION, proto, release);
         return false;
     }
-    if (role == (uint8_t)g_ctrl.role) {
-        LOG("peer role mismatch: both sides role=%u", role);
+    uint8_t expected_role = g_ctrl.role == PIK_CONTROL_ROLE_PTY
+        ? PIK_CONTROL_ROLE_MCU : PIK_CONTROL_ROLE_PTY;
+    if (role != expected_role) {
+        LOG("peer role mismatch: expected=%u got=%u", expected_role, role);
         return false;
     }
     if (strcmp(release, PIK1_RELEASE_VERSION) != 0)
@@ -224,7 +229,6 @@ static bool handle_hello(const uint8_t *p, size_t len) {
             LOG("handshake recovered after %u failed attempts", g_ctrl.handshake_fails);
             g_ctrl.handshake_fails = 0;
             g_ctrl.handshake_fails_reported = 0;
-            pik_session_link()->quiet = false;
         }
         LOG("link up: release=%s protocol=%u features=0x%08x",
             release, proto, features);
@@ -276,8 +280,12 @@ bool pik_control_on_frame(uint8_t type, const uint8_t *p, size_t len) {
         }
         return true;
     case PIK_FRAME_CTRL_ACK:
-        if (len < 5) {
+        if (len < 5 || len > PIK_CTRL_MAX_PAYLOAD) {
             LOG("bad ACK len=%zu", len);
+            return false;
+        }
+        if (g_ctrl.ack_pending) {
+            LOG("received ACK before previous ACK was consumed");
             return false;
         }
         g_ctrl.ack_request_id = pik_get_u32le(p);
@@ -287,22 +295,26 @@ bool pik_control_on_frame(uint8_t type, const uint8_t *p, size_t len) {
             return false;
         }
         g_ctrl.ack_payload_len = len - 5;
-        if (g_ctrl.ack_payload_len > sizeof(g_ctrl.ack_payload))
-            g_ctrl.ack_payload_len = sizeof(g_ctrl.ack_payload);
         if (g_ctrl.ack_payload_len)
             memcpy(g_ctrl.ack_payload, p + 5, g_ctrl.ack_payload_len);
         g_ctrl.ack_pending = true;
         return true;
-    case PIK_FRAME_CTRL_LINK_STATE:
+    case PIK_FRAME_CTRL_SERVICE_STATE:
         if (len != 4) {
-            LOG("bad LINK_STATE len=%zu", len);
+            LOG("bad SERVICE_STATE len=%zu", len);
             return false;
         }
-        g_ctrl.peer_link_flags = pik_get_u32le(p);
-        g_ctrl.peer_link_known = true;
-        LOG("peer data links: serial=%s tcp=%s",
-            (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_SERIAL) ? "up" : "down",
-            (g_ctrl.peer_link_flags & PIK_CONTROL_LINK_TCP) ? "up" : "down");
+        g_ctrl.peer_service_flags = pik_get_u32le(p);
+        if (g_ctrl.peer_service_flags &
+            ~(PIK_CONTROL_SERVICE_SERIAL | PIK_CONTROL_SERVICE_TUNNEL)) {
+            LOG("bad SERVICE_STATE flags=0x%08x",
+                g_ctrl.peer_service_flags);
+            return false;
+        }
+        g_ctrl.peer_service_known = true;
+        LOG("peer services: serial=%s tunnel=%s",
+            (g_ctrl.peer_service_flags & PIK_CONTROL_SERVICE_SERIAL) ? "up" : "down",
+            (g_ctrl.peer_service_flags & PIK_CONTROL_SERVICE_TUNNEL) ? "up" : "down");
         return true;
     case PIK_FRAME_CTRL_CONFIG:
         return handle_config(p, len);
@@ -398,8 +410,8 @@ void pik_control_cleanup(void) {
     g_ctrl.ready = false;
     g_ctrl.config_sent = false;
     clear_pending_ack();
-    g_ctrl.peer_link_known = false;
-    g_ctrl.peer_link_flags = 0;
+    g_ctrl.peer_service_known = false;
+    g_ctrl.peer_service_flags = 0;
 }
 
 void pik_control_set_config(const uint8_t *channels, size_t n_channels,
@@ -442,8 +454,8 @@ bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status
 bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
                           const uint8_t *payload, size_t payload_len) {
     uint8_t p[PIK_CTRL_MAX_PAYLOAD];
-    if (payload_len > sizeof(p) - 5)
-        payload_len = sizeof(p) - 5;
+    if (payload_len > PIK_CTRL_ACK_MAX_PAYLOAD)
+        return false;
     pik_put_u32le(p, request_id);
     p[4] = status;
     if (payload_len)
@@ -451,14 +463,14 @@ bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
     return enqueue_frame(PIK_FRAME_CTRL_ACK, p, 5 + payload_len);
 }
 
-bool pik_control_send_link_state(uint32_t flags) {
+bool pik_control_send_service_state(uint32_t flags) {
     uint8_t p[4];
     pik_put_u32le(p, flags);
-    return enqueue_frame(PIK_FRAME_CTRL_LINK_STATE, p, sizeof(p));
+    return enqueue_frame(PIK_FRAME_CTRL_SERVICE_STATE, p, sizeof(p));
 }
 
-bool pik_control_peer_link_state(uint32_t *flags) {
-    if (!g_ctrl.peer_link_known) return false;
-    if (flags) *flags = g_ctrl.peer_link_flags;
+bool pik_control_peer_service_state(uint32_t *flags) {
+    if (!g_ctrl.peer_service_known) return false;
+    if (flags) *flags = g_ctrl.peer_service_flags;
     return true;
 }

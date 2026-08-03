@@ -8,9 +8,8 @@
 #define PIK_REMOTE_ACTION_DELAY_MS 250
 
 void pik_daemon_control_init(const char *uart_name);
-void pik_daemon_set_link_flags(uint32_t flags);
-void pik_daemon_set_link_flag(uint32_t flag, bool up);
-uint32_t pik_daemon_link_flags(void);
+void pik_daemon_set_service_flags(uint32_t flags);
+void pik_daemon_set_service_flag(uint32_t flag, bool up);
 
 void pik_daemon_on_control_command(pik_control_action_t action, uint32_t request_id);
 void pik_daemon_check_acks(int64_t now);

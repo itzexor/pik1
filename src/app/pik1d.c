@@ -36,7 +36,6 @@
 
 typedef struct {
     app_mode_t mode;
-    char **argv;
     bool has_tcp;
     int transport_backoff_ms;
 } app_state_t;
@@ -84,28 +83,29 @@ static void transport_cleanup(void) {
         pik_ffs_cleanup();
 }
 
-/* Handshake completed: bring up the data services on the shared link. */
+/* Start logical services only after the shared-link handshake completes. */
 static void on_control_ready(void) {
     int64_t now = pik_now_ms();
+    uint32_t services = PIK_CONTROL_SERVICE_SERIAL;
     g_app.transport_backoff_ms = RETRY_MIN_MS;
     serialmux_start(now);
     tunnel_start(now);
-    pik_daemon_set_link_flag(PIK_CONTROL_LINK_SERIAL, true);
-    pik_daemon_set_link_flag(PIK_CONTROL_LINK_TCP, tunnel_active());
-    LOG("data session started");
+    if (tunnel_active())
+        services |= PIK_CONTROL_SERVICE_TUNNEL;
+    pik_daemon_set_service_flags(services);
+    LOG("services started");
 }
 
-/* Tear down everything tied to the current transport session. */
 static void session_teardown(void) {
     transport_cleanup();
     tunnel_cleanup();
     serialmux_cleanup();
     pik_control_cleanup();
     pik_session_cleanup();
-    pik_daemon_set_link_flags(0);
+    pik_daemon_set_service_flags(0);
 }
 
-static void execute_remote_action(pik_control_action_t action) {
+static void execute_remote_action(pik_control_action_t action, char **argv) {
     if (action == PIK_CONTROL_ACTION_REBOOT_PEER ||
         action == PIK_CONTROL_ACTION_POWEROFF_PEER)
         pik_mark_peer_initiated();
@@ -115,8 +115,8 @@ static void execute_remote_action(pik_control_action_t action) {
     switch (action) {
     case PIK_CONTROL_ACTION_RESTART_PEER:
         LOG("executing restart-peer");
-        execv(g_app.argv[0], g_app.argv);
-        LOG("execv %s: %s", g_app.argv[0], strerror(errno));
+        execv(argv[0], argv);
+        LOG("execv %s: %s", argv[0], strerror(errno));
         _exit(127);
     case PIK_CONTROL_ACTION_REBOOT_PEER:
         LOG("executing reboot-peer");
@@ -134,8 +134,6 @@ static void execute_remote_action(pik_control_action_t action) {
 }
 
 int main(int argc, char **argv) {
-    g_app.argv = argv;
-
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
         printf("pik1d %s protocol=%u features=0x%08x\n",
                PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION, PIK1_FEATURE_FLAGS);
@@ -182,7 +180,8 @@ int main(int argc, char **argv) {
     if (epfd < 0) DIE("epoll_create1: %s", strerror(errno));
 
     static int sig_tag;
-    pik_epoll_set(epfd, sig_fd, EPOLLIN, &sig_tag);
+    if (!pik_epoll_set(epfd, sig_fd, EPOLLIN, &sig_tag))
+        DIE("epoll add signal fd: %s", strerror(errno));
     pik_session_init();
     pik_control_init(cfg.control_role, pik_daemon_on_control_command,
                      on_control_ready);
@@ -198,6 +197,7 @@ int main(int argc, char **argv) {
     tunnel_init(epfd, cfg.tunnel_mode, cfg.tcp_addr, cfg.tcp_port);
 
     bool shutdown = false;
+    int exit_status = 0;
     bool session_active = false;
     int64_t transport_retry_at = pik_now_ms();
     bool usb_bulk_waiting_logged = false;
@@ -206,11 +206,9 @@ int main(int argc, char **argv) {
         int64_t now = pik_now_ms();
 
         if (!session_active && now >= transport_retry_at) {
-            bool quiet = pik_control_handshake_failures() > 0;
-            pik_session_link()->quiet = quiet;
             if (transport_start(epfd, now) && pik_control_on_link_open()) {
                 usb_bulk_waiting_logged = false;
-                pik_daemon_set_link_flags(0);
+                pik_daemon_set_service_flags(0);
                 session_active = true;
                 transport_retry_at = 0;
                 if (pik_control_handshake_failures() == 0)
@@ -254,7 +252,9 @@ int main(int argc, char **argv) {
         int n = epoll_wait(epfd, evs, MAX_EVENTS, timeout);
         if (n < 0) {
             if (errno == EINTR) continue;
-            DIE("epoll_wait: %s", strerror(errno));
+            LOG("epoll_wait: %s", strerror(errno));
+            exit_status = 1;
+            break;
         }
 
         now = pik_now_ms();
@@ -315,11 +315,11 @@ int main(int argc, char **argv) {
         }
 
         if (session_active && !session_failed && g_app.has_tcp)
-            pik_daemon_set_link_flag(PIK_CONTROL_LINK_TCP, tunnel_active());
+            pik_daemon_set_service_flag(PIK_CONTROL_SERVICE_TUNNEL,
+                                        tunnel_active());
 
         if (session_active && session_failed) {
-            /* quiet after the first failure of a dead-peer handshake loop;
-             * control logs a periodic summary instead */
+            /* Control logs periodic summaries for a persistent handshake loop. */
             if (pik_control_handshake_failures() <= 1)
                 LOG("session failed, restarting");
             session_active = false;
@@ -330,12 +330,12 @@ int main(int argc, char **argv) {
 
         pik_control_action_t remote_action;
         if (pik_daemon_remote_action_due(now, &remote_action))
-            execute_remote_action(remote_action);
+            execute_remote_action(remote_action, argv);
     }
 
     session_teardown();
     pik_local_control_cleanup();
     close(sig_fd);
     close(epfd);
-    return 0;
+    return exit_status;
 }

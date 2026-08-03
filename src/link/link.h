@@ -49,8 +49,6 @@ typedef struct {
     pik_link_cfg_t cfg;
     bool     active;        /* transport has begun a session */
     bool     failed;
-    bool     quiet;         /* suppress per-attempt open/stats logs while the
-                             * owner is in a known-down retry loop */
     size_t   enc_max;       /* per-frame encoded ceiling incl. delimiter */
 
     uint32_t tx_head, tx_tail;
@@ -77,9 +75,6 @@ typedef struct {
 
     int64_t  last_rx_ms, last_tx_ms;
     int64_t  now_ms;        /* updated on entry to open/dispatch/tick */
-
-    /* cumulative I/O counters (process lifetime): dumped on link failure */
-    uint64_t rx_frames, tx_frames, rx_reads, rx_bytes, tx_writes, tx_bytes;
 } pik_link_t;
 
 void pik_link_init(pik_link_t *lk, const pik_link_cfg_t *cfg);

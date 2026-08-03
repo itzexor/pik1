@@ -22,7 +22,7 @@ static bool send_ack_ok = true;
 static int send_ack_calls;
 static uint32_t send_ack_request;
 static pik_control_ack_status_t send_ack_status;
-static uint8_t send_ack_payload[256];
+static uint8_t send_ack_payload[4096];
 static size_t send_ack_payload_len;
 
 static bool peer_state_known;
@@ -36,7 +36,8 @@ static uint32_t next_request_id = 1000;
 static bool ack_available;
 static uint32_t ack_request;
 static pik_control_ack_status_t ack_status;
-static const char *ack_payload;
+static const uint8_t *ack_payload;
+static size_t ack_payload_len;
 
 int64_t pik_now_ms(void) {
     return now_ms;
@@ -46,7 +47,7 @@ bool pik_control_ready(void) {
     return false;
 }
 
-bool pik_control_send_link_state(uint32_t flags) {
+bool pik_control_send_service_state(uint32_t flags) {
     (void)flags;
     return true;
 }
@@ -64,7 +65,7 @@ bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
     return send_ack_ok;
 }
 
-bool pik_control_peer_link_state(uint32_t *flags) {
+bool pik_control_peer_service_state(uint32_t *flags) {
     if (!peer_state_known) return false;
     if (flags) *flags = peer_state_flags;
     return true;
@@ -84,8 +85,8 @@ bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status
     ack_available = false;
     if (request_id) *request_id = ack_request;
     if (status) *status = ack_status;
-    if (payload) *payload = (const uint8_t *)ack_payload;
-    if (payload_len) *payload_len = ack_payload ? strlen(ack_payload) : 0;
+    if (payload) *payload = ack_payload;
+    if (payload_len) *payload_len = ack_payload_len;
     return true;
 }
 
@@ -125,6 +126,7 @@ static void reset_state(void) {
     ack_request = 0;
     ack_status = 0;
     ack_payload = NULL;
+    ack_payload_len = 0;
     pik_daemon_control_init("test");
 }
 
@@ -161,13 +163,16 @@ static bool dispatch_local_event(int epfd) {
 }
 
 static bool read_reply(int fd, char *buf, size_t cap) {
-    ssize_t n;
-    do {
-        n = read(fd, buf, cap - 1);
-    } while (n < 0 && errno == EINTR);
-    if (n <= 0) return false;
-    buf[n] = '\0';
-    return true;
+    size_t len = 0;
+    while (len < cap - 1) {
+        ssize_t n = read(fd, buf + len, cap - 1 - len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return false;
+        if (n == 0) break;
+        len += (size_t)n;
+    }
+    buf[len] = '\0';
+    return len > 0;
 }
 
 static void test_parse_control_actions(void) {
@@ -175,6 +180,7 @@ static void test_parse_control_actions(void) {
     reset_state();
     CHECK(pik_parse_control_action("status-peer", &action));
     CHECK(action == PIK_CONTROL_ACTION_STATUS);
+    CHECK(!pik_parse_control_action("status", &action));
     CHECK(pik_parse_control_action("restart-peer", &action));
     CHECK(action == PIK_CONTROL_ACTION_RESTART_PEER);
     CHECK(!pik_parse_control_action("bogus", &action));
@@ -182,18 +188,20 @@ static void test_parse_control_actions(void) {
 
 static void test_status_ack_payload(void) {
     reset_state();
-    pik_daemon_set_link_flags(PIK_CONTROL_LINK_SERIAL);
+    pik_daemon_set_service_flags(PIK_CONTROL_SERVICE_SERIAL);
     peer_state_known = true;
-    peer_state_flags = PIK_CONTROL_LINK_TCP;
-
+    peer_state_flags = PIK_CONTROL_SERVICE_SERIAL |
+                       PIK_CONTROL_SERVICE_TUNNEL;
     pik_daemon_on_control_command(PIK_CONTROL_ACTION_STATUS, 77);
 
     CHECK(send_ack_calls == 1);
     CHECK(send_ack_request == 77);
     CHECK(send_ack_status == PIK_CONTROL_ACK_OK);
-    CHECK(send_ack_payload_len > 0);
-    CHECK(memmem(send_ack_payload, send_ack_payload_len, "links=serial", 12) != NULL);
-    CHECK(memmem(send_ack_payload, send_ack_payload_len, "peer=tcp", 8) != NULL);
+    send_ack_payload[send_ack_payload_len] = '\0';
+    CHECK(strstr((char *)send_ack_payload, "side=test") != NULL);
+    CHECK(strstr((char *)send_ack_payload, "services=serial") != NULL);
+    CHECK(strstr((char *)send_ack_payload,
+                 "peer_services=serial,tunnel") != NULL);
 }
 
 static void test_remote_action_requires_ack_success(void) {
@@ -218,6 +226,21 @@ static void test_remote_action_not_scheduled_on_ack_failure(void) {
 
     CHECK(send_ack_calls == 1);
     CHECK(!pik_daemon_remote_action_due(now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
+}
+
+static void test_remote_action_cannot_be_overwritten(void) {
+    pik_control_action_t action = 0;
+    reset_state();
+
+    pik_daemon_on_control_command(PIK_CONTROL_ACTION_REBOOT_PEER, 1);
+    pik_daemon_on_control_command(PIK_CONTROL_ACTION_POWEROFF_PEER, 2);
+
+    CHECK(send_ack_calls == 2);
+    CHECK(send_ack_request == 2);
+    CHECK(send_ack_status == PIK_CONTROL_ACK_INTERNAL_ERROR);
+    CHECK(pik_daemon_remote_action_due(
+        now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
+    CHECK(action == PIK_CONTROL_ACTION_REBOOT_PEER);
 }
 
 static void test_signal_restart_peer_ack(void) {
@@ -247,7 +270,7 @@ static void test_signal_restart_peer_timeout(void) {
 }
 
 static void test_local_command_roundtrip(void) {
-    char reply[128];
+    char reply[256];
     reset_state();
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -268,11 +291,46 @@ static void test_local_command_roundtrip(void) {
     ack_available = true;
     ack_request = next_request_id;
     ack_status = PIK_CONTROL_ACK_OK;
-    ack_payload = "uart=pty links=serial";
+    ack_payload = (const uint8_t *)"side=mcu services=serial,tunnel";
+    ack_payload_len = strlen((const char *)ack_payload);
     pik_daemon_check_acks(now_ms);
     CHECK(read_reply(peer, reply, sizeof(reply)));
-    CHECK(strcmp(reply, "OK uart=pty links=serial\n") == 0);
+    CHECK(strcmp(reply, "OK side=mcu services=serial,tunnel\n") == 0);
     CHECK(!pik_local_control_pending());
+
+    close(peer);
+    pik_local_control_cleanup();
+    close(epfd);
+}
+
+static void test_fragmented_local_command(void) {
+    char reply[64];
+    reset_state();
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    CHECK(epfd >= 0);
+    CHECK(pik_local_control_start(epfd));
+
+    int peer = connect_control_socket(pik_local_control_sock_path());
+    CHECK(peer >= 0);
+    CHECK(dispatch_local_event(epfd));
+
+    CHECK(test_write_all(peer, "reboot-", 7));
+    CHECK(dispatch_local_event(epfd));
+    CHECK(send_command_calls == 0);
+    CHECK(!pik_local_control_pending());
+
+    CHECK(test_write_all(peer, "peer\n", 5));
+    CHECK(dispatch_local_event(epfd));
+    CHECK(send_command_calls == 1);
+    CHECK(sent_action == PIK_CONTROL_ACTION_REBOOT_PEER);
+
+    ack_available = true;
+    ack_request = next_request_id;
+    ack_status = PIK_CONTROL_ACK_OK;
+    pik_daemon_check_acks(now_ms);
+    CHECK(read_reply(peer, reply, sizeof(reply)));
+    CHECK(strcmp(reply, "OK\n") == 0);
 
     close(peer);
     pik_local_control_cleanup();
@@ -297,7 +355,8 @@ static void test_local_error_ack_includes_reason(void) {
     ack_available = true;
     ack_request = next_request_id;
     ack_status = PIK_CONTROL_ACK_INTERNAL_ERROR;
-    ack_payload = "exec failed";
+    ack_payload = (const uint8_t *)"exec failed";
+    ack_payload_len = strlen((const char *)ack_payload);
     pik_daemon_check_acks(now_ms);
     CHECK(read_reply(peer, reply, sizeof(reply)));
     CHECK(strcmp(reply, "ERR peer internal-error exec failed\n") == 0);
@@ -308,7 +367,7 @@ static void test_local_error_ack_includes_reason(void) {
 }
 
 static void test_local_ack_timeout(void) {
-    char reply[64];
+    char reply[128];
     reset_state();
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -331,6 +390,28 @@ static void test_local_ack_timeout(void) {
     close(epfd);
 }
 
+static void test_command_without_ready_peer_fails(void) {
+    char reply[128];
+    reset_state();
+    send_command_ok = false;
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    CHECK(epfd >= 0);
+    CHECK(pik_local_control_start(epfd));
+    int peer = connect_control_socket(pik_local_control_sock_path());
+    CHECK(peer >= 0);
+    CHECK(dispatch_local_event(epfd));
+
+    CHECK(test_write_all(peer, "status-peer\n", 12));
+    CHECK(dispatch_local_event(epfd));
+    CHECK(read_reply(peer, reply, sizeof(reply)));
+    CHECK(strcmp(reply, "ERR peer not ready\n") == 0);
+
+    close(peer);
+    pik_local_control_cleanup();
+    close(epfd);
+}
+
 int main(void) {
     const char *sock = getenv(PIK_CONTROL_SOCK_ENV);
     CHECK(sock && *sock);
@@ -340,11 +421,14 @@ int main(void) {
     test_status_ack_payload();
     test_remote_action_requires_ack_success();
     test_remote_action_not_scheduled_on_ack_failure();
+    test_remote_action_cannot_be_overwritten();
     test_signal_restart_peer_ack();
     test_signal_restart_peer_timeout();
     test_local_command_roundtrip();
+    test_fragmented_local_command();
     test_local_error_ack_includes_reason();
     test_local_ack_timeout();
+    test_command_without_ready_peer_fails();
 
     unlink(sock);
     if (failures) {

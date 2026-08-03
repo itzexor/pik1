@@ -19,9 +19,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// ── sizing ────────────────────────────────────────────────────────────────────
 #define MAX_CONNS         16
-#define CONN_RING_CAP     (1u << 18)             // 256 KB per connection
+#define CONN_RING_CAP     (1u << 18)
 #define CONN_RING_MASK    (CONN_RING_CAP - 1u)
 #define CONN_HIGH_WATER   (64u  * 1024u)
 #define CONN_LOW_WATER    (16u  * 1024u)
@@ -32,19 +31,17 @@
 #define LISTEN_RETRY_MIN  1000
 #define LISTEN_RETRY_MAX  30000
 
-// ── types ─────────────────────────────────────────────────────────────────────
 typedef struct {
     int      fd;
     uint32_t epev;
-    uint8_t  gen;          // current incarnation of this slot
+    uint8_t  gen;          /* current nonzero incarnation of this slot */
     uint8_t  txbuf[CONN_RING_CAP];
     uint32_t tx_head, tx_tail;
-    bool     paused;       // local shared-link backpressure
-    bool     flow_paused;  // remote sent PAUSE
-    bool     pause_sent;   // we sent PAUSE
+    bool     paused;       /* local shared-link backpressure */
+    bool     flow_paused;  /* remote sent PAUSE */
+    bool     pause_sent;   /* we sent PAUSE */
 } conn_t;
 
-// ── globals ───────────────────────────────────────────────────────────────────
 static conn_t        g_conns[MAX_CONNS];
 static tunnel_mode_t g_mode = TUNNEL_MODE_NONE;
 static bool          g_started;
@@ -58,10 +55,8 @@ static int           g_listen_backoff_ms;
 
 static int g_listen_tag;
 
-// ── logging ───────────────────────────────────────────────────────────────────
 #define LOG(...) pik_log("tun", __VA_ARGS__)
 
-// ── connection ring helpers ───────────────────────────────────────────────────
 static uint32_t conn_avail(const conn_t *c) { return c->tx_tail - c->tx_head; }
 static uint32_t conn_space(const conn_t *c) { return CONN_RING_CAP - conn_avail(c); }
 
@@ -70,20 +65,26 @@ static void conn_push(conn_t *c, const uint8_t *src, size_t len) {
         c->txbuf[c->tx_tail++ & CONN_RING_MASK] = src[i];
 }
 
-static void conn_drain(conn_t *c) {
+static bool conn_drain(conn_t *c) {
     while (conn_avail(c) && c->fd >= 0) {
         uint32_t off    = c->tx_head & CONN_RING_MASK;
         uint32_t contig = CONN_RING_CAP - off;
         uint32_t avail  = conn_avail(c);
         size_t   n      = avail < contig ? avail : contig;
         ssize_t  w      = write(c->fd, c->txbuf + off, n);
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return true;
         if (w <= 0) {
-            if (w < 0 && errno != EAGAIN && errno != EINTR)
-                LOG("conn %d TCP write: %s", (int)(c - g_conns), strerror(errno));
-            break;
+            if (w < 0)
+                LOG("conn %d TCP write: %s",
+                    (int)(c - g_conns), strerror(errno));
+            return false;
         }
         c->tx_head += (uint32_t)w;
     }
+    return true;
 }
 
 static void conn_epoll_update(conn_t *c) {
@@ -92,11 +93,15 @@ static void conn_epoll_update(conn_t *c) {
                   | (conn_avail(c) ? EPOLLOUT : 0u);
     if (want == c->epev) return;
     c->epev = want;
-    if (want) pik_epoll_set(g_epfd, c->fd, want, c);
-    else      pik_epoll_del(g_epfd, c->fd);
+    if (want && !pik_epoll_set(g_epfd, c->fd, want, c)) {
+        LOG("conn %d epoll update: %s",
+            (int)(c - g_conns), strerror(errno));
+        pik_session_fail();
+    } else if (!want) {
+        pik_epoll_del(g_epfd, c->fd);
+    }
 }
 
-// ── flow control ──────────────────────────────────────────────────────────────
 static void pause_all_conns(void) {
     if (g_conns_paused) return;
     g_conns_paused = true;
@@ -117,7 +122,6 @@ static void resume_all_conns(void) {
     }
 }
 
-// ── frame enqueue ─────────────────────────────────────────────────────────────
 static bool enqueue_frame(uint8_t type, uint8_t conn_id, uint8_t gen,
                           const uint8_t *data, size_t dlen) {
     static uint8_t payload[PIK_TUN_MAX_PAYLOAD];
@@ -132,7 +136,6 @@ static bool is_stale_closed_slot(const conn_t *c, uint8_t gen) {
     return c->fd < 0 && c->gen != 0 && gen != c->gen;
 }
 
-// ── connection close ──────────────────────────────────────────────────────────
 static void conn_close(int id, bool send_close) {
     conn_t *c = &g_conns[id];
     if (c->fd < 0) return;
@@ -154,7 +157,6 @@ static void close_all_conns(bool send_close) {
         if (g_conns[i].fd >= 0) conn_close(i, send_close);
 }
 
-// ── TCP connect (forward mode) ────────────────────────────────────────────────
 static int tcp_connect_to_target(void) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
@@ -178,7 +180,6 @@ static int tcp_connect_to_target(void) {
     return fd;
 }
 
-// ── frame handling ────────────────────────────────────────────────────────────
 bool tunnel_on_frame(uint8_t type, const uint8_t *payload, size_t plen) {
     if (g_mode == TUNNEL_MODE_NONE) {
         LOG("link failure: tunnel frame but no tunnel configured");
@@ -193,8 +194,17 @@ bool tunnel_on_frame(uint8_t type, const uint8_t *payload, size_t plen) {
     const uint8_t *data = payload + PIK_TUN_PREFIX_LEN;
     size_t dlen = plen - PIK_TUN_PREFIX_LEN;
 
+    if (gen == 0) {
+        LOG("link failure: zero tunnel generation");
+        return false;
+    }
     if (id >= MAX_CONNS) {
         LOG("link failure: invalid connection id %u type=0x%02x", id, type);
+        return false;
+    }
+    if (type != PIK_FRAME_TUN_DATA && dlen != 0) {
+        LOG("link failure: tunnel control frame type=0x%02x has %zu data bytes",
+            type, dlen);
         return false;
     }
     conn_t *c = &g_conns[id];
@@ -234,13 +244,19 @@ bool tunnel_on_frame(uint8_t type, const uint8_t *payload, size_t plen) {
         }
         if (gen != c->gen) return true;  /* stale incarnation, conn is gone */
         if (!dlen) return true;
-        conn_drain(c);
+        if (!conn_drain(c)) {
+            conn_close(id, true);
+            return pik_session_up();
+        }
         if (conn_space(c) < dlen) {
             LOG("link failure: conn output buffer overflow despite PAUSE");
             return false;
         }
         conn_push(c, data, dlen);
-        conn_drain(c);
+        if (!conn_drain(c)) {
+            conn_close(id, true);
+            return pik_session_up();
+        }
         {
             uint32_t avail = conn_avail(c);
             if (!c->pause_sent && avail > CONN_HIGH_WATER) {
@@ -294,7 +310,6 @@ bool tunnel_on_frame(uint8_t type, const uint8_t *payload, size_t plen) {
     }
 }
 
-// ── listener / TCP input ──────────────────────────────────────────────────────
 static bool bind_is_wildcard(void) {
     return strcmp(g_host, "") == 0 ||
            strcmp(g_host, "0.0.0.0") == 0 ||
@@ -338,28 +353,31 @@ static bool listener_start(void) {
 
     int one = 1;
     int lfd = -1;
+    bool wildcard = bind_is_wildcard();
     struct sockaddr_in6 sa6 = { .sin6_family = AF_INET6,
                                 .sin6_port = htons((uint16_t)g_port) };
 
-    bool try_v6 = bind_is_wildcard() ||
+    bool try_v6 = wildcard ||
                   inet_pton(AF_INET6, g_host, &sa6.sin6_addr) == 1;
     if (try_v6) {
-        if (bind_is_wildcard()) sa6.sin6_addr = in6addr_any;
+        if (wildcard) sa6.sin6_addr = in6addr_any;
         lfd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (lfd >= 0) {
             setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
             if (bind(lfd, (struct sockaddr *)&sa6, sizeof(sa6)) < 0) {
                 close(lfd);
                 lfd = -1;
-                if (!bind_is_wildcard()) {
+                if (!wildcard) {
                     LOG("bind %s:%d failed", g_host, g_port);
                     return false;
                 }
             }
         }
-        if (lfd < 0 && bind_is_wildcard() && !bind_v4(&lfd, one)) {
-            if (lfd >= 0) close(lfd);
-            return false;
+        if (lfd < 0 && wildcard) {
+            if (!bind_v4(&lfd, one)) {
+                if (lfd >= 0) close(lfd);
+                return false;
+            }
         }
     } else {
         if (!bind_v4(&lfd, one)) {
@@ -368,13 +386,22 @@ static bool listener_start(void) {
         }
     }
 
+    if (lfd < 0) {
+        LOG("listen socket: %s", strerror(errno));
+        return false;
+    }
     if (listen(lfd, 16) < 0) {
         LOG("listen: %s", strerror(errno));
         close(lfd);
         return false;
     }
     g_listen_fd = lfd;
-    pik_epoll_set(g_epfd, lfd, EPOLLIN, &g_listen_tag);
+    if (!pik_epoll_set(g_epfd, lfd, EPOLLIN, &g_listen_tag)) {
+        LOG("epoll add tunnel listener: %s", strerror(errno));
+        close(lfd);
+        g_listen_fd = -1;
+        return false;
+    }
     LOG("listening on %s:%d", g_host[0] ? g_host : "0.0.0.0", g_port);
     if (bind_is_wildcard())
         LOG("warning: unauthenticated TCP tunnel is exposed on all interfaces");
@@ -415,6 +442,7 @@ static void listener_accept(void) {
     c->fd = fd;
     c->epev = 0;
     c->gen++;
+    if (c->gen == 0) c->gen++;
     c->paused = g_conns_paused;
     c->flow_paused = false;
     c->pause_sent = false;
@@ -447,7 +475,6 @@ static void conn_on_readable(int id) {
         pause_all_conns();
 }
 
-// ── session service hooks ─────────────────────────────────────────────────────
 void tunnel_on_link_down(void) {
     if (g_mode == TUNNEL_MODE_NONE || !g_started) return;
     LOG("link down");
@@ -458,7 +485,6 @@ void tunnel_on_link_down(void) {
     g_conns_paused = false;
 }
 
-// ── component API ─────────────────────────────────────────────────────────────
 void tunnel_init(int epfd, tunnel_mode_t mode, const char *host, int port) {
     g_epfd = epfd;
     g_mode = mode;
@@ -485,12 +511,21 @@ void tunnel_start(int64_t now) {
 
 bool tunnel_owns_event(const void *ptr) {
     if (ptr == &g_listen_tag) return true;
-    return ptr >= (const void *)&g_conns[0] &&
-           ptr < (const void *)&g_conns[MAX_CONNS];
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (ptr == &g_conns[i]) return true;
+    return false;
 }
 
 bool tunnel_dispatch(void *ptr, uint32_t events) {
     if (ptr == &g_listen_tag) {
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            LOG("listener event failure: events=0x%x", events);
+            listener_stop();
+            g_listen_retry_at =
+                pik_now_ms() +
+                pik_backoff_next(&g_listen_backoff_ms, LISTEN_RETRY_MAX);
+            return pik_session_up();
+        }
         listener_accept();
         return pik_session_up();
     }
@@ -499,7 +534,10 @@ bool tunnel_dispatch(void *ptr, uint32_t events) {
     if (events & EPOLLERR) { conn_close(id, true); return pik_session_up(); }
     if (events & EPOLLIN) conn_on_readable(id);
     if (c->fd >= 0 && (events & EPOLLOUT)) {
-        conn_drain(c);
+        if (!conn_drain(c)) {
+            conn_close(id, true);
+            return pik_session_up();
+        }
         if (c->pause_sent && conn_avail(c) < CONN_LOW_WATER) {
             if (enqueue_frame(PIK_FRAME_TUN_RESUME, (uint8_t)id, c->gen, NULL, 0))
                 c->pause_sent = false;

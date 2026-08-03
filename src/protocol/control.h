@@ -32,8 +32,8 @@ typedef enum {
 } pik_control_tcp_role_t;
 
 enum {
-    PIK_CONTROL_LINK_SERIAL = 1u << 0,
-    PIK_CONTROL_LINK_TCP    = 1u << 1,
+    PIK_CONTROL_SERVICE_SERIAL = 1u << 0,
+    PIK_CONTROL_SERVICE_TUNNEL = 1u << 1,
 };
 
 typedef void (*pik_control_command_fn)(pik_control_action_t action,
@@ -53,8 +53,7 @@ bool pik_control_on_frame(uint8_t type, const uint8_t *payload, size_t plen);
 void pik_control_on_link_down(void);
 bool pik_control_tick(int64_t now);
 bool pik_control_ready(void);
-/* Consecutive handshake RX timeouts since the last successful handshake; the
- * daemon uses this to quiet its per-attempt logging in a dead-peer loop. */
+/* Consecutive handshake RX timeouts since the last successful handshake. */
 uint32_t pik_control_handshake_failures(void);
 int64_t pik_control_deadline(void);
 void pik_control_cleanup(void);
@@ -68,8 +67,8 @@ bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status
                           const uint8_t **payload, size_t *payload_len);
 bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
                           const uint8_t *payload, size_t payload_len);
-bool pik_control_send_link_state(uint32_t flags);
-bool pik_control_peer_link_state(uint32_t *flags);
+bool pik_control_send_service_state(uint32_t flags);
+bool pik_control_peer_service_state(uint32_t *flags);
 
 const char *pik_control_action_name(pik_control_action_t action);
 const char *pik_control_ack_status_name(pik_control_ack_status_t status);

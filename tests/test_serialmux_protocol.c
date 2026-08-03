@@ -229,6 +229,17 @@ static void test_unknown_type_fails(void) {
     fixture_cleanup(&mx);
 }
 
+static void test_ready_payload_fails(void) {
+    mux_fixture_t mx;
+    uint8_t payload = 1;
+    CHECK(fixture_init(&mx));
+    CHECK(sfx_handshake(&mx.fx));
+    CHECK(send_mux(&mx, PIK_FRAME_MUX_READY, TEST_WIRE_CH,
+                   &payload, sizeof(payload)));
+    CHECK(!pik_session_up());
+    fixture_cleanup(&mx);
+}
+
 static void test_stale_bringup_frames_discarded_then_sync(void) {
     mux_fixture_t mx;
     CHECK(fixture_init(&mx));
@@ -408,6 +419,7 @@ int main(void) {
     test_unknown_channel_fails();
     test_reserved_channel_fails();
     test_unknown_type_fails();
+    test_ready_payload_fails();
     test_stale_bringup_frames_discarded_then_sync();
     test_stale_frames_past_grace_fail();
     test_seq_gap_naks_and_heals();

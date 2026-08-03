@@ -24,5 +24,5 @@ typedef struct {
     pik_control_tcp_role_t tcp_role;
 } app_config_t;
 
-void pik_app_config_usage(const char *prog);
+_Noreturn void pik_app_config_usage(const char *prog);
 void pik_app_config_parse(int argc, char **argv, app_config_t *cfg);

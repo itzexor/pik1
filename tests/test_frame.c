@@ -214,7 +214,8 @@ static void test_rx_consume_overflow(void) {
 static void test_status_text(void) {
     CHECK(strcmp(pik_frame_status_text(PIK_FRAME_OK), "ok") == 0);
     CHECK(strcmp(pik_frame_status_text(PIK_FRAME_CRC_MISMATCH), "CRC mismatch") == 0);
-    CHECK(strcmp(pik_frame_status_text((pik_frame_status_t)255), "ok") == 0);
+    CHECK(strcmp(pik_frame_status_text((pik_frame_status_t)255),
+                 "unknown frame status") == 0);
 }
 
 static void test_max_size_roundtrip(void) {

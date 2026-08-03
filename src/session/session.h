@@ -41,5 +41,5 @@ bool pik_session_can_queue(pik_session_class_t cls, size_t plen);
 /* Bytes currently backlogged in the class queue (records + payloads). */
 uint32_t pik_session_backlog(pik_session_class_t cls);
 
-/* The underlying link; services read liveness timestamps and stats from it. */
+/* The underlying link; control and transports use its liveness and byte I/O. */
 pik_link_t *pik_session_link(void);

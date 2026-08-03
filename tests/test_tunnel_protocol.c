@@ -81,7 +81,7 @@ static bool read_frame_of_type(session_fixture_t *fx, uint8_t type, sfx_frame_t 
     return false;
 }
 
-// ── listen mode ───────────────────────────────────────────────────────────────
+/* Listener mode. */
 static void test_listen_open_data_close(void) {
     session_fixture_t fx;
     sfx_frame_t f;
@@ -220,7 +220,33 @@ static void test_short_tunnel_frame_fails(void) {
     sfx_cleanup(&fx);
 }
 
-// ── forward mode ──────────────────────────────────────────────────────────────
+static void test_zero_generation_fails(void) {
+    session_fixture_t fx;
+    int port = free_port();
+    CHECK(port > 0);
+
+    CHECK(fixture_init_mode(&fx, TUNNEL_MODE_LISTEN, port));
+    CHECK(handshake_as(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(send_tun(&fx, PIK_FRAME_TUN_DATA, 0, 0,
+                   (const uint8_t *)"x", 1));
+    CHECK(!sfx_dispatch_one(&fx, 1000));
+    sfx_cleanup(&fx);
+}
+
+static void test_tunnel_control_payload_fails(void) {
+    session_fixture_t fx;
+    int port = free_port();
+    CHECK(port > 0);
+
+    CHECK(fixture_init_mode(&fx, TUNNEL_MODE_LISTEN, port));
+    CHECK(handshake_as(&fx, PIK_CONTROL_ROLE_PTY));
+    CHECK(send_tun(&fx, PIK_FRAME_TUN_CLOSE, 0, 1,
+                   (const uint8_t *)"x", 1));
+    CHECK(!sfx_dispatch_one(&fx, 1000));
+    sfx_cleanup(&fx);
+}
+
+/* Forward mode. */
 typedef struct {
     int listen_fd;
     int port;
@@ -325,7 +351,7 @@ static void test_tunnel_frame_without_tunnel_fails(void) {
     sfx_cleanup(&fx);
 }
 
-// ── TX scheduler ──────────────────────────────────────────────────────────────
+/* Shared-link TX scheduling. */
 static void test_control_overtakes_tunnel_backlog(void) {
     session_fixture_t fx;
     sfx_frame_t f;
@@ -370,6 +396,8 @@ int main(void) {
     test_generation_disambiguates_reused_slot();
     test_open_in_listen_mode_fails();
     test_short_tunnel_frame_fails();
+    test_zero_generation_fails();
+    test_tunnel_control_payload_fails();
     test_forward_open_data_roundtrip();
     test_forward_duplicate_open_fails();
     test_data_for_closed_conn_answers_close();

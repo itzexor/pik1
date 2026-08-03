@@ -10,10 +10,10 @@ typedef enum { CH_MCU, CH_PTY } ch_type_t;
 
 typedef struct {
     ch_type_t type;
-    uint8_t   ch_id;      // user-facing CLI channel id
-    char      dev[128];   // MCU: serial device path
-    int       baud;       // MCU: baud rate
-    char      path[128];  // PTY: symlink path
+    uint8_t   ch_id;      /* user-facing CLI channel id */
+    char      dev[128];   /* MCU serial device path */
+    int       baud;
+    char      path[128];  /* PTY symlink path */
 } ch_spec_t;
 
 typedef struct {

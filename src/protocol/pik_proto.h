@@ -5,7 +5,7 @@
 
 #include "frame.h"
 
-/* Unified single-link wire protocol (protocol version 8).
+/* Unified single-link wire protocol.
  *
  * All traffic shares one sequenced link. Every frame carries the 8-byte
  * header [type:1][ch:1][session_le:4][seq_le:2]; the channel byte selects
@@ -64,8 +64,8 @@ enum {
     PIK_FRAME_CTRL_PONG       = 0x12u,
     PIK_FRAME_CTRL_COMMAND    = 0x13u,
     PIK_FRAME_CTRL_ACK        = 0x14u,
-    PIK_FRAME_CTRL_LINK_STATE = 0x15u,
-    PIK_FRAME_CTRL_CONFIG     = 0x16u,
+    PIK_FRAME_CTRL_SERVICE_STATE = 0x15u,
+    PIK_FRAME_CTRL_CONFIG        = 0x16u,
 
     /* TCP tunnel (ch 15); payload starts with [conn:1][gen:1] */
     PIK_FRAME_TUN_OPEN   = 0x20u,
@@ -81,6 +81,7 @@ enum {
     PIK_MUX_MAX_PAYLOAD  = PIK_WIRE_MAX_PAYLOAD,
 
     PIK_CTRL_MAX_PAYLOAD = 128u,
+    PIK_CTRL_ACK_MAX_PAYLOAD = PIK_CTRL_MAX_PAYLOAD - 5u,
     PIK_CTRL_HELLO_LEN   = 29u,
     PIK_CTRL_RELEASE_LEN = 16u,
 

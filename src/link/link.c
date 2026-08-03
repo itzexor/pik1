@@ -35,23 +35,20 @@ const uint8_t *pik_link_tx_peek(pik_link_t *lk, uint32_t *len) {
 
 void pik_link_tx_consume(pik_link_t *lk, uint32_t len, int64_t now) {
     if (!len) return;
+    if (len > tx_avail(lk)) {
+        LOGL(lk, "link failure: transport consumed %u bytes with only %u queued",
+             len, tx_avail(lk));
+        pik_link_fail(lk);
+        return;
+    }
     lk->tx_head += len;
     lk->last_tx_ms = now;
-    lk->tx_writes++;
-    lk->tx_bytes += (uint64_t)len;
 }
 
 void pik_link_fail(pik_link_t *lk) {
     bool was_active = lk->active;
     lk->failed = true;
     if (!was_active) return;
-    if (!lk->quiet)
-        LOGL(lk, "link stats: rx_frames=%llu tx_frames=%llu rx_reads=%llu rx_bytes=%llu "
-             "tx_writes=%llu tx_bytes=%llu rx_seq=%u tx_seq=%u",
-             (unsigned long long)lk->rx_frames, (unsigned long long)lk->tx_frames,
-             (unsigned long long)lk->rx_reads, (unsigned long long)lk->rx_bytes,
-             (unsigned long long)lk->tx_writes, (unsigned long long)lk->tx_bytes,
-             lk->rx_seq, lk->tx_seq);
     lk->active = false;
     if (lk->cfg.on_down)
         lk->cfg.on_down();
@@ -120,7 +117,6 @@ static bool enqueue_opt(pik_link_t *lk, uint8_t type, uint8_t aux,
         hist_store(lk, lk->tx_seq, s_enc, enc_len);
         lk->tx_seq++;
     }
-    lk->tx_frames++;
     if (lk->cfg.on_tx_ready)
         lk->cfg.on_tx_ready();
     return true;
@@ -170,7 +166,6 @@ static void handle_nak(pik_link_t *lk, const uint8_t *p) {
 
 static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
     pik_frame_t frame;
-    lk->rx_frames++;
 
     pik_frame_status_t st = pik_frame_decode(enc, enc_len, lk->enc_max,
                                              s_dec, sizeof(s_dec), &frame);
@@ -193,7 +188,6 @@ static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
                 lk->gap_discards = 0;
                 LOGL(lk, "bad frame (%s enc_len=%zu), requesting retransmit",
                      pik_frame_status_text(st), enc_len);
-                pik_log_bad_frame_sample(lk->cfg.name, enc, enc_len);
                 send_nak(lk, lk->now_ms);
             }
             lk->gap_discards++;
@@ -201,7 +195,6 @@ static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
         }
         LOGL(lk, "link failure: %s enc_len=%zu first=0x%02x",
              pik_frame_status_text(st), enc_len, enc_len ? enc[0] : 0);
-        pik_log_bad_frame_sample(lk->cfg.name, enc, enc_len);
         pik_link_fail(lk);
         return;
     }
@@ -320,8 +313,6 @@ bool pik_link_feed(pik_link_t *lk, const uint8_t *buf, size_t len, int64_t now) 
     if (!len) return true;
 
     lk->last_rx_ms = now;
-    lk->rx_reads++;
-    lk->rx_bytes += (uint64_t)len;
 
     while (len && !lk->failed) {
         size_t cap = lk->cfg.rx_cap - lk->rxbuf_len;
@@ -359,9 +350,6 @@ void pik_link_begin(pik_link_t *lk, int64_t now) {
     lk->tx_session = pik_session_id(now);
     lk->rx_session = 0;
     lk->tx_seq = lk->rx_seq = 0;
-    lk->rx_frames = lk->tx_frames = 0;
-    lk->rx_reads = lk->rx_bytes = 0;
-    lk->tx_writes = lk->tx_bytes = 0;
     lk->hist_first = lk->hist_count = 0;
     lk->hist_head = lk->hist_tail = 0;
     lk->last_resend_ms = 0;
@@ -407,7 +395,6 @@ int64_t pik_link_deadline(const pik_link_t *lk) {
 void pik_link_cleanup(pik_link_t *lk) {
     lk->active = false;
     lk->failed = false;
-    lk->quiet = false;
     lk->tx_head = lk->tx_tail = 0;
     lk->rxbuf_len = 0;
     lk->tx_session = lk->rx_session = 0;
