@@ -42,7 +42,7 @@ static bool handshake_as(session_fixture_t *fx, pik_control_role_t peer_role) {
     if (f.type != PIK_FRAME_CTRL_HELLO) return false;
     if (!sfx_send_peer_hello(fx, peer_role, PIK1_PROTOCOL_VERSION)) return false;
     if (!sfx_dispatch_one(fx, 1000)) return false;
-    if (!pik_control_ready()) return false;
+    if (sfx_ready_calls != 1) return false;
     if (!sfx_read_frame(fx, &f) || f.type != PIK_FRAME_CTRL_HELLO) return false;
     if (!sfx_read_frame(fx, &f) || f.type != PIK_FRAME_CTRL_CONFIG) return false;
     return true;

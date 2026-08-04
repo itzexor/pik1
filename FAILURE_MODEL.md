@@ -49,8 +49,8 @@ Teardown closes or cancels transport work, closes PTYs and TCP connections,
 clears all service queues and retransmit history, and resets control state.
 Reconnect uses a new session ID and bounded backoff.
 
-No bytes, close events, stream generations, ACKs, or service state from the
-old session may affect the new one.
+No bytes, close events, stream generations, or ACKs from the old session may
+affect the new one.
 
 ## Framing and retransmission
 

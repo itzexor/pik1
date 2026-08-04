@@ -1,8 +1,8 @@
 CC       ?= gcc
 CFLAGS   := -O2 -std=c11 -Wall -Wextra -D_GNU_SOURCE \
              -ffunction-sections -fdata-sections \
-             -Isrc/app -Isrc/core -Isrc/link -Isrc/platform \
-             -Isrc/protocol -Isrc/session -Isrc/transport -Isrc/vendor
+             -Isrc/app -Isrc/common -Isrc/link -Isrc/services \
+             -Isrc/io -Isrc/vendor
 LDFLAGS  := -Wl,--gc-sections
 
 STATIC   := -static
@@ -11,36 +11,25 @@ TEST_BUILD := $(BUILD)/tests
 
 COBS_SRCS   := src/vendor/nanocobs/cobs.c
 COBS_HDRS   := src/vendor/nanocobs/cobs.h
-CORE_SRCS   := src/core/util.c src/core/logging.c
-CORE_HDRS   := src/core/util.h src/core/logging.h src/core/product.h
-PLATFORM_SRCS := src/platform/tty.c src/platform/fd.c
-PLATFORM_HDRS := src/platform/tty.h src/platform/fd.h
-LINK_SRCS := src/link/frame.c src/link/link.c
-LINK_HDRS := src/link/frame.h src/link/link.h
-SESSION_SRCS := src/session/session.c
-SESSION_HDRS := src/session/session.h
-TRANSPORT_SRCS := src/transport/usb_bulk.c \
-                  src/transport/usb_gadget_ffs.c \
-                  src/transport/usb_gadget_configfs.c
-TRANSPORT_HDRS := src/transport/usb_bulk.h \
-                  src/transport/usb_gadget_ffs.h \
-                  src/transport/usb_gadget_configfs.h \
-                  src/transport/usb_common.h
-COMMON_SRCS := $(CORE_SRCS) $(LINK_SRCS) $(SESSION_SRCS) \
-               $(PLATFORM_SRCS) $(TRANSPORT_SRCS)
-COMMON_HDRS := $(CORE_HDRS) $(LINK_HDRS) $(SESSION_HDRS) \
-               $(PLATFORM_HDRS) $(TRANSPORT_HDRS)
-PROTO_SRCS  := src/protocol/control.c src/protocol/serialmux.c \
-               src/protocol/tunnel.c
-PROTO_HDRS  := src/protocol/control.h src/protocol/serialmux.h \
-               src/protocol/tunnel.h \
-               src/protocol/pik_proto.h
-APP_SRCS    := src/app/pik1d.c src/app/app_config.c \
-               src/app/local_control.c src/app/daemon_control.c
-APP_HDRS    := src/app/app_config.h src/app/local_control.h src/app/daemon_control.h
+COMMON_SRCS := src/common/util.c src/common/logging.c
+COMMON_HDRS := src/common/util.h src/common/logging.h src/common/product.h
+LINK_SRCS   := src/link/frame.c src/link/link.c src/link/session.c
+LINK_HDRS   := src/link/frame.h src/link/link.h src/link/session.h \
+               src/link/pik_proto.h
+SERVICE_SRCS := src/services/control.c src/services/serialmux.c \
+                src/services/tunnel.c
+SERVICE_HDRS := src/services/control.h src/services/serialmux.h \
+                src/services/tunnel.h
+IO_SRCS := src/io/fd.c src/io/usb_host.c src/io/usb_gadget.c \
+           src/io/usb_gadget_configfs.c
+IO_HDRS := src/io/fd.h src/io/usb.h
+APP_SRCS := src/app/pik1d.c src/app/commands.c
+APP_HDRS := src/app/commands.h
 
-PIK1D_SRCS  := $(APP_SRCS) $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
-PIK1D_HDRS  := $(APP_HDRS) $(PROTO_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
+BASE_SRCS   := $(COMMON_SRCS) $(LINK_SRCS) $(IO_SRCS)
+BASE_HDRS   := $(COMMON_HDRS) $(LINK_HDRS) $(IO_HDRS)
+PIK1D_SRCS  := $(APP_SRCS) $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
+PIK1D_HDRS  := $(APP_HDRS) $(SERVICE_HDRS) $(COBS_HDRS) $(BASE_HDRS)
 UTILITY_SCRIPTS := scripts/wifi-reset.sh
 
 # Install
@@ -94,7 +83,7 @@ test: test-unit test-cli test-scripts
 
 test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_frame \
       $(TEST_BUILD)/test_logging $(TEST_BUILD)/test_control_names \
-      $(TEST_BUILD)/test_control_protocol $(TEST_BUILD)/test_app_control \
+      $(TEST_BUILD)/test_control_protocol $(TEST_BUILD)/test_commands \
       $(TEST_BUILD)/test_serialmux_protocol $(TEST_BUILD)/test_tunnel_protocol
 	$(TEST_BUILD)/test_util
 	$(TEST_BUILD)/test_cobs
@@ -102,7 +91,7 @@ test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_fr
 	$(TEST_BUILD)/test_logging
 	$(TEST_BUILD)/test_control_names
 	$(TEST_BUILD)/test_control_protocol
-	PIK1_CONTROL_SOCK=$(abspath $(TEST_BUILD))/app-control.sock $(TEST_BUILD)/test_app_control
+	PIK1_CONTROL_SOCK=$(abspath $(TEST_BUILD))/commands.sock $(TEST_BUILD)/test_commands
 	$(TEST_BUILD)/test_serialmux_protocol
 	$(TEST_BUILD)/test_tunnel_protocol
 
@@ -116,8 +105,8 @@ test-scripts:
 $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(PIK1D_SRCS)
 
-$(TEST_BUILD)/test_util: tests/test_util.c src/core/util.c src/core/util.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_util.c src/core/util.c
+$(TEST_BUILD)/test_util: tests/test_util.c src/common/util.c src/common/util.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_util.c src/common/util.c
 
 $(TEST_BUILD)/test_frame: tests/test_frame.c src/link/frame.c src/link/frame.h $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_frame.c src/link/frame.c $(COBS_SRCS)
@@ -125,23 +114,23 @@ $(TEST_BUILD)/test_frame: tests/test_frame.c src/link/frame.c src/link/frame.h $
 $(TEST_BUILD)/test_cobs: tests/test_cobs.c $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_cobs.c $(COBS_SRCS)
 
-$(TEST_BUILD)/test_logging: tests/test_logging.c src/core/logging.c src/core/logging.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_logging.c src/core/logging.c
+$(TEST_BUILD)/test_logging: tests/test_logging.c src/common/logging.c src/common/logging.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_logging.c src/common/logging.c
 
-$(TEST_BUILD)/test_control_names: tests/test_control_names.c $(PROTO_SRCS) $(PROTO_HDRS) $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_names.c $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_control_names: tests/test_control_names.c $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_names.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
 
-$(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h tests/test_session_harness.h $(PROTO_SRCS) $(PROTO_HDRS) $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_protocol.c $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h tests/test_session_harness.h $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_protocol.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
 
-$(TEST_BUILD)/test_app_control: tests/test_app_control.c tests/test_harness.h src/app/local_control.c src/app/daemon_control.c src/app/local_control.h src/app/daemon_control.h src/core/logging.c src/core/logging.h src/platform/fd.c src/platform/fd.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_app_control.c src/app/local_control.c src/app/daemon_control.c src/core/logging.c src/platform/fd.c
+$(TEST_BUILD)/test_commands: tests/test_commands.c tests/test_harness.h src/app/commands.c src/app/commands.h src/common/logging.c src/common/logging.h src/io/fd.c src/io/fd.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_commands.c src/app/commands.c src/common/logging.c src/io/fd.c
 
-$(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h tests/test_session_harness.h $(PROTO_SRCS) $(PROTO_HDRS) $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_serialmux_protocol.c $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h tests/test_session_harness.h $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_serialmux_protocol.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
 
-$(TEST_BUILD)/test_tunnel_protocol: tests/test_tunnel_protocol.c tests/test_harness.h tests/test_session_harness.h $(PROTO_SRCS) $(PROTO_HDRS) $(COBS_SRCS) $(COMMON_SRCS) $(COMMON_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_tunnel_protocol.c $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
+$(TEST_BUILD)/test_tunnel_protocol: tests/test_tunnel_protocol.c tests/test_harness.h tests/test_session_harness.h $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_tunnel_protocol.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
 
 # MIPSEL
 mipsel: $(BUILD)/pik1d.mipsel

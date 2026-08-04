@@ -310,12 +310,6 @@ bool tunnel_on_frame(uint8_t type, const uint8_t *payload, size_t plen) {
     }
 }
 
-static bool bind_is_wildcard(void) {
-    return strcmp(g_host, "") == 0 ||
-           strcmp(g_host, "0.0.0.0") == 0 ||
-           strcmp(g_host, "::") == 0;
-}
-
 static void listener_stop(void) {
     if (g_listen_fd < 0) return;
     pik_epoll_del(g_epfd, g_listen_fd);
@@ -323,71 +317,31 @@ static void listener_stop(void) {
     g_listen_fd = -1;
 }
 
-static bool bind_v4(int *lfd, int one) {
-    struct sockaddr_in sa4 = { .sin_family = AF_INET,
-                               .sin_port = htons((uint16_t)g_port) };
-    if (strcmp(g_host, "0.0.0.0") == 0 || strcmp(g_host, "") == 0) {
-        sa4.sin_addr.s_addr = INADDR_ANY;
-    } else if (inet_pton(AF_INET, g_host, &sa4.sin_addr) != 1) {
-        LOG("bad bind address: %s", g_host);
-        return false;
-    }
-    if (*lfd < 0) {
-        *lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (*lfd < 0) {
-            LOG("listen socket: %s", strerror(errno));
-            return false;
-        }
-        setsockopt(*lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    }
-    if (bind(*lfd, (struct sockaddr *)&sa4, sizeof(sa4)) < 0) {
-        LOG("bind %s:%d: %s", g_host[0] ? g_host : "0.0.0.0", g_port,
-            strerror(errno));
-        return false;
-    }
-    return true;
-}
-
 static bool listener_start(void) {
     if (g_mode != TUNNEL_MODE_LISTEN || g_listen_fd >= 0) return true;
 
     int one = 1;
-    int lfd = -1;
-    bool wildcard = bind_is_wildcard();
-    struct sockaddr_in6 sa6 = { .sin6_family = AF_INET6,
-                                .sin6_port = htons((uint16_t)g_port) };
-
-    bool try_v6 = wildcard ||
-                  inet_pton(AF_INET6, g_host, &sa6.sin6_addr) == 1;
-    if (try_v6) {
-        if (wildcard) sa6.sin6_addr = in6addr_any;
-        lfd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (lfd >= 0) {
-            setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-            if (bind(lfd, (struct sockaddr *)&sa6, sizeof(sa6)) < 0) {
-                close(lfd);
-                lfd = -1;
-                if (!wildcard) {
-                    LOG("bind %s:%d failed", g_host, g_port);
-                    return false;
-                }
-            }
-        }
-        if (lfd < 0 && wildcard) {
-            if (!bind_v4(&lfd, one)) {
-                if (lfd >= 0) close(lfd);
-                return false;
-            }
-        }
-    } else {
-        if (!bind_v4(&lfd, one)) {
-            if (lfd >= 0) close(lfd);
-            return false;
-        }
+    bool wildcard = strcmp(g_host, "0.0.0.0") == 0;
+    struct sockaddr_in sa = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)g_port),
+    };
+    if (wildcard) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, g_host, &sa.sin_addr) != 1) {
+        LOG("bad bind address: %s", g_host);
+        return false;
     }
 
+    int lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (lfd < 0) {
         LOG("listen socket: %s", strerror(errno));
+        return false;
+    }
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        LOG("bind %s:%d: %s", g_host, g_port, strerror(errno));
+        close(lfd);
         return false;
     }
     if (listen(lfd, 16) < 0) {
@@ -402,8 +356,8 @@ static bool listener_start(void) {
         g_listen_fd = -1;
         return false;
     }
-    LOG("listening on %s:%d", g_host[0] ? g_host : "0.0.0.0", g_port);
-    if (bind_is_wildcard())
+    LOG("listening on %s:%d", g_host, g_port);
+    if (wildcard)
         LOG("warning: unauthenticated TCP tunnel is exposed on all interfaces");
     return true;
 }

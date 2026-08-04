@@ -316,7 +316,7 @@ static TEST_UNUSED bool sfx_handshake(session_fixture_t *fx) {
     if (!sfx_send_peer_hello(fx, PIK_CONTROL_ROLE_MCU, PIK1_PROTOCOL_VERSION))
         return false;
     if (!sfx_dispatch_one(fx, 1000)) return false;
-    if (!pik_control_ready()) return false;
+    if (sfx_ready_calls != 1) return false;
 
     if (!sfx_read_frame(fx, &f)) return false;
     if (f.type != PIK_FRAME_CTRL_HELLO) return false;

@@ -24,11 +24,11 @@ tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 export PIK1_CONTROL_SOCK="$tmpdir/control.sock"
 
-release=$(sed -n 's/#define PIK1_RELEASE_VERSION "\(.*\)"/\1/p' src/core/product.h)
-[[ -n "$release" ]] || fail "could not read PIK1_RELEASE_VERSION from src/core/product.h"
+release=$(sed -n 's/#define PIK1_RELEASE_VERSION "\(.*\)"/\1/p' src/common/product.h)
+[[ -n "$release" ]] || fail "could not read PIK1_RELEASE_VERSION from src/common/product.h"
 out=$("$PIK1D" --version)
-protocol=$(sed -n 's/#define PIK1_PROTOCOL_VERSION \([0-9]*\)u/\1/p' src/core/product.h)
-[[ -n "$protocol" ]] || fail "could not read PIK1_PROTOCOL_VERSION from src/core/product.h"
+protocol=$(sed -n 's/#define PIK1_PROTOCOL_VERSION \([0-9]*\)u/\1/p' src/common/product.h)
+[[ -n "$protocol" ]] || fail "could not read PIK1_PROTOCOL_VERSION from src/common/product.h"
 [[ "$out" == "pik1d $release protocol=$protocol" ]] ||
     fail "unexpected --version output: $out"
 

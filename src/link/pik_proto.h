@@ -64,8 +64,7 @@ enum {
     PIK_FRAME_CTRL_PONG       = 0x12u,
     PIK_FRAME_CTRL_COMMAND    = 0x13u,
     PIK_FRAME_CTRL_ACK        = 0x14u,
-    PIK_FRAME_CTRL_SERVICE_STATE = 0x15u,
-    PIK_FRAME_CTRL_CONFIG        = 0x16u,
+    PIK_FRAME_CTRL_CONFIG        = 0x15u,
 
     /* TCP tunnel (ch 15); payload starts with [conn:1][gen:1] */
     PIK_FRAME_TUN_OPEN   = 0x20u,

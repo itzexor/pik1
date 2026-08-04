@@ -50,7 +50,7 @@ static void test_protocol_mismatch_fails(void) {
     CHECK(sfx_read_frame(&fx, &f));
     CHECK(sfx_send_peer_hello(&fx, PIK_CONTROL_ROLE_MCU, PIK1_PROTOCOL_VERSION + 1));
     CHECK(!sfx_dispatch_one(&fx, 1000));
-    CHECK(!pik_control_ready());
+    CHECK(sfx_ready_calls == 0);
     sfx_cleanup(&fx);
 }
 
@@ -83,12 +83,17 @@ static void test_missing_peer_handshake_times_out(void) {
     int64_t start;
 
     CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
-    start = pik_now_ms();
+    start = pik_session_link()->last_rx_ms;
     CHECK(sfx_read_frame(&fx, &f));
-    CHECK(!pik_control_ready());
+    {
+        uint8_t empty_frames[] = { 0, 0, 0 };
+        CHECK(pik_link_feed(pik_session_link(), empty_frames,
+                            sizeof(empty_frames), start + 9000));
+    }
+    CHECK(sfx_ready_calls == 0);
     CHECK(pik_control_deadline() <= start + 10000);
     CHECK(!pik_control_tick(start + 10001));
-    CHECK(!pik_control_ready());
+    CHECK(sfx_ready_calls == 0);
     sfx_cleanup(&fx);
 }
 
@@ -109,7 +114,7 @@ static void test_late_peer_hello_retry_sequence(void) {
     fx.peer_seq = 4;
     CHECK(sfx_send_peer_hello(&fx, PIK_CONTROL_ROLE_MCU, PIK1_PROTOCOL_VERSION));
     CHECK(sfx_dispatch_one(&fx, 1000));
-    CHECK(pik_control_ready());
+    CHECK(sfx_ready_calls == 1);
     CHECK(sfx_read_frame(&fx, &f));
     CHECK(f.type == PIK_FRAME_CTRL_HELLO);
     CHECK(sfx_read_frame(&fx, &f));
@@ -143,7 +148,7 @@ static void test_sequence_gap_naks_and_heals(void) {
     CHECK(f.type == PIK_FRAME_CTRL_PONG);
     CHECK(sfx_read_frame(&fx, &f));
     CHECK(f.type == PIK_FRAME_CTRL_PONG);
-    CHECK(pik_control_ready());
+    CHECK(sfx_ready_calls == 1);
     sfx_cleanup(&fx);
 }
 
@@ -188,7 +193,7 @@ static void test_nak_triggers_retransmit(void) {
     CHECK(sfx_read_frame(&fx, &f));
     CHECK(f.type == PIK_FRAME_CTRL_CONFIG);
     CHECK(f.seq == 2);
-    CHECK(pik_control_ready());
+    CHECK(sfx_ready_calls == 1);
     sfx_cleanup(&fx);
 }
 
@@ -273,7 +278,7 @@ static void test_synced_corrupt_frame_heals(void) {
     uint16_t lost_seq = fx.peer_seq;
     CHECK(send_corrupt_ping(&fx));
     CHECK(sfx_dispatch_one(&fx, 1000));
-    CHECK(pik_control_ready());
+    CHECK(sfx_ready_calls == 1);
     CHECK(sfx_read_frame(&fx, &f));
     CHECK(f.type == PIK_FRAME_NAK);
     CHECK(f.payload_len == 2);
@@ -375,19 +380,6 @@ static void test_unconsumed_ack_cannot_be_overwritten(void) {
     sfx_cleanup(&fx);
 }
 
-static void test_invalid_service_state_fails(void) {
-    session_fixture_t fx;
-    uint8_t state[4];
-
-    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
-    CHECK(sfx_handshake(&fx));
-    pik_put_u32le(state, 1u << 31);
-    CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_SERVICE_STATE,
-                              PIK_CH_CONTROL, state, sizeof(state)));
-    CHECK(!pik_session_up());
-    sfx_cleanup(&fx);
-}
-
 static void test_invalid_config_channel_fails(void) {
     session_fixture_t fx;
     uint8_t config[] = { PIK_CONTROL_TCP_NONE, 1, PIK_MUX_CLI_LAST + 1u };
@@ -422,7 +414,6 @@ int main(void) {
     test_bad_ack_status_fails();
     test_oversized_ack_fails();
     test_unconsumed_ack_cannot_be_overwritten();
-    test_invalid_service_state_fails();
     test_invalid_config_channel_fails();
 
     if (failures) {

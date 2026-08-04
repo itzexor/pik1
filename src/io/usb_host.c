@@ -1,9 +1,8 @@
-#include "usb_bulk.h"
+#include "usb.h"
 
 #include "fd.h"
 #include "logging.h"
 #include "product.h"
-#include "usb_common.h"
 #include "util.h"
 
 #include <dirent.h>
@@ -394,8 +393,8 @@ static bool reap_completed(int64_t now) {
     return false;
 }
 
-bool pik_usb_bulk_start(pik_link_t *lk, int epfd, int64_t now) {
-    pik_usb_bulk_cleanup();
+bool pik_usb_host_start(pik_link_t *lk, int epfd, int64_t now) {
+    pik_usb_host_cleanup();
     g_usb.lk = lk;
     g_usb.epfd = epfd;
 
@@ -406,7 +405,7 @@ bool pik_usb_bulk_start(pik_link_t *lk, int epfd, int64_t now) {
 
     if (ioctl(g_usb.fd, USBDEVFS_CLAIMINTERFACE, &g_usb.iface) < 0) {
         LOG("claim interface %d: %s", g_usb.iface, strerror(errno));
-        pik_usb_bulk_cleanup();
+        pik_usb_host_cleanup();
         return false;
     }
 
@@ -420,13 +419,13 @@ bool pik_usb_bulk_start(pik_link_t *lk, int epfd, int64_t now) {
 
     if (!pik_epoll_set(epfd, g_usb.fd, USB_EPOLL_EVENTS, &g_usb_tag)) {
         LOG("epoll add usbfs fd: %s", strerror(errno));
-        pik_usb_bulk_cleanup();
+        pik_usb_host_cleanup();
         return false;
     }
     pik_link_begin(lk, now);
     for (unsigned i = 0; i < RX_URBS; i++) {
         if (!submit_rx(&g_usb.rx[i])) {
-            pik_usb_bulk_cleanup();
+            pik_usb_host_cleanup();
             return false;
         }
     }
@@ -434,11 +433,11 @@ bool pik_usb_bulk_start(pik_link_t *lk, int epfd, int64_t now) {
     return true;
 }
 
-bool pik_usb_bulk_owns_event(const void *ptr) {
+bool pik_usb_host_owns_event(const void *ptr) {
     return ptr == &g_usb_tag;
 }
 
-bool pik_usb_bulk_dispatch(void *ptr, uint32_t events, int64_t now) {
+bool pik_usb_host_dispatch(void *ptr, uint32_t events, int64_t now) {
     (void)ptr;
     if (events & (EPOLLERR | EPOLLHUP)) {
         LOG("usbfs event failure: events=0x%x", events);
@@ -448,17 +447,17 @@ bool pik_usb_bulk_dispatch(void *ptr, uint32_t events, int64_t now) {
     return reap_completed(now);
 }
 
-bool pik_usb_bulk_tick(int64_t now) {
+bool pik_usb_host_tick(int64_t now) {
     if (g_usb.fd < 0 || !pik_link_is_open(g_usb.lk)) return true;
     return reap_completed(now);
 }
 
-int64_t pik_usb_bulk_deadline(void) {
+int64_t pik_usb_host_deadline(void) {
     if (g_usb.fd < 0 || !pik_link_is_open(g_usb.lk)) return INT64_MAX;
     return pik_now_ms() + USB_POLL_MS;
 }
 
-void pik_usb_bulk_cleanup(void) {
+void pik_usb_host_cleanup(void) {
     if (g_usb.fd >= 0) {
         for (unsigned i = 0; i < RX_URBS; i++) {
             if (g_usb.rx[i].submitted)

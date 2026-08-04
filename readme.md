@@ -33,7 +33,7 @@ session router starts and routes:
 
 | Wire channel | Logical service |
 |---|---|
-| 0 | Handshake, liveness, service state, and peer commands |
+| 0 | Handshake, liveness, configuration checks, and peer commands |
 | 1–8 | MCU serial mux (`mcu:0`–`mcu:7` / `pty:0`–`pty:7`) |
 | 15 | Optional touchscreen TCP tunnel |
 
@@ -263,7 +263,7 @@ pik1d --control wifi-reset-peer
 ```
 
 `status-peer` returns one bounded summary containing the peer side, release,
-protocol, active logical services, and the peer's last received service state.
+protocol, and active logical services.
 `wifi-reset-peer` runs the installed `scripts/wifi-reset.sh` utility on the
 peer without stopping the USB link. The utility resets the active Wi-Fi stack
 and supports common embedded and Linux network managers. Only one outbound

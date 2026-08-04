@@ -1,9 +1,8 @@
-#include "usb_gadget_ffs.h"
+#include "usb.h"
 
 #include "fd.h"
 #include "logging.h"
 #include "product.h"
-#include "usb_common.h"
 #include "util.h"
 
 #include <errno.h>
@@ -296,15 +295,8 @@ static bool submit_rx_reads(void) {
     return true;
 }
 
-static bool tx_busy(void) {
-    for (unsigned i = 0; i < FFS_TX_SLOTS; i++) {
-        if (g_ffs.tx[i].busy) return true;
-    }
-    return false;
-}
-
 static bool pump_tx(void) {
-    if (!g_ffs.enabled || g_ffs.in_fd < 0 || tx_busy())
+    if (!g_ffs.enabled || g_ffs.in_fd < 0 || g_ffs.tx[0].busy)
         return true;
 
     uint32_t len = 0;
@@ -450,10 +442,10 @@ static bool handle_ep0(void) {
     return true;
 }
 
-bool pik_ffs_start(pik_link_t *lk, int epfd, int64_t now) {
+bool pik_usb_gadget_start(pik_link_t *lk, int epfd, int64_t now) {
     char path[256];
 
-    pik_ffs_cleanup();
+    pik_usb_gadget_cleanup();
     g_ffs.lk = lk;
     g_ffs.epfd = epfd;
     aio_req_init();
@@ -466,7 +458,7 @@ bool pik_ffs_start(pik_link_t *lk, int epfd, int64_t now) {
     }
     if (!write_descriptors(g_ffs.ep0) || !write_strings(g_ffs.ep0)) {
         LOG("write FunctionFS descriptors: %s", strerror(errno));
-        pik_ffs_cleanup();
+        pik_usb_gadget_cleanup();
         return false;
     }
 
@@ -474,49 +466,49 @@ bool pik_ffs_start(pik_link_t *lk, int epfd, int64_t now) {
     g_ffs.out_fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (g_ffs.out_fd < 0) {
         LOG("open %s: %s", path, strerror(errno));
-        pik_ffs_cleanup();
+        pik_usb_gadget_cleanup();
         return false;
     }
     snprintf(path, sizeof(path), "%s/ep2", PIK1_FFS_MOUNT);
     g_ffs.in_fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (g_ffs.in_fd < 0) {
         LOG("open %s: %s", path, strerror(errno));
-        pik_ffs_cleanup();
+        pik_usb_gadget_cleanup();
         return false;
     }
 
     g_ffs.event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_ffs.event_fd < 0) {
         LOG("eventfd: %s", strerror(errno));
-        pik_ffs_cleanup();
+        pik_usb_gadget_cleanup();
         return false;
     }
     if (aio_setup(FFS_RX_SLOTS + FFS_TX_SLOTS, &g_ffs.aio) < 0) {
         LOG("io_setup: %s", strerror(errno));
-        pik_ffs_cleanup();
+        pik_usb_gadget_cleanup();
         return false;
     }
 
     if (!pik_epoll_set(epfd, g_ffs.ep0, EPOLLIN, &g_ep0_tag) ||
         !pik_epoll_set(epfd, g_ffs.event_fd, EPOLLIN, &g_aio_tag)) {
         LOG("epoll add FunctionFS fd: %s", strerror(errno));
-        pik_ffs_cleanup();
+        pik_usb_gadget_cleanup();
         return false;
     }
     pik_link_begin(lk, now);
     if (!bind_udc()) {
-        pik_ffs_cleanup();
+        pik_usb_gadget_cleanup();
         return false;
     }
     LOG("FunctionFS transport ready at %s", PIK1_FFS_MOUNT);
     return true;
 }
 
-bool pik_ffs_owns_event(const void *ptr) {
+bool pik_usb_gadget_owns_event(const void *ptr) {
     return ptr == &g_ep0_tag || ptr == &g_aio_tag;
 }
 
-bool pik_ffs_dispatch(void *ptr, uint32_t events, int64_t now) {
+bool pik_usb_gadget_dispatch(void *ptr, uint32_t events, int64_t now) {
     if (events & (EPOLLERR | EPOLLHUP)) {
         const char *which = ptr == &g_ep0_tag ? "ep0" :
                             ptr == &g_aio_tag ? "aio" : "unknown";
@@ -531,17 +523,17 @@ bool pik_ffs_dispatch(void *ptr, uint32_t events, int64_t now) {
     return true;
 }
 
-bool pik_ffs_tick(int64_t now) {
+bool pik_usb_gadget_tick(int64_t now) {
     if (!g_ffs.enabled || !pik_link_is_open(g_ffs.lk)) return true;
     return process_aio(now);
 }
 
-int64_t pik_ffs_deadline(void) {
+int64_t pik_usb_gadget_deadline(void) {
     if (!g_ffs.enabled || !pik_link_is_open(g_ffs.lk)) return INT64_MAX;
     return pik_now_ms() + FFS_POLL_MS;
 }
 
-void pik_ffs_cleanup(void) {
+void pik_usb_gadget_cleanup(void) {
     if (g_ffs.ep0 >= 0 || g_ffs.out_fd >= 0 || g_ffs.in_fd >= 0)
         LOG("cleaning up FunctionFS transport");
     if (g_ffs.epfd >= 0) {

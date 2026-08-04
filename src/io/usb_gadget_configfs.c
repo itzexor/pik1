@@ -1,8 +1,7 @@
-#include "usb_gadget_configfs.h"
+#include "usb.h"
 
 #include "logging.h"
 #include "product.h"
-#include "usb_common.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -160,7 +159,7 @@ static bool unbind_gadget(void) {
     return true;
 }
 
-bool pik_ffs_prepare_gadget(void) {
+bool pik_usb_gadget_prepare(void) {
     char path[256];
     char ffs_function[32];
     snprintf(ffs_function, sizeof(ffs_function), "ffs.%s", PIK1_FFS_NAME);

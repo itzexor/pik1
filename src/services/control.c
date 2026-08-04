@@ -33,9 +33,6 @@ typedef struct {
     uint8_t ack_payload[PIK_CTRL_ACK_MAX_PAYLOAD];
     size_t ack_payload_len;
 
-    bool peer_service_known;
-    uint32_t peer_service_flags;
-
     uint8_t local_channels[PIK_CTRL_MAX_PAYLOAD - 2u];
     size_t local_channel_count;
     pik_control_tcp_role_t local_tcp_role;
@@ -295,23 +292,6 @@ bool pik_control_on_frame(uint8_t type, const uint8_t *p, size_t len) {
             memcpy(g_ctrl.ack_payload, p + 5, g_ctrl.ack_payload_len);
         g_ctrl.ack_pending = true;
         return true;
-    case PIK_FRAME_CTRL_SERVICE_STATE:
-        if (len != 4) {
-            LOG("bad SERVICE_STATE len=%zu", len);
-            return false;
-        }
-        g_ctrl.peer_service_flags = pik_get_u32le(p);
-        if (g_ctrl.peer_service_flags &
-            ~(PIK_CONTROL_SERVICE_SERIAL | PIK_CONTROL_SERVICE_TUNNEL)) {
-            LOG("bad SERVICE_STATE flags=0x%08x",
-                g_ctrl.peer_service_flags);
-            return false;
-        }
-        g_ctrl.peer_service_known = true;
-        LOG("peer services: serial=%s tunnel=%s",
-            (g_ctrl.peer_service_flags & PIK_CONTROL_SERVICE_SERIAL) ? "up" : "down",
-            (g_ctrl.peer_service_flags & PIK_CONTROL_SERVICE_TUNNEL) ? "up" : "down");
-        return true;
     case PIK_FRAME_CTRL_CONFIG:
         return handle_config(p, len);
     default:
@@ -376,10 +356,6 @@ bool pik_control_tick(int64_t now) {
     return !lk->failed;
 }
 
-bool pik_control_ready(void) {
-    return g_ctrl.ready;
-}
-
 uint32_t pik_control_handshake_failures(void) {
     return g_ctrl.handshake_fails;
 }
@@ -401,8 +377,6 @@ int64_t pik_control_deadline(void) {
 void pik_control_cleanup(void) {
     g_ctrl.ready = false;
     clear_pending_ack();
-    g_ctrl.peer_service_known = false;
-    g_ctrl.peer_service_flags = 0;
 }
 
 void pik_control_set_config(const uint8_t *channels, size_t n_channels,
@@ -449,16 +423,4 @@ bool pik_control_send_ack(uint32_t request_id, pik_control_ack_status_t status,
     if (payload_len)
         memcpy(p + 5, payload, payload_len);
     return enqueue_frame(PIK_FRAME_CTRL_ACK, p, 5 + payload_len);
-}
-
-bool pik_control_send_service_state(uint32_t flags) {
-    uint8_t p[4];
-    pik_put_u32le(p, flags);
-    return enqueue_frame(PIK_FRAME_CTRL_SERVICE_STATE, p, sizeof(p));
-}
-
-bool pik_control_peer_service_state(uint32_t *flags) {
-    if (!g_ctrl.peer_service_known) return false;
-    if (flags) *flags = g_ctrl.peer_service_flags;
-    return true;
 }

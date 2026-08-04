@@ -1,7 +1,10 @@
-#include "local_control.h"
+#include "commands.h"
 
 #include "fd.h"
 #include "logging.h"
+#include "pik_proto.h"
+#include "product.h"
+#include "util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -37,7 +40,7 @@ static local_control_t g_local = {
 };
 static int g_local_listen_tag;
 
-const char *pik_local_control_sock_path(void) {
+const char *pik_commands_sock_path(void) {
     const char *p = getenv(PIK_CONTROL_SOCK_ENV);
     return (p && *p) ? p : PIK_LOCAL_CONTROL_SOCK;
 }
@@ -49,7 +52,7 @@ static int connect_local_control(void) {
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", pik_local_control_sock_path());
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", pik_commands_sock_path());
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         close(fd);
         return -1;
@@ -57,11 +60,11 @@ static int connect_local_control(void) {
     return fd;
 }
 
-int pik_local_control_client_main(const char *cmd) {
+int pik_commands_client_main(const char *cmd) {
     int fd = connect_local_control();
     if (fd < 0) {
         fprintf(stderr, "pik1d: connect %s: %s\n",
-                pik_local_control_sock_path(), strerror(errno));
+                pik_commands_sock_path(), strerror(errno));
         return 1;
     }
     dprintf(fd, "%s\n", cmd);
@@ -85,7 +88,7 @@ int pik_local_control_client_main(const char *cmd) {
     return strncmp(buf, "OK", 2) == 0 ? 0 : 1;
 }
 
-bool pik_parse_control_action(const char *cmd, pik_control_action_t *action) {
+bool pik_commands_parse_action(const char *cmd, pik_control_action_t *action) {
     if (strcmp(cmd, "restart-peer") == 0) {
         *action = PIK_CONTROL_ACTION_RESTART_PEER;
         return true;
@@ -119,8 +122,8 @@ static void local_control_close_client(void) {
     g_local.input_len = 0;
 }
 
-bool pik_local_control_start(int epfd) {
-    const char *sock_path = pik_local_control_sock_path();
+bool pik_commands_start(int epfd) {
+    const char *sock_path = pik_commands_sock_path();
     g_local.epfd = epfd;
     if (!getenv(PIK_CONTROL_SOCK_ENV) &&
         mkdir(PIK_LOCAL_CONTROL_DIR, 0700) < 0 && errno != EEXIST) {
@@ -169,21 +172,21 @@ bool pik_local_control_start(int epfd) {
     return true;
 }
 
-void pik_local_control_cleanup(void) {
+void pik_commands_cleanup(void) {
     local_control_close_client();
     if (g_local.listen_fd >= 0) {
         pik_epoll_del(g_local.epfd, g_local.listen_fd);
         close(g_local.listen_fd);
         g_local.listen_fd = -1;
-        unlink(pik_local_control_sock_path());
+        unlink(pik_commands_sock_path());
     }
 }
 
-bool pik_local_control_owns_listen(const void *ptr) {
+static bool local_control_owns_listen(const void *ptr) {
     return ptr == &g_local_listen_tag;
 }
 
-bool pik_local_control_owns_client(const void *ptr) {
+static bool local_control_owns_client(const void *ptr) {
     return ptr == &g_local;
 }
 
@@ -248,7 +251,7 @@ static void local_control_reply_error_status(pik_control_ack_status_t status,
     local_control_reply_and_close(msg);
 }
 
-void pik_local_control_accept(void) {
+static void local_control_accept(void) {
     int fd = accept4(g_local.listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) return;
     if (g_local.client_fd >= 0) {
@@ -268,7 +271,7 @@ void pik_local_control_accept(void) {
 
 static void local_control_process_command(int64_t now, bool command_busy) {
     pik_control_action_t action;
-    if (!pik_parse_control_action(g_local.input, &action)) {
+    if (!pik_commands_parse_action(g_local.input, &action)) {
         local_control_reply_and_close("ERR unknown command\n");
         return;
     }
@@ -284,7 +287,7 @@ static void local_control_process_command(int64_t now, bool command_busy) {
     g_local.deadline_ms = now + PIK_COMMAND_ACK_TIMEOUT_MS;
 }
 
-void pik_local_control_read(int64_t now, bool command_busy) {
+static void local_control_read(int64_t now, bool command_busy) {
     while (true) {
         if (g_local.input_len == sizeof(g_local.input) - 1u) {
             local_control_reply_and_close("ERR command too long\n");
@@ -321,16 +324,16 @@ void pik_local_control_read(int64_t now, bool command_busy) {
     }
 }
 
-bool pik_local_control_pending(void) {
+static bool local_control_pending(void) {
     return g_local.command_pending;
 }
 
-uint32_t pik_local_control_request_id(void) {
+static uint32_t local_control_request_id(void) {
     return g_local.request_id;
 }
 
-void pik_local_control_complete(pik_control_ack_status_t status,
-                                const uint8_t *payload, size_t payload_len) {
+static void local_control_complete(pik_control_ack_status_t status,
+                                   const uint8_t *payload, size_t payload_len) {
     if (status == PIK_CONTROL_ACK_OK && payload_len) {
         local_control_reply_payload_and_close(payload, payload_len);
     } else if (status == PIK_CONTROL_ACK_OK) {
@@ -340,20 +343,182 @@ void pik_local_control_complete(pik_control_ack_status_t status,
     }
 }
 
-void pik_local_control_check_timeout(int64_t now) {
+static void local_control_check_timeout(int64_t now) {
     if (g_local.command_pending && now >= g_local.deadline_ms)
         local_control_reply_and_close("ERR peer ack timeout\n");
 }
 
-int64_t pik_local_control_deadline(void) {
+static int64_t local_control_deadline(void) {
     return g_local.command_pending ? g_local.deadline_ms : INT64_MAX;
 }
 
-void pik_mark_peer_initiated(void) {
+void pik_commands_mark_peer_initiated(void) {
     int fd = open(PIK_PEER_INITIATED_MARKER, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
         LOG("marker %s: %s", PIK_PEER_INITIATED_MARKER, strerror(errno));
         return;
     }
     close(fd);
+}
+
+typedef struct {
+    const char *side_name;
+    uint32_t service_flags;
+    pik_control_action_t remote_action;
+    bool remote_action_pending;
+    int64_t remote_action_at_ms;
+    bool signal_command_pending;
+    bool signal_command_done;
+    uint32_t signal_request_id;
+    int64_t signal_deadline_ms;
+} commands_state_t;
+
+static commands_state_t g_ctl;
+
+void pik_commands_init(const char *side_name) {
+    g_ctl.side_name = side_name;
+    g_ctl.service_flags = 0;
+    g_ctl.remote_action = 0;
+    g_ctl.remote_action_pending = false;
+    g_ctl.remote_action_at_ms = 0;
+    g_ctl.signal_command_pending = false;
+    g_ctl.signal_command_done = false;
+    g_ctl.signal_request_id = 0;
+    g_ctl.signal_deadline_ms = 0;
+}
+
+void pik_commands_set_service_flags(uint32_t flags) {
+    g_ctl.service_flags = flags;
+}
+
+void pik_commands_set_service_flag(uint32_t flag, bool up) {
+    uint32_t flags = up ? (g_ctl.service_flags | flag)
+                        : (g_ctl.service_flags & ~flag);
+    pik_commands_set_service_flags(flags);
+}
+
+void pik_commands_on_command(pik_control_action_t action,
+                             uint32_t request_id) {
+    LOG("received command %s request=%u",
+        pik_control_action_name(action), request_id);
+    if (action == PIK_CONTROL_ACTION_STATUS) {
+        uint32_t known = PIK_CONTROL_SERVICE_SERIAL |
+                         PIK_CONTROL_SERVICE_TUNNEL;
+        const char *services = (g_ctl.service_flags & known) == known
+            ? "serial,tunnel"
+            : (g_ctl.service_flags & PIK_CONTROL_SERVICE_SERIAL) ? "serial"
+            : (g_ctl.service_flags & PIK_CONTROL_SERVICE_TUNNEL) ? "tunnel"
+            : "none";
+
+        char status[PIK_CTRL_ACK_MAX_PAYLOAD + 1u];
+        int n = snprintf(status, sizeof(status),
+                         "side=%s release=%s protocol=%u services=%s",
+                         g_ctl.side_name, PIK1_RELEASE_VERSION,
+                         PIK1_PROTOCOL_VERSION, services);
+        if (n < 0 || (size_t)n >= sizeof(status)) {
+            if (!pik_control_send_ack(request_id,
+                                      PIK_CONTROL_ACK_INTERNAL_ERROR, NULL, 0))
+                LOG("failed to send status error ACK request=%u", request_id);
+            return;
+        }
+        if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK,
+                                  (const uint8_t *)status, (size_t)n))
+            LOG("failed to send status ACK request=%u", request_id);
+        return;
+    }
+
+    if (g_ctl.remote_action_pending) {
+        static const uint8_t busy[] = "action already pending";
+        if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR,
+                                  busy, sizeof(busy) - 1u))
+            LOG("failed to send busy ACK request=%u", request_id);
+        return;
+    }
+
+    if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, NULL, 0)) {
+        LOG("failed to send command ACK request=%u", request_id);
+        return;
+    }
+    g_ctl.remote_action = action;
+    g_ctl.remote_action_pending = true;
+    g_ctl.remote_action_at_ms = pik_now_ms() + PIK_REMOTE_ACTION_DELAY_MS;
+}
+
+void pik_commands_check_acks(int64_t now) {
+    uint32_t request_id;
+    pik_control_ack_status_t status;
+    const uint8_t *payload;
+    size_t payload_len;
+    while (pik_control_take_ack(&request_id, &status, &payload, &payload_len)) {
+        if (local_control_pending() &&
+            request_id == local_control_request_id()) {
+            local_control_complete(status, payload, payload_len);
+        } else if (g_ctl.signal_command_pending &&
+                   request_id == g_ctl.signal_request_id) {
+            LOG("restart command ack status=%s",
+                pik_control_ack_status_name(status));
+            g_ctl.signal_command_pending = false;
+            g_ctl.signal_command_done = true;
+        } else {
+            LOG("command ack request=%u status=%s",
+                request_id, pik_control_ack_status_name(status));
+        }
+    }
+    local_control_check_timeout(now);
+    if (g_ctl.signal_command_pending && now >= g_ctl.signal_deadline_ms) {
+        LOG("restart command ack timeout");
+        g_ctl.signal_command_pending = false;
+        g_ctl.signal_command_done = true;
+    }
+}
+
+int64_t pik_commands_deadline(void) {
+    int64_t dl = local_control_deadline();
+    if (g_ctl.signal_command_pending && g_ctl.signal_deadline_ms < dl)
+        dl = g_ctl.signal_deadline_ms;
+    return dl;
+}
+
+bool pik_commands_signal_pending(void) {
+    return g_ctl.signal_command_pending;
+}
+
+bool pik_commands_owns_event(const void *ptr) {
+    return local_control_owns_listen(ptr) || local_control_owns_client(ptr);
+}
+
+void pik_commands_dispatch(void *ptr, int64_t now) {
+    if (local_control_owns_listen(ptr))
+        local_control_accept();
+    else if (local_control_owns_client(ptr))
+        local_control_read(now, pik_commands_signal_pending());
+}
+
+bool pik_commands_signal_done(void) {
+    return g_ctl.signal_command_done;
+}
+
+void pik_commands_request_restart_peer(bool can_signal_peer_restart, int64_t now) {
+    if (local_control_pending()) {
+        LOG("ignoring SIGUSR1 while a local command is pending");
+        g_ctl.signal_command_done = true;
+    } else if (can_signal_peer_restart && !g_ctl.signal_command_pending &&
+               !g_ctl.signal_command_done &&
+               pik_control_send_command(PIK_CONTROL_ACTION_RESTART_PEER,
+                                        &g_ctl.signal_request_id)) {
+        g_ctl.signal_command_pending = true;
+        g_ctl.signal_deadline_ms = now + PIK_COMMAND_ACK_TIMEOUT_MS;
+    } else {
+        g_ctl.signal_command_done = true;
+    }
+}
+
+bool pik_commands_action_due(int64_t now, pik_control_action_t *action) {
+    if (!g_ctl.remote_action_pending || now < g_ctl.remote_action_at_ms)
+        return false;
+    if (action) *action = g_ctl.remote_action;
+    g_ctl.remote_action = 0;
+    g_ctl.remote_action_pending = false;
+    g_ctl.remote_action_at_ms = 0;
+    return true;
 }

@@ -219,6 +219,7 @@ static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
          * peer has never sent us a sequenced frame. Ignore unless it is
          * provably about our live session. */
         if (session != lk->tx_session) return;
+        lk->last_rx_ms = lk->now_ms;
         if (plen != 2) {
             LOGL(lk, "link failure: bad NAK len=%zu", plen);
             pik_link_fail(lk);
@@ -248,6 +249,7 @@ static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
         }
         lk->rx_session = session;
         lk->rx_seq = (uint16_t)(seq + 1);
+        lk->last_rx_ms = lk->now_ms;
         if (lk->stale_discards)
             LOGL(lk, "bring-up synchronized, discarded %u stale frames",
                  lk->stale_discards);
@@ -257,6 +259,7 @@ static void handle_frame(pik_link_t *lk, const uint8_t *enc, size_t enc_len) {
         pik_link_fail(lk);
         return;
     } else {
+        lk->last_rx_ms = lk->now_ms;
         int16_t d = (int16_t)(seq - lk->rx_seq);
         if (d < 0) {
             /* duplicate from retransmission overlap; already delivered */
@@ -311,8 +314,6 @@ bool pik_link_feed(pik_link_t *lk, const uint8_t *buf, size_t len, int64_t now) 
     lk->now_ms = now;
     if (!lk->active || lk->failed) return false;
     if (!len) return true;
-
-    lk->last_rx_ms = now;
 
     while (len && !lk->failed) {
         size_t cap = lk->cfg.rx_cap - lk->rxbuf_len;
