@@ -159,52 +159,47 @@ static void parse_args(int argc, char **argv, app_config_t *cfg) {
 }
 
 typedef struct {
-    app_mode_t mode;
+    const char *name;
+    const char *wait_message;
+    bool (*prepare)(void);
+    bool (*start)(pik_link_t *link, int epfd, int64_t now);
+    bool (*owns_event)(const void *ptr);
+    bool (*dispatch)(void *ptr, uint32_t events, int64_t now);
+    bool (*tick)(int64_t now);
+    int64_t (*deadline)(void);
+    void (*cleanup)(void);
+} transport_ops_t;
+
+static const transport_ops_t usb_host_ops = {
+    .name = "usb-bulk",
+    .wait_message = "waiting for USB bulk device",
+    .start = pik_usb_host_start,
+    .owns_event = pik_usb_host_owns_event,
+    .dispatch = pik_usb_host_dispatch,
+    .tick = pik_usb_host_tick,
+    .deadline = pik_usb_host_deadline,
+    .cleanup = pik_usb_host_cleanup,
+};
+
+static const transport_ops_t usb_gadget_ops = {
+    .name = "ffs",
+    .prepare = pik_usb_gadget_prepare,
+    .start = pik_usb_gadget_start,
+    .owns_event = pik_usb_gadget_owns_event,
+    .dispatch = pik_usb_gadget_dispatch,
+    .tick = pik_usb_gadget_tick,
+    .deadline = pik_usb_gadget_deadline,
+    .cleanup = pik_usb_gadget_cleanup,
+};
+
+typedef struct {
+    const transport_ops_t *transport;
     int transport_backoff_ms;
 } app_state_t;
 
 static app_state_t g_app = {
     .transport_backoff_ms = RETRY_MIN_MS,
 };
-
-static bool transport_prepare(void) {
-    if (g_app.mode == APP_MODE_K1) return true;
-    return pik_usb_gadget_prepare();
-}
-
-static bool transport_start(int epfd, int64_t now) {
-    pik_link_t *lk = pik_session_link();
-    if (g_app.mode == APP_MODE_K1)
-        return pik_usb_host_start(lk, epfd, now);
-    return pik_usb_gadget_start(lk, epfd, now);
-}
-
-static bool transport_owns_event(const void *ptr) {
-    return g_app.mode == APP_MODE_K1 ? pik_usb_host_owns_event(ptr)
-                                     : pik_usb_gadget_owns_event(ptr);
-}
-
-static bool transport_dispatch(void *ptr, uint32_t events, int64_t now) {
-    return g_app.mode == APP_MODE_K1 ? pik_usb_host_dispatch(ptr, events, now)
-                                     : pik_usb_gadget_dispatch(ptr, events, now);
-}
-
-static bool transport_tick(int64_t now) {
-    return g_app.mode == APP_MODE_K1 ? pik_usb_host_tick(now)
-                                     : pik_usb_gadget_tick(now);
-}
-
-static int64_t transport_deadline(void) {
-    return g_app.mode == APP_MODE_K1 ? pik_usb_host_deadline()
-                                     : pik_usb_gadget_deadline();
-}
-
-static void transport_cleanup(void) {
-    if (g_app.mode == APP_MODE_K1)
-        pik_usb_host_cleanup();
-    else
-        pik_usb_gadget_cleanup();
-}
 
 /* Start logical services only after the shared-link handshake completes. */
 static void on_control_ready(void) {
@@ -220,7 +215,7 @@ static void on_control_ready(void) {
 }
 
 static void session_teardown(void) {
-    transport_cleanup();
+    g_app.transport->cleanup();
     tunnel_cleanup();
     serialmux_cleanup();
     pik_control_cleanup();
@@ -314,14 +309,13 @@ int main(int argc, char **argv) {
     app_config_t cfg;
     parse_args(argc, argv, &cfg);
 
-    g_app.mode = cfg.mode;
     bool k1_mode = cfg.mode == APP_MODE_K1;
+    g_app.transport = k1_mode ? &usb_host_ops : &usb_gadget_ops;
     const char *side_name = k1_mode ? "mcu" : "pty";
     pik_control_role_t control_role =
         k1_mode ? PIK_CONTROL_ROLE_MCU : PIK_CONTROL_ROLE_PTY;
-    const char *transport_name = k1_mode ? "usb-bulk" : "ffs";
     pik_commands_init(side_name);
-    pik_log_set_timestamps(cfg.mode == APP_MODE_K1);
+    pik_log_set_timestamps(k1_mode);
 
     if (cfg.tunnel_mode != TUNNEL_MODE_NONE)
         LOG("uart=%s release=%s protocol=%u channels=%d tcp=%s:%s:%d link=%s",
@@ -329,14 +323,14 @@ int main(int argc, char **argv) {
             cfg.mux.n_channels,
             cfg.tunnel_mode == TUNNEL_MODE_LISTEN ? "listen" : "forward",
             cfg.tcp_addr, cfg.tcp_port,
-            transport_name);
+            g_app.transport->name);
     else
         LOG("uart=%s release=%s protocol=%u channels=%d link=%s",
             side_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
-            cfg.mux.n_channels, transport_name);
+            cfg.mux.n_channels, g_app.transport->name);
 
-    if (!transport_prepare())
-        DIE("failed to prepare %s", transport_name);
+    if (g_app.transport->prepare && !g_app.transport->prepare())
+        DIE("failed to prepare %s", g_app.transport->name);
 
     sigset_t mask;
     sigemptyset(&mask);
@@ -373,27 +367,28 @@ int main(int argc, char **argv) {
     int exit_status = 0;
     bool session_active = false;
     int64_t transport_retry_at = pik_now_ms();
-    bool usb_waiting_logged = false;
+    bool transport_waiting_logged = false;
 
     while (!shutdown) {
         int64_t now = pik_now_ms();
 
         if (!session_active && now >= transport_retry_at) {
-            if (transport_start(epfd, now) && pik_control_on_link_open()) {
-                usb_waiting_logged = false;
+            if (g_app.transport->start(pik_session_link(), epfd, now) &&
+                pik_control_on_link_open()) {
+                transport_waiting_logged = false;
                 pik_commands_set_service_flags(0);
                 session_active = true;
                 transport_retry_at = 0;
                 if (pik_control_handshake_failures() == 0)
-                    LOG("session started: %s", transport_name);
+                    LOG("session started: %s", g_app.transport->name);
             } else {
-                if (cfg.mode == APP_MODE_K1) {
-                    if (!usb_waiting_logged) {
-                        LOG("waiting for USB bulk device");
-                        usb_waiting_logged = true;
+                if (g_app.transport->wait_message) {
+                    if (!transport_waiting_logged) {
+                        LOG("%s", g_app.transport->wait_message);
+                        transport_waiting_logged = true;
                     }
                 } else {
-                    usb_waiting_logged = false;
+                    transport_waiting_logged = false;
                 }
                 session_teardown();
                 transport_retry_at =
@@ -409,7 +404,7 @@ int main(int argc, char **argv) {
             if (md < dl) dl = md;
             int64_t td = tunnel_deadline();
             if (td < dl) dl = td;
-            int64_t xd = transport_deadline();
+            int64_t xd = g_app.transport->deadline();
             if (xd < dl) dl = xd;
         }
         int64_t ld = pik_commands_deadline();
@@ -455,8 +450,8 @@ int main(int argc, char **argv) {
 
             if (!session_active) continue;
 
-            if (transport_owns_event(ptr)) {
-                if (!transport_dispatch(ptr, ev, now))
+            if (g_app.transport->owns_event(ptr)) {
+                if (!g_app.transport->dispatch(ptr, ev, now))
                     session_failed = true;
             } else if (serialmux_owns_event(ptr)) {
                 if (!serialmux_dispatch(ptr, ev, now))
@@ -476,7 +471,7 @@ int main(int argc, char **argv) {
         if (session_active && !session_failed) {
             if (!pik_control_tick(now) ||
                 !pik_session_tick(now) ||
-                !transport_tick(now) ||
+                !g_app.transport->tick(now) ||
                 !serialmux_tick(now) ||
                 !tunnel_tick(now))
                 session_failed = true;
