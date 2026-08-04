@@ -102,6 +102,10 @@ bool pik_parse_control_action(const char *cmd, pik_control_action_t *action) {
         *action = PIK_CONTROL_ACTION_STATUS;
         return true;
     }
+    if (strcmp(cmd, "wifi-reset-peer") == 0) {
+        *action = PIK_CONTROL_ACTION_WIFI_RESET_PEER;
+        return true;
+    }
     return false;
 }
 

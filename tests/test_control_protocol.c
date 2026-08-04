@@ -306,6 +306,15 @@ static void test_command_callback_and_bad_action_ack(void) {
     CHECK(last_action == PIK_CONTROL_ACTION_STATUS);
     CHECK(last_request == 0x1234u);
 
+    cmd[4] = PIK_CONTROL_ACTION_WIFI_RESET_PEER;
+    pik_put_u32le(cmd, 0x3456u);
+    CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_COMMAND, PIK_CH_CONTROL,
+                              cmd, sizeof(cmd)));
+    CHECK(sfx_settle(&fx));
+    CHECK(command_calls == 2);
+    CHECK(last_action == PIK_CONTROL_ACTION_WIFI_RESET_PEER);
+    CHECK(last_request == 0x3456u);
+
     cmd[4] = 0xfeu;
     pik_put_u32le(cmd, 0x5678u);
     CHECK(sfx_send_peer_frame(&fx, PIK_FRAME_CTRL_COMMAND, PIK_CH_CONTROL,

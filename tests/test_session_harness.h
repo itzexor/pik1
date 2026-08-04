@@ -298,9 +298,8 @@ static TEST_UNUSED bool sfx_send_peer_hello(session_fixture_t *fx,
     p[2] = PIK_CTRL_HELLO_MAGIC_2;
     p[3] = PIK_CTRL_HELLO_MAGIC_3;
     pik_put_u32le(p + 4, protocol);
-    pik_put_u32le(p + 8, PIK1_FEATURE_FLAGS);
-    p[12] = (uint8_t)role;
-    snprintf((char *)p + 13, PIK_CTRL_RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
+    p[8] = (uint8_t)role;
+    snprintf((char *)p + 9, PIK_CTRL_RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
     return sfx_send_peer_frame(fx, PIK_FRAME_CTRL_HELLO, PIK_CH_CONTROL,
                                p, sizeof(p));
 }

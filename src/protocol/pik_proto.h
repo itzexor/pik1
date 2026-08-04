@@ -82,7 +82,7 @@ enum {
 
     PIK_CTRL_MAX_PAYLOAD = 128u,
     PIK_CTRL_ACK_MAX_PAYLOAD = PIK_CTRL_MAX_PAYLOAD - 5u,
-    PIK_CTRL_HELLO_LEN   = 29u,
+    PIK_CTRL_HELLO_LEN   = 25u,
     PIK_CTRL_RELEASE_LEN = 16u,
 
     /* tunnel: [conn:1][gen:1] prefix, then at most PIK_TUN_MAX_DATA bytes.

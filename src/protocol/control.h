@@ -17,6 +17,7 @@ typedef enum {
     PIK_CONTROL_ACTION_REBOOT_PEER = 2,
     PIK_CONTROL_ACTION_POWEROFF_PEER = 3,
     PIK_CONTROL_ACTION_STATUS = 4,
+    PIK_CONTROL_ACTION_WIFI_RESET_PEER = 5,
 } pik_control_action_t;
 
 typedef enum {
@@ -58,6 +59,7 @@ uint32_t pik_control_handshake_failures(void);
 int64_t pik_control_deadline(void);
 void pik_control_cleanup(void);
 
+/* Set once before opening the link; each handshake sends this configuration. */
 void pik_control_set_config(const uint8_t *channels, size_t n_channels,
                             pik_control_tcp_role_t tcp_role);
 /* One outstanding outbound command per daemon: the pending-ACK slot is

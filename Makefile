@@ -41,6 +41,7 @@ APP_HDRS    := src/app/app_config.h src/app/local_control.h src/app/daemon_contr
 
 PIK1D_SRCS  := $(APP_SRCS) $(PROTO_SRCS) $(COBS_SRCS) $(COMMON_SRCS)
 PIK1D_HDRS  := $(APP_HDRS) $(PROTO_HDRS) $(COBS_HDRS) $(COMMON_HDRS)
+UTILITY_SCRIPTS := scripts/wifi-reset.sh
 
 # Install
 SUDO            ?= sudo
@@ -81,7 +82,7 @@ MIPSEL_STRIP ?= $(TOOLCHAIN_DIR)/$(MIPSEL_TRIPLE)-cross/bin/$(MIPSEL_TRIPLE)-str
 AARCH64_CC   ?= $(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-gcc
 AARCH64_STRIP ?= $(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-strip
 
-.PHONY: all native mipsel aarch64 test test-unit test-cli \
+.PHONY: all native mipsel aarch64 test test-unit test-cli test-scripts \
         toolchain clean distclean \
         render-k1-init install-k1 uninstall-k1 install-pi uninstall-pi FORCE
 
@@ -89,7 +90,7 @@ all: native
 
 native: $(BUILD)/pik1d
 
-test: test-unit test-cli
+test: test-unit test-cli test-scripts
 
 test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_frame \
       $(TEST_BUILD)/test_logging $(TEST_BUILD)/test_control_names \
@@ -107,6 +108,9 @@ test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_fr
 
 test-cli: native
 	PIK1D=$(BUILD)/pik1d bash tests/test_cli.sh
+
+test-scripts:
+	bash tests/test_wifi_reset.sh
 
 # Native builds
 $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
@@ -183,12 +187,13 @@ toolchain: \
 	$(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-gcc
 
 # Install targets
-install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
+install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh $(UTILITY_SCRIPTS)
 	@test -x $(BUILD)/pik1d.mipsel || \
 		{ echo "Missing $(BUILD)/pik1d.mipsel; run 'make mipsel' first"; exit 1; }
-	install -d $(K1_DIR)
+	install -d $(K1_DIR) $(K1_DIR)/scripts
 	install -m 755 $(BUILD)/pik1d.mipsel    $(K1_DIR)/pik1d
 	install -m 755 $(BUILD)/shutdown_command.sh $(K1_DIR)/shutdown_command.sh
+	install -m 755 $(UTILITY_SCRIPTS) $(K1_DIR)/scripts/
 	install -m 755 $(BUILD)/S99pik1 $(K1_INIT_DIR)/S99pik1
 	@for svc in $(K1_DISABLE_SVCS); do \
 		if [ -f $(K1_INIT_DIR)/$$svc ]; then \
@@ -200,6 +205,8 @@ install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
 uninstall-k1:
 	rm -f $(K1_INIT_DIR)/S99pik1
 	rm -f $(K1_DIR)/pik1d $(K1_DIR)/shutdown_command.sh
+	rm -f $(K1_DIR)/scripts/wifi-reset.sh
+	-rmdir $(K1_DIR)/scripts
 	@for svc in $(sort $(K1_DISABLE_SVCS) $(K1_SCREEN_SVCS)); do \
 		if [ -f $(K1_INIT_DIR)/_$$svc ]; then \
 			echo "Restoring $$svc"; \
@@ -207,11 +214,12 @@ uninstall-k1:
 		fi; \
 	done
 
-install-pi:
+install-pi: $(UTILITY_SCRIPTS)
 	@test -x $(BUILD)/pik1d.aarch64 || \
 		{ echo "Missing $(BUILD)/pik1d.aarch64; run 'make aarch64' first"; exit 1; }
-	$(SUDO) install -d $(PI_DIR)
+	$(SUDO) install -d $(PI_DIR) $(PI_DIR)/scripts
 	$(SUDO) install -m 755 $(BUILD)/pik1d.aarch64     $(PI_DIR)/pik1d
+	$(SUDO) install -m 755 $(UTILITY_SCRIPTS) $(PI_DIR)/scripts/
 	sed -e 's|@INSTALL_DIR@|$(PI_DIR)|g' -e 's|@TCP_SPEC@|$(PI_TCP_SPEC)|g' \
 		files/pi/pik1.service.in | \
 		$(SUDO) tee $(PI_SYSTEMD_DIR)/pik1.service > /dev/null
@@ -230,8 +238,7 @@ uninstall-pi:
 	-$(SUDO) systemctl disable pik1-peer-poweroff.service
 	$(SUDO) rm -f $(PI_SYSTEMD_DIR)/pik1.service \
 		$(PI_SYSTEMD_DIR)/pik1-peer-reboot.service \
-		$(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service \
-		/etc/polkit-1/rules.d/49-pik1.rules
+		$(PI_SYSTEMD_DIR)/pik1-peer-poweroff.service
 	$(SUDO) systemctl daemon-reload
 	$(SUDO) rm -rf $(PI_DIR)
 

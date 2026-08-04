@@ -96,7 +96,8 @@ make test
 
 `make toolchain` downloads the musl cross-compilers into `.toolchain/`.
 Both endpoints must run the same protocol version, so deploy the K1 and Pi
-binaries as a pair.
+binaries as a pair. Both install targets copy the utilities under `scripts/`
+beside the daemon.
 
 ### Raspberry Pi
 
@@ -258,11 +259,15 @@ pik1d --control status-peer
 pik1d --control restart-peer
 pik1d --control reboot-peer
 pik1d --control poweroff-peer
+pik1d --control wifi-reset-peer
 ```
 
 `status-peer` returns one bounded summary containing the peer side, release,
 protocol, active logical services, and the peer's last received service state.
-Only one outbound command may be pending at a time.
+`wifi-reset-peer` runs the installed `scripts/wifi-reset.sh` utility on the
+peer without stopping the USB link. The utility resets the active Wi-Fi stack
+and supports common embedded and Linux network managers. Only one outbound
+command may be pending at a time.
 
 ### Shutdown propagation
 

@@ -36,7 +36,6 @@
 
 typedef struct {
     app_mode_t mode;
-    bool has_tcp;
     int transport_backoff_ms;
 } app_state_t;
 
@@ -105,7 +104,51 @@ static void session_teardown(void) {
     pik_daemon_set_service_flags(0);
 }
 
+static bool start_utility(const char *name) {
+    char path[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1u);
+    if (n < 0)
+        return false;
+    path[n] = '\0';
+
+    char *base = strrchr(path, '/');
+    if (!base) {
+        errno = ENOENT;
+        return false;
+    }
+    base++;
+    size_t remaining = sizeof(path) - (size_t)(base - path);
+    int written = snprintf(base, remaining, "scripts/%s", name);
+    if (written < 0 || (size_t)written >= remaining) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    if (access(path, X_OK) < 0)
+        return false;
+
+    pid_t pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigprocmask(SIG_SETMASK, &mask, NULL);
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        execl(path, path, (char *)NULL);
+        _exit(127);
+    }
+    return true;
+}
+
 static void execute_remote_action(pik_control_action_t action, char **argv) {
+    if (action == PIK_CONTROL_ACTION_WIFI_RESET_PEER) {
+        LOG("executing wifi-reset-peer");
+        if (!start_utility("wifi-reset.sh"))
+            LOG("start wifi-reset.sh: %s", strerror(errno));
+        return;
+    }
+
     if (action == PIK_CONTROL_ACTION_REBOOT_PEER ||
         action == PIK_CONTROL_ACTION_POWEROFF_PEER)
         pik_mark_peer_initiated();
@@ -135,8 +178,8 @@ static void execute_remote_action(pik_control_action_t action, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        printf("pik1d %s protocol=%u features=0x%08x\n",
-               PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION, PIK1_FEATURE_FLAGS);
+        printf("pik1d %s protocol=%u\n",
+               PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "--control") == 0)
@@ -148,19 +191,24 @@ int main(int argc, char **argv) {
     pik_app_config_parse(argc, argv, &cfg);
 
     g_app.mode = cfg.mode;
-    const char *transport_name = cfg.mode == APP_MODE_K1 ? "usb-bulk" : "ffs";
-    pik_daemon_control_init(cfg.uart_name);
-    g_app.has_tcp = cfg.has_tcp;
+    bool k1_mode = cfg.mode == APP_MODE_K1;
+    const char *side_name = k1_mode ? "mcu" : "pty";
+    pik_control_role_t control_role =
+        k1_mode ? PIK_CONTROL_ROLE_MCU : PIK_CONTROL_ROLE_PTY;
+    const char *transport_name = k1_mode ? "usb-bulk" : "ffs";
+    pik_daemon_control_init(side_name);
     pik_log_set_timestamps(cfg.mode == APP_MODE_K1);
 
-    if (cfg.has_tcp)
+    if (cfg.tunnel_mode != TUNNEL_MODE_NONE)
         LOG("uart=%s release=%s protocol=%u channels=%d tcp=%s:%s:%d link=%s",
-            cfg.uart_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
-            cfg.mux.n_channels, cfg.tcp_mode_name, cfg.tcp_addr, cfg.tcp_port,
+            side_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+            cfg.mux.n_channels,
+            cfg.tunnel_mode == TUNNEL_MODE_LISTEN ? "listen" : "forward",
+            cfg.tcp_addr, cfg.tcp_port,
             transport_name);
     else
         LOG("uart=%s release=%s protocol=%u channels=%d link=%s",
-            cfg.uart_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
+            side_name, PIK1_RELEASE_VERSION, PIK1_PROTOCOL_VERSION,
             cfg.mux.n_channels, transport_name);
 
     if (!transport_prepare())
@@ -172,6 +220,7 @@ int main(int argc, char **argv) {
     sigaddset(&mask, SIGUSR1);
     sigprocmask(SIG_BLOCK, &mask, NULL);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
 
     int sig_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sig_fd < 0) DIE("signalfd: %s", strerror(errno));
@@ -183,7 +232,7 @@ int main(int argc, char **argv) {
     if (!pik_epoll_set(epfd, sig_fd, EPOLLIN, &sig_tag))
         DIE("epoll add signal fd: %s", strerror(errno));
     pik_session_init();
-    pik_control_init(cfg.control_role, pik_daemon_on_control_command,
+    pik_control_init(control_role, pik_daemon_on_control_command,
                      on_control_ready);
     {
         uint8_t channel_ids[MAX_CHANNELS];
@@ -314,7 +363,7 @@ int main(int argc, char **argv) {
                 session_failed = true;
         }
 
-        if (session_active && !session_failed && g_app.has_tcp)
+        if (session_active && !session_failed)
             pik_daemon_set_service_flag(PIK_CONTROL_SERVICE_TUNNEL,
                                         tunnel_active());
 

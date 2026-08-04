@@ -4,8 +4,6 @@
 #include "serialmux.h"
 #include "tunnel.h"
 
-#include <stdbool.h>
-
 typedef enum {
     APP_MODE_K1,
     APP_MODE_PI,
@@ -13,11 +11,7 @@ typedef enum {
 
 typedef struct {
     app_mode_t mode;
-    const char *uart_name;
-    pik_control_role_t control_role;
     serialmux_config_t mux;
-    bool has_tcp;
-    const char *tcp_mode_name;
     char tcp_addr[64];
     int tcp_port;
     tunnel_mode_t tunnel_mode;

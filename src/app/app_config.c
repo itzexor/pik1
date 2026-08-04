@@ -3,6 +3,7 @@
 #include "logging.h"
 #include "util.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@ _Noreturn void pik_app_config_usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s --version\n"
-        "  %s --control status-peer|restart-peer|reboot-peer|poweroff-peer\n"
+        "  %s --control status-peer|restart-peer|reboot-peer|poweroff-peer|wifi-reset-peer\n"
         "  %s --usb  mcu:N:DEV:BAUD [...] [listen:BIND_ADDR:PORT]\n"
         "  %s --ffs  pty:N:SYMLINK  [...] [forward:TARGET_HOST:PORT]\n",
         prog, prog, prog, prog);
@@ -45,12 +46,10 @@ static void parse_pty_channel(const char *spec, ch_spec_t *s) {
 static void parse_tcp_spec(app_config_t *cfg, const char *spec) {
     const char *hostport;
     if (strncmp(spec, "listen:", 7) == 0) {
-        cfg->tcp_mode_name = "listen";
         cfg->tcp_role = PIK_CONTROL_TCP_LISTEN;
         cfg->tunnel_mode = TUNNEL_MODE_LISTEN;
         hostport = spec + 7;
     } else if (strncmp(spec, "forward:", 8) == 0) {
-        cfg->tcp_mode_name = "forward";
         cfg->tcp_role = PIK_CONTROL_TCP_FORWARD;
         cfg->tunnel_mode = TUNNEL_MODE_FORWARD;
         hostport = spec + 8;
@@ -63,7 +62,6 @@ static void parse_tcp_spec(app_config_t *cfg, const char *spec) {
                cfg->tcp_addr, port_str, &extra) != 2 ||
         !pik_parse_port(port_str, &cfg->tcp_port))
         DIE("bad tcp spec: %s", spec);
-    cfg->has_tcp = true;
 }
 
 void pik_app_config_parse(int argc, char **argv, app_config_t *cfg) {
@@ -76,12 +74,8 @@ void pik_app_config_parse(int argc, char **argv, app_config_t *cfg) {
     int argi = 1;
     if (strcmp(argv[argi], "--usb") == 0) {
         cfg->mode = APP_MODE_K1;
-        cfg->uart_name = "mcu";
-        cfg->control_role = PIK_CONTROL_ROLE_MCU;
     } else if (strcmp(argv[argi], "--ffs") == 0) {
         cfg->mode = APP_MODE_PI;
-        cfg->uart_name = "pty";
-        cfg->control_role = PIK_CONTROL_ROLE_PTY;
     } else {
         pik_app_config_usage(argv[0]);
     }

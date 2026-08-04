@@ -29,7 +29,8 @@ release=$(sed -n 's/#define PIK1_RELEASE_VERSION "\(.*\)"/\1/p' src/core/product
 out=$("$PIK1D" --version)
 protocol=$(sed -n 's/#define PIK1_PROTOCOL_VERSION \([0-9]*\)u/\1/p' src/core/product.h)
 [[ -n "$protocol" ]] || fail "could not read PIK1_PROTOCOL_VERSION from src/core/product.h"
-contains "$out" "pik1d $release protocol=$protocol"
+[[ "$out" == "pik1d $release protocol=$protocol" ]] ||
+    fail "unexpected --version output: $out"
 
 set +e
 out=$("$PIK1D" --control status-peer 2>&1)

@@ -39,7 +39,6 @@ typedef struct {
     uint8_t local_channels[PIK_CTRL_MAX_PAYLOAD - 2u];
     size_t local_channel_count;
     pik_control_tcp_role_t local_tcp_role;
-    bool config_sent;
 
     uint32_t handshake_fails;          /* consecutive handshake RX timeouts */
     uint32_t handshake_fails_reported;
@@ -56,6 +55,7 @@ const char *pik_control_action_name(pik_control_action_t action) {
     case PIK_CONTROL_ACTION_REBOOT_PEER: return "reboot-peer";
     case PIK_CONTROL_ACTION_POWEROFF_PEER: return "poweroff-peer";
     case PIK_CONTROL_ACTION_STATUS: return "status";
+    case PIK_CONTROL_ACTION_WIFI_RESET_PEER: return "wifi-reset-peer";
     default: return "unknown";
     }
 }
@@ -75,6 +75,7 @@ static bool action_valid(pik_control_action_t action) {
     case PIK_CONTROL_ACTION_REBOOT_PEER:
     case PIK_CONTROL_ACTION_POWEROFF_PEER:
     case PIK_CONTROL_ACTION_STATUS:
+    case PIK_CONTROL_ACTION_WIFI_RESET_PEER:
         return true;
     default:
         return false;
@@ -112,9 +113,8 @@ static bool send_hello(void) {
     p[2] = PIK_CTRL_HELLO_MAGIC_2;
     p[3] = PIK_CTRL_HELLO_MAGIC_3;
     pik_put_u32le(p + 4, PIK1_PROTOCOL_VERSION);
-    pik_put_u32le(p + 8, PIK1_FEATURE_FLAGS);
-    p[12] = (uint8_t)g_ctrl.role;
-    snprintf((char *)p + 13, PIK_CTRL_RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
+    p[8] = (uint8_t)g_ctrl.role;
+    snprintf((char *)p + 9, PIK_CTRL_RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
     return enqueue_frame(PIK_FRAME_CTRL_HELLO, p, sizeof(p));
 }
 
@@ -135,10 +135,8 @@ static bool send_config(void) {
     p[1] = (uint8_t)g_ctrl.local_channel_count;
     if (g_ctrl.local_channel_count)
         memcpy(p + 2, g_ctrl.local_channels, g_ctrl.local_channel_count);
-    if (!enqueue_frame(PIK_FRAME_CTRL_CONFIG, p, g_ctrl.local_channel_count + 2))
-        return false;
-    g_ctrl.config_sent = true;
-    return true;
+    return enqueue_frame(PIK_FRAME_CTRL_CONFIG, p,
+                         g_ctrl.local_channel_count + 2);
 }
 
 static bool local_channel_present(uint8_t id) {
@@ -203,10 +201,9 @@ static bool handle_hello(const uint8_t *p, size_t len) {
     }
 
     uint32_t proto = pik_get_u32le(p + 4);
-    uint32_t features = pik_get_u32le(p + 8);
-    uint8_t role = p[12];
+    uint8_t role = p[8];
     char release[PIK_CTRL_RELEASE_LEN + 1];
-    memcpy(release, p + 13, PIK_CTRL_RELEASE_LEN);
+    memcpy(release, p + 9, PIK_CTRL_RELEASE_LEN);
     release[PIK_CTRL_RELEASE_LEN] = '\0';
 
     if (proto != PIK1_PROTOCOL_VERSION) {
@@ -230,8 +227,7 @@ static bool handle_hello(const uint8_t *p, size_t len) {
             g_ctrl.handshake_fails = 0;
             g_ctrl.handshake_fails_reported = 0;
         }
-        LOG("link up: release=%s protocol=%u features=0x%08x",
-            release, proto, features);
+        LOG("link up: release=%s protocol=%u", release, proto);
         if (!send_hello())
             return false;
         if (!send_config())
@@ -327,7 +323,6 @@ bool pik_control_on_frame(uint8_t type, const uint8_t *p, size_t len) {
 void pik_control_on_link_down(void) {
     if (g_ctrl.ready) LOG("link down");
     g_ctrl.ready = false;
-    g_ctrl.config_sent = false;
     clear_pending_ack();
 }
 
@@ -343,7 +338,6 @@ void pik_control_init(pik_control_role_t role,
 
 bool pik_control_on_link_open(void) {
     g_ctrl.ready = false;
-    g_ctrl.config_sent = false;
     return send_hello();
 }
 
@@ -370,8 +364,6 @@ bool pik_control_tick(int64_t now) {
             return false;
         }
     } else {
-        if (!g_ctrl.config_sent)
-            send_config();
         if (!pik_link_tx_avail(lk) &&
             (now - lk->last_tx_ms) > PING_IDLE_MS)
             enqueue_frame(PIK_FRAME_CTRL_PING, NULL, 0);
@@ -408,7 +400,6 @@ int64_t pik_control_deadline(void) {
 
 void pik_control_cleanup(void) {
     g_ctrl.ready = false;
-    g_ctrl.config_sent = false;
     clear_pending_ack();
     g_ctrl.peer_service_known = false;
     g_ctrl.peer_service_flags = 0;
@@ -422,9 +413,6 @@ void pik_control_set_config(const uint8_t *channels, size_t n_channels,
         memcpy(g_ctrl.local_channels, channels, n_channels);
     g_ctrl.local_channel_count = n_channels;
     g_ctrl.local_tcp_role = tcp_role;
-    g_ctrl.config_sent = false;
-    if (g_ctrl.ready)
-        send_config();
 }
 
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id) {

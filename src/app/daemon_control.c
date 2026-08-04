@@ -12,7 +12,7 @@
 #define LOG(...) pik_log("pik1", __VA_ARGS__)
 
 typedef struct {
-    const char *uart_name;
+    const char *side_name;
     uint32_t service_flags;
     pik_control_action_t remote_action;
     bool remote_action_pending;
@@ -37,8 +37,8 @@ static void append_service_names(char *buf, size_t cap, uint32_t flags) {
         snprintf(buf, cap, "none");
 }
 
-void pik_daemon_control_init(const char *uart_name) {
-    g_ctl.uart_name = uart_name;
+void pik_daemon_control_init(const char *side_name) {
+    g_ctl.side_name = side_name;
     g_ctl.service_flags = 0;
     g_ctl.remote_action = 0;
     g_ctl.remote_action_pending = false;
@@ -78,7 +78,7 @@ void pik_daemon_on_control_command(pik_control_action_t action, uint32_t request
         char status[PIK_CTRL_ACK_MAX_PAYLOAD + 1u];
         int n = snprintf(status, sizeof(status),
                          "side=%s release=%s protocol=%u services=%s peer_services=%s",
-                         g_ctl.uart_name, PIK1_RELEASE_VERSION,
+                         g_ctl.side_name, PIK1_RELEASE_VERSION,
                          PIK1_PROTOCOL_VERSION, services, peer_services);
         if (n < 0 || (size_t)n >= sizeof(status)) {
             if (!pik_control_send_ack(request_id,
@@ -151,10 +151,6 @@ bool pik_daemon_signal_done(void) {
     return g_ctl.signal_command_done;
 }
 
-void pik_daemon_signal_mark_done(void) {
-    g_ctl.signal_command_done = true;
-}
-
 void pik_daemon_request_restart_peer(bool can_signal_peer_restart, int64_t now) {
     if (pik_local_control_pending()) {
         LOG("ignoring SIGUSR1 while a local command is pending");
@@ -174,5 +170,8 @@ bool pik_daemon_remote_action_due(int64_t now, pik_control_action_t *action) {
     if (!g_ctl.remote_action_pending || now < g_ctl.remote_action_at_ms)
         return false;
     if (action) *action = g_ctl.remote_action;
+    g_ctl.remote_action = 0;
+    g_ctl.remote_action_pending = false;
+    g_ctl.remote_action_at_ms = 0;
     return true;
 }

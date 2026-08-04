@@ -96,6 +96,7 @@ const char *pik_control_action_name(pik_control_action_t action) {
     case PIK_CONTROL_ACTION_REBOOT_PEER: return "reboot-peer";
     case PIK_CONTROL_ACTION_POWEROFF_PEER: return "poweroff-peer";
     case PIK_CONTROL_ACTION_STATUS: return "status";
+    case PIK_CONTROL_ACTION_WIFI_RESET_PEER: return "wifi-reset-peer";
     default: return "unknown";
     }
 }
@@ -183,6 +184,8 @@ static void test_parse_control_actions(void) {
     CHECK(!pik_parse_control_action("status", &action));
     CHECK(pik_parse_control_action("restart-peer", &action));
     CHECK(action == PIK_CONTROL_ACTION_RESTART_PEER);
+    CHECK(pik_parse_control_action("wifi-reset-peer", &action));
+    CHECK(action == PIK_CONTROL_ACTION_WIFI_RESET_PEER);
     CHECK(!pik_parse_control_action("bogus", &action));
 }
 
@@ -215,6 +218,21 @@ static void test_remote_action_requires_ack_success(void) {
     CHECK(!pik_daemon_remote_action_due(now_ms, &action));
     CHECK(pik_daemon_remote_action_due(now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
     CHECK(action == PIK_CONTROL_ACTION_REBOOT_PEER);
+    CHECK(!pik_daemon_remote_action_due(
+        now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
+}
+
+static void test_wifi_reset_is_scheduled(void) {
+    pik_control_action_t action = 0;
+    reset_state();
+
+    pik_daemon_on_control_command(PIK_CONTROL_ACTION_WIFI_RESET_PEER, 89);
+
+    CHECK(send_ack_calls == 1);
+    CHECK(send_ack_status == PIK_CONTROL_ACK_OK);
+    CHECK(pik_daemon_remote_action_due(
+        now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
+    CHECK(action == PIK_CONTROL_ACTION_WIFI_RESET_PEER);
 }
 
 static void test_remote_action_not_scheduled_on_ack_failure(void) {
@@ -420,6 +438,7 @@ int main(void) {
     test_parse_control_actions();
     test_status_ack_payload();
     test_remote_action_requires_ack_success();
+    test_wifi_reset_is_scheduled();
     test_remote_action_not_scheduled_on_ack_failure();
     test_remote_action_cannot_be_overwritten();
     test_signal_restart_peer_ack();
