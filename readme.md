@@ -44,17 +44,20 @@ requirements.
 
 ## Build and install
 
-Prebuilt K1 and Pi binaries are tracked as `build/pik1d.mipsel` and
-`build/pik1d.aarch64`. To rebuild them:
+Prebuilt endpoint binaries are tracked as `build/k1/pik1d` and
+`build/pi/pik1d`. To rebuild both:
 
 ```bash
 make toolchain
-make mipsel
-make aarch64
+make artifacts
 make test
 ```
 
 `make toolchain` downloads the musl cross-compilers into `.toolchain/`.
+`make host` builds `build/host/pik1d` for the current machine; `make k1` and
+`make pi` build one endpoint artifact. On an AArch64 host, `make pi` uses the
+host compiler. `make test` requires a C++20 compiler for the pinned nanocobs
+test suite.
 Both endpoints must run the same protocol version, so deploy the K1 and Pi
 binaries as a pair. Both install targets copy the utilities under `scripts/`
 beside the daemon.
@@ -82,8 +85,8 @@ beside the daemon.
    ```
 
    The updater auto-detects the Pi, stops and uninstalls an existing service,
-   pulls with `git pull --ff-only`, installs the tracked AArch64 binary and
-   systemd units, and starts `pik1.service`.
+   pulls with `git pull --ff-only`, installs the tracked Pi binary and systemd
+   units, and starts `pik1.service`.
 
    To install without the updater:
 
@@ -118,7 +121,7 @@ beside the daemon.
    ./update.sh
    ```
 
-   The updater installs `build/pik1d.mipsel` under `/usr/data/pik1`, installs
+   The updater installs `build/k1/pik1d` under `/usr/data/pik1`, installs
    `/etc/init.d/S99pik1`, and disables these stock services while the K1 is in
    bridge mode:
 

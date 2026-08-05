@@ -256,7 +256,8 @@ For changes to transport or protocol code, verify:
 - TCP binds remain explicit;
 - logs identify failures without dumping payload contents.
 
-The native suite covers framing, sequence recovery, stale-session handling,
+The host suite covers framing, sequence recovery, stale-session handling,
 control validation, queue behavior, fragmented local commands, serial mux
-state, and tunnel stream rules. USB hardware behavior must also be exercised
-on both a K1 usbfs host and a Pi FunctionFS gadget before release.
+state, and tunnel stream rules. It also runs the complete test suite from the
+pinned nanocobs snapshot. USB hardware behavior must also be exercised on both
+a K1 usbfs host and a Pi FunctionFS gadget before release.

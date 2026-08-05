@@ -1,0 +1,109 @@
+name: Presubmit Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly
+
+jobs:
+  sanitizers:
+    name: sanitizer (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    container:
+      image: ghcr.io/charlesnicholson/docker-image:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    strategy:
+      matrix:
+        sanitizer: [ "memory", "address", "safe-stack", "undefined" ]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: CC=clang CXX=clang++ COBS_SANITIZER=${{ matrix.sanitizer }} make -j
+
+  arm-cm4:
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    container:
+      image: ghcr.io/charlesnicholson/docker-image:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: arm-none-eabi-gcc -mcpu=cortex-m4 -Os -Werror -Wall -Wextra -Wconversion -c cobs.c
+
+  linux:
+    name: linux (${{ matrix.compiler.name }}, ${{ matrix.architecture }})
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    container:
+      image: ghcr.io/charlesnicholson/docker-image:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    strategy:
+      matrix:
+        compiler:
+          - { name: "clang", env: "CC=clang CXX=clang++" }
+          - { name: "gcc", env: "CC=gcc CXX=g++" }
+        architecture: [32, 64]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: ${{ matrix.compiler.env }} COBS_LINUXARCH=${{ matrix.architecture }} make -j
+
+  macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -j
+
+  win:
+    name: windows (msvc, ${{ matrix.architecture }})
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        architecture: [32, 64]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (
+            echo Could not locate a Visual Studio installation via vswhere 1>&2
+            exit /b 1
+          )
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars${{ matrix.architecture }}.bat" || exit /b 1
+          call make-win.bat
+
+  all-checks-pass:
+    needs: [sanitizers, linux, macos, win, arm-cm4]
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo Done
+

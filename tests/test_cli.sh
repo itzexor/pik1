@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PIK1D=${PIK1D:-build/pik1d}
+PIK1D=${PIK1D:-build/host/pik1d}
 
 fail() {
     echo "test_cli: $*" >&2

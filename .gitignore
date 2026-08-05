@@ -1,7 +1,8 @@
 __pycache__/
 .toolchain/
 .vscode/
-build/pik1d
+build/host/
 build/tcpbridge
 build/S99pik1
+build/shutdown_command.sh
 build/tests/

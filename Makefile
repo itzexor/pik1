@@ -1,16 +1,21 @@
 CC       ?= gcc
+CXX      ?= g++
 CFLAGS   := -O2 -std=c11 -Wall -Wextra -D_GNU_SOURCE \
              -ffunction-sections -fdata-sections \
              -Isrc/app -Isrc/common -Isrc/link -Isrc/services \
-             -Isrc/io -Isrc/vendor
+             -Isrc/io -Ivendor
 LDFLAGS  := -Wl,--gc-sections
 
 STATIC   := -static
 BUILD    := build
+HOST_BUILD := $(BUILD)/host
+K1_BUILD   := $(BUILD)/k1
+PI_BUILD   := $(BUILD)/pi
 TEST_BUILD := $(BUILD)/tests
 
-COBS_SRCS   := src/vendor/nanocobs/cobs.c
-COBS_HDRS   := src/vendor/nanocobs/cobs.h
+NANOCOBS_DIR := vendor/nanocobs
+COBS_SRCS   := $(NANOCOBS_DIR)/cobs.c
+COBS_HDRS   := $(NANOCOBS_DIR)/cobs.h
 COMMON_SRCS := src/common/util.c src/common/logging.c
 COMMON_HDRS := src/common/util.h src/common/logging.h src/common/product.h
 LINK_SRCS   := src/link/frame.c src/link/link.c src/link/session.c
@@ -30,6 +35,10 @@ BASE_SRCS   := $(COMMON_SRCS) $(LINK_SRCS) $(IO_SRCS)
 BASE_HDRS   := $(COMMON_HDRS) $(LINK_HDRS) $(IO_HDRS)
 PIK1D_SRCS  := $(APP_SRCS) $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
 PIK1D_HDRS  := $(APP_HDRS) $(SERVICE_HDRS) $(COBS_HDRS) $(BASE_HDRS)
+TEST_RUNTIME_SRCS := $(SERVICE_SRCS) $(COBS_SRCS) $(COMMON_SRCS) \
+                     $(LINK_SRCS) src/io/fd.c
+TEST_RUNTIME_HDRS := $(SERVICE_HDRS) $(COBS_HDRS) $(COMMON_HDRS) \
+                     $(LINK_HDRS) src/io/fd.h
 UTILITY_SCRIPTS := scripts/restart-wifi.sh
 
 # Install
@@ -59,34 +68,47 @@ endif
 PI_DIR          ?= /opt/pik1
 PI_SYSTEMD_DIR  ?= /etc/systemd/system
 
-# Cross toolchains
+# Target toolchains
 TOOLCHAIN_DIR  := $(CURDIR)/.toolchain
 MUSL_CC_BASE   := https://musl.cc
 
-MIPSEL_TRIPLE  := mipsel-linux-musl
-AARCH64_TRIPLE := aarch64-linux-musl
+K1_TRIPLE := mipsel-linux-musl
+PI_TRIPLE := aarch64-linux-musl
 
-MIPSEL_CC    ?= $(TOOLCHAIN_DIR)/$(MIPSEL_TRIPLE)-cross/bin/$(MIPSEL_TRIPLE)-gcc
-MIPSEL_STRIP ?= $(TOOLCHAIN_DIR)/$(MIPSEL_TRIPLE)-cross/bin/$(MIPSEL_TRIPLE)-strip
-AARCH64_CC   ?= $(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-gcc
-AARCH64_STRIP ?= $(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-strip
+K1_CC    ?= $(TOOLCHAIN_DIR)/$(K1_TRIPLE)-cross/bin/$(K1_TRIPLE)-gcc
+K1_STRIP ?= $(TOOLCHAIN_DIR)/$(K1_TRIPLE)-cross/bin/$(K1_TRIPLE)-strip
 
-.PHONY: all native mipsel aarch64 test test-unit test-cli test-scripts \
-        toolchain clean distclean \
+HOST_MACHINE := $(shell uname -m)
+ifeq ($(HOST_MACHINE),aarch64)
+PI_CC    ?= $(CC)
+PI_STRIP ?= strip
+else
+PI_CC    ?= $(TOOLCHAIN_DIR)/$(PI_TRIPLE)-cross/bin/$(PI_TRIPLE)-gcc
+PI_STRIP ?= $(TOOLCHAIN_DIR)/$(PI_TRIPLE)-cross/bin/$(PI_TRIPLE)-strip
+endif
+
+.PHONY: all host k1 pi artifacts test test-nanocobs test-unit test-cli \
+        test-scripts toolchain clean distclean \
         render-k1-init install-k1 uninstall-k1 install-pi uninstall-pi FORCE
 
-all: native
+all: host
 
-native: $(BUILD)/pik1d
+host: $(HOST_BUILD)/pik1d
+k1: $(K1_BUILD)/pik1d
+pi: $(PI_BUILD)/pik1d
+artifacts: k1 pi
 
-test: test-unit test-cli test-scripts
+test: test-nanocobs test-unit test-cli test-scripts
 
-test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_frame \
+test-nanocobs:
+	$(MAKE) -C $(NANOCOBS_DIR) \
+		BUILD_DIR=$(abspath $(TEST_BUILD)/nanocobs) CC="$(CC)" CXX="$(CXX)"
+
+test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_frame \
       $(TEST_BUILD)/test_logging $(TEST_BUILD)/test_control_names \
       $(TEST_BUILD)/test_control_protocol $(TEST_BUILD)/test_commands \
       $(TEST_BUILD)/test_serialmux_protocol $(TEST_BUILD)/test_tunnel_protocol
 	$(TEST_BUILD)/test_util
-	$(TEST_BUILD)/test_cobs
 	$(TEST_BUILD)/test_frame
 	$(TEST_BUILD)/test_logging
 	$(TEST_BUILD)/test_control_names
@@ -95,14 +117,14 @@ test-unit: $(TEST_BUILD)/test_util $(TEST_BUILD)/test_cobs $(TEST_BUILD)/test_fr
 	$(TEST_BUILD)/test_serialmux_protocol
 	$(TEST_BUILD)/test_tunnel_protocol
 
-test-cli: native
-	PIK1D=$(BUILD)/pik1d bash tests/test_cli.sh
+test-cli: host
+	PIK1D=$(HOST_BUILD)/pik1d bash tests/test_cli.sh
 
 test-scripts:
 	bash tests/test_restart_wifi.sh
 
-# Native builds
-$(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
+# Host build
+$(HOST_BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(HOST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(PIK1D_SRCS)
 
 $(TEST_BUILD)/test_util: tests/test_util.c src/common/util.c src/common/util.h | $(TEST_BUILD)
@@ -111,45 +133,34 @@ $(TEST_BUILD)/test_util: tests/test_util.c src/common/util.c src/common/util.h |
 $(TEST_BUILD)/test_frame: tests/test_frame.c src/link/frame.c src/link/frame.h $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_frame.c src/link/frame.c $(COBS_SRCS)
 
-$(TEST_BUILD)/test_cobs: tests/test_cobs.c $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_cobs.c $(COBS_SRCS)
-
 $(TEST_BUILD)/test_logging: tests/test_logging.c src/common/logging.c src/common/logging.h | $(TEST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_logging.c src/common/logging.c
 
-$(TEST_BUILD)/test_control_names: tests/test_control_names.c $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_names.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
+$(TEST_BUILD)/test_control_names: tests/test_control_names.c $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_names.c $(TEST_RUNTIME_SRCS)
 
-$(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h tests/test_session_harness.h $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_protocol.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
+$(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h tests/test_session_harness.h $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_protocol.c $(TEST_RUNTIME_SRCS)
 
 $(TEST_BUILD)/test_commands: tests/test_commands.c tests/test_harness.h src/app/commands.c src/app/commands.h src/common/logging.c src/common/logging.h src/io/fd.c src/io/fd.h | $(TEST_BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_commands.c src/app/commands.c src/common/logging.c src/io/fd.c
 
-$(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h tests/test_session_harness.h $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_serialmux_protocol.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
+$(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h tests/test_session_harness.h $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_serialmux_protocol.c $(TEST_RUNTIME_SRCS)
 
-$(TEST_BUILD)/test_tunnel_protocol: tests/test_tunnel_protocol.c tests/test_harness.h tests/test_session_harness.h $(SERVICE_SRCS) $(SERVICE_HDRS) $(COBS_SRCS) $(BASE_SRCS) $(BASE_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_tunnel_protocol.c $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
+$(TEST_BUILD)/test_tunnel_protocol: tests/test_tunnel_protocol.c tests/test_harness.h tests/test_session_harness.h $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_tunnel_protocol.c $(TEST_RUNTIME_SRCS)
 
-# MIPSEL
-mipsel: $(BUILD)/pik1d.mipsel
+# Device builds
+$(K1_BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(K1_BUILD)
+	$(K1_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
+	-$(K1_STRIP) $@
 
-$(BUILD)/pik1d.mipsel: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
-	$(MIPSEL_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
-	-$(MIPSEL_STRIP) $@
+$(PI_BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(PI_BUILD)
+	$(PI_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
+	-$(PI_STRIP) $@
 
-# AARCH64
-aarch64: $(BUILD)/pik1d.aarch64
-
-$(BUILD)/pik1d.aarch64: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
-	$(AARCH64_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
-	-$(AARCH64_STRIP) $@
-
-$(BUILD):
-	mkdir -p $@
-
-$(TEST_BUILD):
+$(BUILD) $(HOST_BUILD) $(K1_BUILD) $(PI_BUILD) $(TEST_BUILD):
 	mkdir -p $@
 
 $(BUILD)/S99pik1: files/k1/S99pik1.in FORCE | $(BUILD)
@@ -168,19 +179,19 @@ $(TOOLCHAIN_DIR)/$(1)-cross/bin/$(1)-gcc:
 	mkdir -p $(TOOLCHAIN_DIR)
 	curl -fL --progress-bar $(MUSL_CC_BASE)/$(1)-cross.tgz | tar -xz -C $(TOOLCHAIN_DIR)
 endef
-$(eval $(call fetch_toolchain,$(MIPSEL_TRIPLE)))
-$(eval $(call fetch_toolchain,$(AARCH64_TRIPLE)))
+$(eval $(call fetch_toolchain,$(K1_TRIPLE)))
+$(eval $(call fetch_toolchain,$(PI_TRIPLE)))
 
 toolchain: \
-	$(TOOLCHAIN_DIR)/$(MIPSEL_TRIPLE)-cross/bin/$(MIPSEL_TRIPLE)-gcc \
-	$(TOOLCHAIN_DIR)/$(AARCH64_TRIPLE)-cross/bin/$(AARCH64_TRIPLE)-gcc
+	$(TOOLCHAIN_DIR)/$(K1_TRIPLE)-cross/bin/$(K1_TRIPLE)-gcc \
+	$(TOOLCHAIN_DIR)/$(PI_TRIPLE)-cross/bin/$(PI_TRIPLE)-gcc
 
 # Install targets
 install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh $(UTILITY_SCRIPTS)
-	@test -x $(BUILD)/pik1d.mipsel || \
-		{ echo "Missing $(BUILD)/pik1d.mipsel; run 'make mipsel' first"; exit 1; }
+	@test -x $(K1_BUILD)/pik1d || \
+		{ echo "Missing $(K1_BUILD)/pik1d; run 'make k1' first"; exit 1; }
 	install -d $(K1_DIR) $(K1_DIR)/scripts
-	install -m 755 $(BUILD)/pik1d.mipsel    $(K1_DIR)/pik1d
+	install -m 755 $(K1_BUILD)/pik1d $(K1_DIR)/pik1d
 	install -m 755 $(BUILD)/shutdown_command.sh $(K1_DIR)/shutdown_command.sh
 	install -m 755 $(UTILITY_SCRIPTS) $(K1_DIR)/scripts/
 	install -m 755 $(BUILD)/S99pik1 $(K1_INIT_DIR)/S99pik1
@@ -204,10 +215,10 @@ uninstall-k1:
 	done
 
 install-pi: $(UTILITY_SCRIPTS)
-	@test -x $(BUILD)/pik1d.aarch64 || \
-		{ echo "Missing $(BUILD)/pik1d.aarch64; run 'make aarch64' first"; exit 1; }
+	@test -x $(PI_BUILD)/pik1d || \
+		{ echo "Missing $(PI_BUILD)/pik1d; run 'make pi' first"; exit 1; }
 	$(SUDO) install -d $(PI_DIR) $(PI_DIR)/scripts
-	$(SUDO) install -m 755 $(BUILD)/pik1d.aarch64     $(PI_DIR)/pik1d
+	$(SUDO) install -m 755 $(PI_BUILD)/pik1d $(PI_DIR)/pik1d
 	$(SUDO) install -m 755 $(UTILITY_SCRIPTS) $(PI_DIR)/scripts/
 	sed -e 's|@INSTALL_DIR@|$(PI_DIR)|g' -e 's|@TCP_SPEC@|$(PI_TCP_SPEC)|g' \
 		files/pi/pik1.service.in | \
@@ -232,7 +243,8 @@ uninstall-pi:
 	$(SUDO) rm -rf $(PI_DIR)
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(HOST_BUILD) $(TEST_BUILD)
+	rm -f $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh
 
 distclean: clean
 	rm -rf $(TOOLCHAIN_DIR)
