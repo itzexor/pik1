@@ -9,7 +9,7 @@ ConditionPathExists=!/run/pik1/peer-initiated
 
 [Service]
 Type=oneshot
-ExecStart=-@INSTALL_DIR@/pik1d --control reboot-peer
+ExecStart=-@INSTALL_DIR@/pik1d --control reboot
 TimeoutStartSec=5
 
 [Install]

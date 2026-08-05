@@ -8,7 +8,7 @@
 
 /* Shared sequenced link core: COBS+CRC framing, session/sequence tracking,
  * bring-up grace for stale peer frames, and bounded link-layer retransmission
- * (see FAILURE_MODEL.md).
+ * (see DESIGN.md).
  *
  * Wire header layout: [type:1][aux:1][session_le:4][seq_le:2].
  * The aux byte carries the service channel id (pik_proto.h). */

@@ -48,11 +48,12 @@ static control_t g_ctrl;
 
 const char *pik_control_action_name(pik_control_action_t action) {
     switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_PEER: return "restart-peer";
-    case PIK_CONTROL_ACTION_REBOOT_PEER: return "reboot-peer";
-    case PIK_CONTROL_ACTION_POWEROFF_PEER: return "poweroff-peer";
+    case PIK_CONTROL_ACTION_RESTART_PIK1: return "restart-pik1";
+    case PIK_CONTROL_ACTION_REBOOT: return "reboot";
+    case PIK_CONTROL_ACTION_POWEROFF: return "poweroff";
     case PIK_CONTROL_ACTION_STATUS: return "status";
-    case PIK_CONTROL_ACTION_WIFI_RESET_PEER: return "wifi-reset-peer";
+    case PIK_CONTROL_ACTION_RESTART_WIFI: return "restart-wifi";
+    case PIK_CONTROL_ACTION_RESTART_KLIPPER: return "restart-klipper";
     default: return "unknown";
     }
 }
@@ -68,11 +69,12 @@ const char *pik_control_ack_status_name(pik_control_ack_status_t status) {
 
 static bool action_valid(pik_control_action_t action) {
     switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_PEER:
-    case PIK_CONTROL_ACTION_REBOOT_PEER:
-    case PIK_CONTROL_ACTION_POWEROFF_PEER:
+    case PIK_CONTROL_ACTION_RESTART_PIK1:
+    case PIK_CONTROL_ACTION_REBOOT:
+    case PIK_CONTROL_ACTION_POWEROFF:
     case PIK_CONTROL_ACTION_STATUS:
-    case PIK_CONTROL_ACTION_WIFI_RESET_PEER:
+    case PIK_CONTROL_ACTION_RESTART_WIFI:
+    case PIK_CONTROL_ACTION_RESTART_KLIPPER:
         return true;
     default:
         return false;

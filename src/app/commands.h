@@ -31,7 +31,7 @@ void pik_commands_dispatch(void *ptr, int64_t now);
 bool pik_commands_parse_action(const char *cmd, pik_control_action_t *action);
 void pik_commands_mark_peer_initiated(void);
 
-void pik_commands_init(const char *side_name);
+void pik_commands_init(const char *side_name, bool pty_side);
 void pik_commands_set_service_flags(uint32_t flags);
 void pik_commands_set_service_flag(uint32_t flag, bool up);
 void pik_commands_on_command(pik_control_action_t action,
@@ -40,5 +40,5 @@ void pik_commands_check_acks(int64_t now);
 int64_t pik_commands_deadline(void);
 bool pik_commands_signal_pending(void);
 bool pik_commands_signal_done(void);
-void pik_commands_request_restart_peer(bool can_signal_peer_restart, int64_t now);
+void pik_commands_request_restart_pik1(bool can_request, int64_t now);
 bool pik_commands_action_due(int64_t now, pik_control_action_t *action);

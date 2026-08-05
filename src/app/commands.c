@@ -89,24 +89,28 @@ int pik_commands_client_main(const char *cmd) {
 }
 
 bool pik_commands_parse_action(const char *cmd, pik_control_action_t *action) {
-    if (strcmp(cmd, "restart-peer") == 0) {
-        *action = PIK_CONTROL_ACTION_RESTART_PEER;
+    if (strcmp(cmd, "restart-pik1") == 0) {
+        *action = PIK_CONTROL_ACTION_RESTART_PIK1;
         return true;
     }
-    if (strcmp(cmd, "reboot-peer") == 0) {
-        *action = PIK_CONTROL_ACTION_REBOOT_PEER;
+    if (strcmp(cmd, "reboot") == 0) {
+        *action = PIK_CONTROL_ACTION_REBOOT;
         return true;
     }
-    if (strcmp(cmd, "poweroff-peer") == 0) {
-        *action = PIK_CONTROL_ACTION_POWEROFF_PEER;
+    if (strcmp(cmd, "poweroff") == 0) {
+        *action = PIK_CONTROL_ACTION_POWEROFF;
         return true;
     }
-    if (strcmp(cmd, "status-peer") == 0) {
+    if (strcmp(cmd, "status") == 0) {
         *action = PIK_CONTROL_ACTION_STATUS;
         return true;
     }
-    if (strcmp(cmd, "wifi-reset-peer") == 0) {
-        *action = PIK_CONTROL_ACTION_WIFI_RESET_PEER;
+    if (strcmp(cmd, "restart-wifi") == 0) {
+        *action = PIK_CONTROL_ACTION_RESTART_WIFI;
+        return true;
+    }
+    if (strcmp(cmd, "restart-klipper") == 0) {
+        *action = PIK_CONTROL_ACTION_RESTART_KLIPPER;
         return true;
     }
     return false;
@@ -363,6 +367,7 @@ void pik_commands_mark_peer_initiated(void) {
 
 typedef struct {
     const char *side_name;
+    bool pty_side;
     uint32_t service_flags;
     pik_control_action_t remote_action;
     bool remote_action_pending;
@@ -375,8 +380,9 @@ typedef struct {
 
 static commands_state_t g_ctl;
 
-void pik_commands_init(const char *side_name) {
+void pik_commands_init(const char *side_name, bool pty_side) {
     g_ctl.side_name = side_name;
+    g_ctl.pty_side = pty_side;
     g_ctl.service_flags = 0;
     g_ctl.remote_action = 0;
     g_ctl.remote_action_pending = false;
@@ -427,6 +433,12 @@ void pik_commands_on_command(pik_control_action_t action,
         return;
     }
 
+    if (action == PIK_CONTROL_ACTION_RESTART_KLIPPER && !g_ctl.pty_side) {
+        if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_OK, NULL, 0))
+            LOG("failed to send no-op ACK request=%u", request_id);
+        return;
+    }
+
     if (g_ctl.remote_action_pending) {
         static const uint8_t busy[] = "action already pending";
         if (!pik_control_send_ack(request_id, PIK_CONTROL_ACK_INTERNAL_ERROR,
@@ -455,7 +467,7 @@ void pik_commands_check_acks(int64_t now) {
             local_control_complete(status, payload, payload_len);
         } else if (g_ctl.signal_command_pending &&
                    request_id == g_ctl.signal_request_id) {
-            LOG("restart command ack status=%s",
+            LOG("restart-pik1 command ack status=%s",
                 pik_control_ack_status_name(status));
             g_ctl.signal_command_pending = false;
             g_ctl.signal_command_done = true;
@@ -466,7 +478,7 @@ void pik_commands_check_acks(int64_t now) {
     }
     local_control_check_timeout(now);
     if (g_ctl.signal_command_pending && now >= g_ctl.signal_deadline_ms) {
-        LOG("restart command ack timeout");
+        LOG("restart-pik1 command ack timeout");
         g_ctl.signal_command_pending = false;
         g_ctl.signal_command_done = true;
     }
@@ -498,13 +510,13 @@ bool pik_commands_signal_done(void) {
     return g_ctl.signal_command_done;
 }
 
-void pik_commands_request_restart_peer(bool can_signal_peer_restart, int64_t now) {
+void pik_commands_request_restart_pik1(bool can_request, int64_t now) {
     if (local_control_pending()) {
         LOG("ignoring SIGUSR1 while a local command is pending");
         g_ctl.signal_command_done = true;
-    } else if (can_signal_peer_restart && !g_ctl.signal_command_pending &&
+    } else if (can_request && !g_ctl.signal_command_pending &&
                !g_ctl.signal_command_done &&
-               pik_control_send_command(PIK_CONTROL_ACTION_RESTART_PEER,
+               pik_control_send_command(PIK_CONTROL_ACTION_RESTART_PIK1,
                                         &g_ctl.signal_request_id)) {
         g_ctl.signal_command_pending = true;
         g_ctl.signal_deadline_ms = now + PIK_COMMAND_ACK_TIMEOUT_MS;

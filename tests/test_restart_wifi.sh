@@ -2,7 +2,7 @@
 set -euo pipefail
 
 fail() {
-    echo "test_wifi_reset: $*" >&2
+    echo "test_restart_wifi: $*" >&2
     exit 1
 }
 
@@ -25,7 +25,7 @@ run_reset() {
     PIK1_NET_CLASS_DIR="$tmpdir/net" \
     PIK1_WIFI_TEST_CALLS="$calls" \
     PATH="$tmpdir/bin:/usr/bin:/bin" \
-        scripts/wifi-reset.sh
+        scripts/restart-wifi.sh
 }
 
 make_mock nmcli '
@@ -66,4 +66,4 @@ expected=$'wpa_cli -i wifi-test reconfigure\nwpa_cli -i wifi-test reassociate'
 [[ $(<"$calls") == "$expected" ]] ||
     fail "wpa_cli command sequence was incorrect"
 
-echo "test_wifi_reset: ok"
+echo "test_restart_wifi: ok"

@@ -3,8 +3,8 @@
 /* Product identity shared by the host lookup path, FunctionFS gadget
  * descriptors, install templates, and user-facing logs/docs. */
 
-#define PIK1_RELEASE_VERSION "0.12.0"
-#define PIK1_PROTOCOL_VERSION 12u
+#define PIK1_RELEASE_VERSION "0.13.0"
+#define PIK1_PROTOCOL_VERSION 13u
 
 #define PIK1_USB_VID "1d6b"
 #define PIK1_USB_PID "51c1"

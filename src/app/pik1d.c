@@ -48,9 +48,17 @@ static _Noreturn void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s --version\n"
-        "  %s --control status-peer|restart-peer|reboot-peer|poweroff-peer|wifi-reset-peer\n"
+        "  %s --control COMMAND\n"
         "  %s --usb  mcu:N:DEV:BAUD [...] [listen:BIND_ADDR:PORT]\n"
-        "  %s --ffs  pty:N:SYMLINK  [...] [forward:TARGET_HOST:PORT]\n",
+        "  %s --ffs  pty:N:SYMLINK  [...] [forward:TARGET_HOST:PORT]\n"
+        "\n"
+        "Control commands:\n"
+        "  status\n"
+        "  restart-pik1\n"
+        "  restart-wifi\n"
+        "  restart-klipper\n"
+        "  reboot\n"
+        "  poweroff\n",
         prog, prog, prog, prog);
     exit(1);
 }
@@ -223,6 +231,22 @@ static void session_teardown(void) {
     pik_commands_set_service_flags(0);
 }
 
+static bool start_process(const char *path, char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigprocmask(SIG_SETMASK, &mask, NULL);
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        execvp(path, argv);
+        _exit(127);
+    }
+    return true;
+}
+
 static bool start_utility(const char *name) {
     char path[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1u);
@@ -245,48 +269,46 @@ static bool start_utility(const char *name) {
     if (access(path, X_OK) < 0)
         return false;
 
-    pid_t pid = fork();
-    if (pid < 0)
-        return false;
-    if (pid == 0) {
-        sigset_t mask;
-        sigemptyset(&mask);
-        sigprocmask(SIG_SETMASK, &mask, NULL);
-        signal(SIGCHLD, SIG_DFL);
-        signal(SIGPIPE, SIG_DFL);
-        execl(path, path, (char *)NULL);
-        _exit(127);
-    }
-    return true;
+    char *const argv[] = { path, NULL };
+    return start_process(path, argv);
 }
 
 static void execute_remote_action(pik_control_action_t action, char **argv) {
-    if (action == PIK_CONTROL_ACTION_WIFI_RESET_PEER) {
-        LOG("executing wifi-reset-peer");
-        if (!start_utility("wifi-reset.sh"))
-            LOG("start wifi-reset.sh: %s", strerror(errno));
+    if (action == PIK_CONTROL_ACTION_RESTART_WIFI) {
+        LOG("executing restart-wifi");
+        if (!start_utility("restart-wifi.sh"))
+            LOG("start restart-wifi.sh: %s", strerror(errno));
+        return;
+    }
+    if (action == PIK_CONTROL_ACTION_RESTART_KLIPPER) {
+        LOG("executing restart-klipper");
+        char *const systemctl_argv[] = {
+            "systemctl", "restart", "klipper.service", NULL
+        };
+        if (!start_process("systemctl", systemctl_argv))
+            LOG("start systemctl: %s", strerror(errno));
         return;
     }
 
-    if (action == PIK_CONTROL_ACTION_REBOOT_PEER ||
-        action == PIK_CONTROL_ACTION_POWEROFF_PEER)
+    if (action == PIK_CONTROL_ACTION_REBOOT ||
+        action == PIK_CONTROL_ACTION_POWEROFF)
         pik_commands_mark_peer_initiated();
     session_teardown();
     pik_commands_cleanup();
 
     switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_PEER:
-        LOG("executing restart-peer");
+    case PIK_CONTROL_ACTION_RESTART_PIK1:
+        LOG("executing restart-pik1");
         execv(argv[0], argv);
         LOG("execv %s: %s", argv[0], strerror(errno));
         _exit(127);
-    case PIK_CONTROL_ACTION_REBOOT_PEER:
-        LOG("executing reboot-peer");
+    case PIK_CONTROL_ACTION_REBOOT:
+        LOG("executing reboot");
         execl("/sbin/reboot", "reboot", (char *)NULL);
         LOG("execl /sbin/reboot: %s", strerror(errno));
         _exit(127);
-    case PIK_CONTROL_ACTION_POWEROFF_PEER:
-        LOG("executing poweroff-peer");
+    case PIK_CONTROL_ACTION_POWEROFF:
+        LOG("executing poweroff");
         execl("/sbin/poweroff", "poweroff", (char *)NULL);
         LOG("execl /sbin/poweroff: %s", strerror(errno));
         _exit(127);
@@ -314,7 +336,7 @@ int main(int argc, char **argv) {
     const char *side_name = k1_mode ? "mcu" : "pty";
     pik_control_role_t control_role =
         k1_mode ? PIK_CONTROL_ROLE_MCU : PIK_CONTROL_ROLE_PTY;
-    pik_commands_init(side_name);
+    pik_commands_init(side_name, !k1_mode);
     pik_log_set_timestamps(k1_mode);
 
     if (cfg.tunnel_mode != TUNNEL_MODE_NONE)
@@ -437,7 +459,8 @@ int main(int argc, char **argv) {
                     if (si.ssi_signo == SIGTERM) {
                         shutdown = true;
                     } else if (si.ssi_signo == SIGUSR1) {
-                        pik_commands_request_restart_peer(cfg.mode == APP_MODE_PI, now);
+                        pik_commands_request_restart_pik1(cfg.mode == APP_MODE_PI,
+                                                          now);
                     }
                 }
                 continue;

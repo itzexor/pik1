@@ -8,48 +8,8 @@ for its physical MCUs and, optionally, its touchscreen.
 > restore the K1 before proceeding. Creality publishes
 > [recovery images and instructions](https://github.com/CrealityOfficial/K1_Series_Annex/releases/tag/V1.0.0).
 
-## Architecture
-
-There is exactly one bidirectional USB bulk link:
-
-```text
-K1 USB host                         Raspberry Pi USB gadget
-usbfs bulk URBs  <==== USB cable ====>  configfs + FunctionFS
-        \                                  /
-         +------ one sequenced link ------+
-                  |      |       |
-               control  MCU   TCP tunnel
-```
-
-The Pi creates one vendor-specific FunctionFS interface with one bulk OUT
-endpoint and one bulk IN endpoint. The K1 finds that interface by VID:PID,
-claims it through usbfs, and keeps bulk receive URBs posted. Both transports
-feed and drain the same byte-oriented link; neither transport owns a separate
-protocol session.
-
-The link applies COBS framing, CRC32 integrity, session IDs, sequence numbers,
-and bounded retransmission. After the channel-0 HELLO handshake succeeds, the
-session router starts and routes:
-
-| Wire channel | Logical service |
-|---|---|
-| 0 | Handshake, liveness, configuration checks, and peer commands |
-| 1–8 | MCU serial mux (`mcu:0`–`mcu:7` / `pty:0`–`pty:7`) |
-| 15 | Optional touchscreen TCP tunnel |
-
-Outbound traffic waits in bounded per-service queues. Control has highest
-priority, MCU traffic is next, and tunnel traffic is last. Only a shallow
-amount is admitted to the transport at once, so a touchscreen burst cannot
-fill the USB path ahead of MCU traffic.
-
-Any transport, framing, sequencing, or reliable-service failure tears down
-the whole session. Queued bytes and logical endpoints are discarded, the
-transport reconnects with bounded backoff, and services restart only after a
-new HELLO handshake. See [FAILURE_MODEL.md](FAILURE_MODEL.md) for the failure
-contract.
-
-The TCP tunnel is for low-bandwidth Moonraker API traffic only. Do not use it
-for webcam streams or file transfers.
+Daemon architecture, protocol flow, scheduling, and failure behavior are
+documented in [DESIGN.md](DESIGN.md).
 
 ## Requirements
 
@@ -148,9 +108,6 @@ beside the daemon.
    `restart_method: command` is required because the serial mux does not carry
    DTR or RTS.
 
-The Pi service runs as root because `pik1d` owns configfs, the FunctionFS
-mount and descriptors, UDC binding, and PTY permissions.
-
 ### K1
 
 1. Install [Simple AF](https://pellcorp.github.io/creality-wiki/) on the K1.
@@ -188,30 +145,9 @@ mount and descriptors, UDC binding, and PTY permissions.
 
 Screen support is enabled by default. The K1 listens only on
 `127.0.0.1:7125`, where guppyscreen already expects Moonraker. The Pi side
-forwards that logical stream to `127.0.0.1:7125` on the Pi:
-
-```text
-guppyscreen -> K1 localhost:7125 -> shared USB link -> Pi Moonraker:7125
-```
-
-The generated daemon arguments are equivalent to:
-
-```sh
-# K1
-pik1d --usb \
-    mcu:0:/dev/ttyS7:230400 \
-    mcu:1:/dev/ttyS1:230400 \
-    listen:127.0.0.1:7125
-
-# Pi
-pik1d --ffs \
-    pty:0:/tmp/klipper_mcu \
-    pty:1:/tmp/klipper_toolhead \
-    forward:127.0.0.1:7125
-```
+forwards that stream to Moonraker on the Pi.
 
 Do not bind the K1 listener to `0.0.0.0` unless remote access is intentional.
-The tunnel has no authentication of its own.
 
 To omit the tunnel and disable the K1 screen services, use the same option on
 both devices:
@@ -237,37 +173,33 @@ On the K1:
 cat /tmp/pik1.log
 ```
 
-A healthy startup shows:
-
-- the Pi preparing and binding one FunctionFS gadget;
-- the K1 opening the matching vendor bulk interface;
-- a successful control HELLO on both sides;
-- the serial service starting and the expected MCU/PTY channels becoming
-  active;
-- the tunnel listener starting when screen support is enabled.
+A healthy installation brings the configured Klipper MCUs online. Use
+`pik1d --control status` to check the peer release, protocol, and active
+services.
 
 Klipper may take about 15 seconds to reconnect while the GD32 bootloader is
 active. `FIRMWARE_RESTART` can have the same delay.
 
 ## Peer commands
 
-Each daemon exposes a root-only Unix socket at `/run/pik1/control.sock`.
-Commands other than `status-peer` are acknowledged before the peer acts:
+Use the daemon CLI to send commands to the other endpoint:
 
 ```sh
-pik1d --control status-peer
-pik1d --control restart-peer
-pik1d --control reboot-peer
-pik1d --control poweroff-peer
-pik1d --control wifi-reset-peer
+pik1d --control status
+pik1d --control restart-pik1
+pik1d --control reboot
+pik1d --control poweroff
+pik1d --control restart-wifi
+pik1d --control restart-klipper
 ```
 
-`status-peer` returns one bounded summary containing the peer side, release,
+`status` returns one bounded summary containing the peer side, release,
 protocol, and active logical services.
-`wifi-reset-peer` runs the installed `scripts/wifi-reset.sh` utility on the
+`restart-wifi` runs the installed `scripts/restart-wifi.sh` utility on the
 peer without stopping the USB link. The utility resets the active Wi-Fi stack
-and supports common embedded and Linux network managers. Only one outbound
-command may be pending at a time.
+and supports common embedded and Linux network managers.
+`restart-klipper` restarts `klipper.service` when received by the Pi/PTY side.
+The K1/MCU side acknowledges the command without taking any action.
 
 ### Shutdown propagation
 
@@ -275,13 +207,9 @@ Pi shutdown/reboot helper units send the matching command to the K1. A
 K1-initiated action should use:
 
 ```sh
-/usr/data/pik1/shutdown_command.sh shutdown
+/usr/data/pik1/shutdown_command.sh poweroff
 /usr/data/pik1/shutdown_command.sh reboot
 ```
-
-The receiving side writes `/run/pik1/peer-initiated` before acting. The Pi
-helper units check that marker so they do not relay the action back to its
-origin.
 
 ## Return the K1 to standalone mode
 

@@ -30,7 +30,7 @@ BASE_SRCS   := $(COMMON_SRCS) $(LINK_SRCS) $(IO_SRCS)
 BASE_HDRS   := $(COMMON_HDRS) $(LINK_HDRS) $(IO_HDRS)
 PIK1D_SRCS  := $(APP_SRCS) $(SERVICE_SRCS) $(COBS_SRCS) $(BASE_SRCS)
 PIK1D_HDRS  := $(APP_HDRS) $(SERVICE_HDRS) $(COBS_HDRS) $(BASE_HDRS)
-UTILITY_SCRIPTS := scripts/wifi-reset.sh
+UTILITY_SCRIPTS := scripts/restart-wifi.sh
 
 # Install
 SUDO            ?= sudo
@@ -99,7 +99,7 @@ test-cli: native
 	PIK1D=$(BUILD)/pik1d bash tests/test_cli.sh
 
 test-scripts:
-	bash tests/test_wifi_reset.sh
+	bash tests/test_restart_wifi.sh
 
 # Native builds
 $(BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(BUILD)
@@ -194,7 +194,7 @@ install-k1: $(BUILD)/S99pik1 $(BUILD)/shutdown_command.sh $(UTILITY_SCRIPTS)
 uninstall-k1:
 	rm -f $(K1_INIT_DIR)/S99pik1
 	rm -f $(K1_DIR)/pik1d $(K1_DIR)/shutdown_command.sh
-	rm -f $(K1_DIR)/scripts/wifi-reset.sh
+	rm -f $(K1_DIR)/scripts/restart-wifi.sh
 	-rmdir $(K1_DIR)/scripts
 	@for svc in $(sort $(K1_DISABLE_SVCS) $(K1_SCREEN_SVCS)); do \
 		if [ -f $(K1_INIT_DIR)/_$$svc ]; then \

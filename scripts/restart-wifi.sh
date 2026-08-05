@@ -2,7 +2,7 @@
 set -u
 
 fail() {
-    printf 'wifi-reset: %s\n' "$*" >&2
+    printf 'restart-wifi: %s\n' "$*" >&2
     exit 1
 }
 

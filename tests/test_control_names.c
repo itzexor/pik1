@@ -13,11 +13,12 @@ static int failures;
 } while (0)
 
 static void test_action_names(void) {
-    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_RESTART_PEER), "restart-peer") == 0);
-    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_REBOOT_PEER), "reboot-peer") == 0);
-    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_POWEROFF_PEER), "poweroff-peer") == 0);
+    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_RESTART_PIK1), "restart-pik1") == 0);
+    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_REBOOT), "reboot") == 0);
+    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_POWEROFF), "poweroff") == 0);
     CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_STATUS), "status") == 0);
-    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_WIFI_RESET_PEER), "wifi-reset-peer") == 0);
+    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_RESTART_WIFI), "restart-wifi") == 0);
+    CHECK(strcmp(pik_control_action_name(PIK_CONTROL_ACTION_RESTART_KLIPPER), "restart-klipper") == 0);
     CHECK(strcmp(pik_control_action_name((pik_control_action_t)99), "unknown") == 0);
 }
 
@@ -34,7 +35,8 @@ static void test_public_enum_values(void) {
     CHECK(PIK_CONTROL_TCP_NONE == 0);
     CHECK(PIK_CONTROL_TCP_LISTEN == 1);
     CHECK(PIK_CONTROL_TCP_FORWARD == 2);
-    CHECK(PIK_CONTROL_ACTION_WIFI_RESET_PEER == 5);
+    CHECK(PIK_CONTROL_ACTION_RESTART_WIFI == 5);
+    CHECK(PIK_CONTROL_ACTION_RESTART_KLIPPER == 6);
     CHECK(PIK_CONTROL_SERVICE_SERIAL == (1u << 0));
     CHECK(PIK_CONTROL_SERVICE_TUNNEL == (1u << 1));
 }

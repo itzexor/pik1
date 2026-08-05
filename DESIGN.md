@@ -1,14 +1,96 @@
-# Failure Model
+# Daemon Design
 
 PiK1 is a transport bridge, not a printer safety controller. Thermal, motion,
 heater, watchdog, and emergency-stop safety remain the responsibility of
 Klipper, MCU firmware, printer configuration, and physical protections.
 
-This document defines the failure contract for the current architecture: one
-USB bulk connection, one sequenced link, and three logical services carried by
-that link.
+This document describes the current daemon architecture, runtime flow, wire
+services, and failure contract.
 
-## Core policy
+## Architecture
+
+There is exactly one bidirectional USB bulk connection and one protocol
+session:
+
+```text
+K1 USB host                         Raspberry Pi USB gadget
+usbfs bulk URBs  <==== USB cable ====>  configfs + FunctionFS
+        \                                  /
+         +------ one sequenced link ------+
+                  |      |       |
+               control  MCU   TCP tunnel
+```
+
+The Pi creates one vendor-specific FunctionFS interface with one bulk OUT and
+one bulk IN endpoint. The K1 finds it by VID:PID, claims it through usbfs, and
+keeps receive URBs posted. Both backends feed and drain the same byte-oriented
+link; neither owns a separate protocol session.
+
+The daemon is divided by runtime responsibility:
+
+| Area | Responsibility |
+|---|---|
+| `app/` | startup, argument parsing, lifecycle, local and peer commands |
+| `common/` | logging, product identity, and small shared utilities |
+| `io/` | fd helpers and USB host/gadget implementations |
+| `link/` | framing, sequencing, retransmission, scheduling, and routing |
+| `services/` | control, serial mux, and TCP tunnel state machines |
+
+At startup, the daemon selects immutable host or gadget transport operations,
+prepares the endpoint, creates the local control socket, and initializes the
+logical services. A transport open creates a fresh link session and sends a
+channel-0 HELLO. Serial and tunnel endpoints start only after both sides have
+validated the HELLO. The epoll loop then dispatches transport, command, serial,
+and tunnel events and advances their bounded deadlines.
+
+The session router carries:
+
+| Wire channel | Logical service |
+|---|---|
+| 0 | handshake, liveness, configuration validation, and commands |
+| 1–8 | MCU serial mux |
+| 15 | optional TCP tunnel |
+
+All reliable traffic shares this link. Control traffic has highest priority,
+serial traffic is next, and tunnel traffic is last.
+
+## Deployment integration
+
+The Pi daemon runs as root because it owns configfs, the FunctionFS mount and
+descriptors, UDC binding, PTY creation, and PTY permissions.
+
+With screen support enabled, the K1 listens on `127.0.0.1:7125` and carries
+that stream over the shared link to Moonraker at `127.0.0.1:7125` on the Pi:
+
+```text
+guppyscreen -> K1 localhost:7125 -> shared USB link -> Pi Moonraker:7125
+```
+
+The default daemon arguments are equivalent to:
+
+```sh
+# K1
+pik1d --usb \
+    mcu:0:/dev/ttyS7:230400 \
+    mcu:1:/dev/ttyS1:230400 \
+    listen:127.0.0.1:7125
+
+# Pi
+pik1d --ffs \
+    pty:0:/tmp/klipper_mcu \
+    pty:1:/tmp/klipper_toolhead \
+    forward:127.0.0.1:7125
+```
+
+The tunnel is intended for low-bandwidth Moonraker API traffic, not webcam
+streams or file transfers. It has no authentication of its own.
+
+## Safety boundary
+
+PiK1 does not validate G-code, reconstruct application messages, decide
+whether a print should continue, or provide a safety interlock.
+
+## Failure policy
 
 When transport or protocol state is ambiguous, fail the shared session,
 discard its queued state, and reconnect from a new generation.
@@ -22,9 +104,6 @@ PiK1 must:
 - never keep a logical service alive after the underlying link fails;
 - expose communication loss to Klipper and local clients;
 - avoid binding the TCP listener more broadly than configured.
-
-PiK1 does not validate G-code, reconstruct application messages, decide
-whether a print should continue, or provide a safety interlock.
 
 ## Shared-link lifecycle
 
@@ -136,13 +215,31 @@ authentication.
 
 ## Control commands
 
+Each daemon exposes a root-only Unix socket at `/run/pik1/control.sock`. The
+CLI connects to that socket and sends one command across the shared link.
+
 Only one outbound command may await an ACK in a daemon. A second local command
-is rejected as busy. Only one received reboot/restart/poweroff action may be
-scheduled; another action is rejected and cannot overwrite the first.
+is rejected as busy. Only one received action may be scheduled; another action
+is rejected and cannot overwrite the first. `restart-klipper` received on the
+MCU side is acknowledged as a no-op and is not scheduled.
 
 The receiver sends an ACK before executing a destructive peer action, then
 waits briefly so the ACK can leave the transport. ACK timeout is reported to
 the initiator and does not imply that an unacknowledged action ran.
+
+`restart-wifi` launches the installed recovery utility without stopping the
+USB link. On the PTY side, `restart-klipper` directly runs
+`systemctl restart klipper.service`. Reboot and poweroff receivers create the
+`/run/pik1/peer-initiated` marker before acting; Pi shutdown helper units use
+that marker to avoid relaying the action back to its origin.
+
+## Operational signals
+
+A successful startup consists of the Pi binding one FunctionFS gadget, the K1
+opening its vendor bulk interface, both sides completing HELLO, configured
+serial channels becoming active, and the optional tunnel listener starting.
+The K1 writes daemon logs to `/tmp/pik1.log`; the Pi writes to the systemd
+journal.
 
 ## Review checklist
 

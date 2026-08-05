@@ -33,10 +33,10 @@ protocol=$(sed -n 's/#define PIK1_PROTOCOL_VERSION \([0-9]*\)u/\1/p' src/common/
     fail "unexpected --version output: $out"
 
 set +e
-out=$("$PIK1D" --control status-peer 2>&1)
+out=$("$PIK1D" --control status 2>&1)
 rc=$?
 set -e
-[[ $rc -eq 1 ]] || fail "--control status-peer with no daemon exited with $rc"
+[[ $rc -eq 1 ]] || fail "--control status with no daemon exited with $rc"
 contains "$out" "connect"
 
 set +e

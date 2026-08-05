@@ -73,11 +73,12 @@ bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status
 
 const char *pik_control_action_name(pik_control_action_t action) {
     switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_PEER: return "restart-peer";
-    case PIK_CONTROL_ACTION_REBOOT_PEER: return "reboot-peer";
-    case PIK_CONTROL_ACTION_POWEROFF_PEER: return "poweroff-peer";
+    case PIK_CONTROL_ACTION_RESTART_PIK1: return "restart-pik1";
+    case PIK_CONTROL_ACTION_REBOOT: return "reboot";
+    case PIK_CONTROL_ACTION_POWEROFF: return "poweroff";
     case PIK_CONTROL_ACTION_STATUS: return "status";
-    case PIK_CONTROL_ACTION_WIFI_RESET_PEER: return "wifi-reset-peer";
+    case PIK_CONTROL_ACTION_RESTART_WIFI: return "restart-wifi";
+    case PIK_CONTROL_ACTION_RESTART_KLIPPER: return "restart-klipper";
     default: return "unknown";
     }
 }
@@ -107,7 +108,7 @@ static void reset_state(void) {
     ack_status = 0;
     ack_payload = NULL;
     ack_payload_len = 0;
-    pik_commands_init("test");
+    pik_commands_init("test", true);
 }
 
 static int connect_control_socket(const char *path) {
@@ -154,13 +155,14 @@ static bool read_reply(int fd, char *buf, size_t cap) {
 static void test_parse_control_actions(void) {
     pik_control_action_t action = 0;
     reset_state();
-    CHECK(pik_commands_parse_action("status-peer", &action));
+    CHECK(pik_commands_parse_action("status", &action));
     CHECK(action == PIK_CONTROL_ACTION_STATUS);
-    CHECK(!pik_commands_parse_action("status", &action));
-    CHECK(pik_commands_parse_action("restart-peer", &action));
-    CHECK(action == PIK_CONTROL_ACTION_RESTART_PEER);
-    CHECK(pik_commands_parse_action("wifi-reset-peer", &action));
-    CHECK(action == PIK_CONTROL_ACTION_WIFI_RESET_PEER);
+    CHECK(pik_commands_parse_action("restart-pik1", &action));
+    CHECK(action == PIK_CONTROL_ACTION_RESTART_PIK1);
+    CHECK(pik_commands_parse_action("restart-wifi", &action));
+    CHECK(action == PIK_CONTROL_ACTION_RESTART_WIFI);
+    CHECK(pik_commands_parse_action("restart-klipper", &action));
+    CHECK(action == PIK_CONTROL_ACTION_RESTART_KLIPPER);
     CHECK(!pik_commands_parse_action("bogus", &action));
 }
 
@@ -181,28 +183,48 @@ static void test_remote_action_requires_ack_success(void) {
     pik_control_action_t action = 0;
     reset_state();
 
-    pik_commands_on_command(PIK_CONTROL_ACTION_REBOOT_PEER, 88);
+    pik_commands_on_command(PIK_CONTROL_ACTION_REBOOT, 88);
 
     CHECK(send_ack_calls == 1);
     CHECK(send_ack_status == PIK_CONTROL_ACK_OK);
     CHECK(!pik_commands_action_due(now_ms, &action));
     CHECK(pik_commands_action_due(now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
-    CHECK(action == PIK_CONTROL_ACTION_REBOOT_PEER);
+    CHECK(action == PIK_CONTROL_ACTION_REBOOT);
     CHECK(!pik_commands_action_due(
         now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
 }
 
-static void test_wifi_reset_is_scheduled(void) {
+static void test_restart_wifi_is_scheduled(void) {
     pik_control_action_t action = 0;
     reset_state();
 
-    pik_commands_on_command(PIK_CONTROL_ACTION_WIFI_RESET_PEER, 89);
+    pik_commands_on_command(PIK_CONTROL_ACTION_RESTART_WIFI, 89);
 
     CHECK(send_ack_calls == 1);
     CHECK(send_ack_status == PIK_CONTROL_ACK_OK);
     CHECK(pik_commands_action_due(
         now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
-    CHECK(action == PIK_CONTROL_ACTION_WIFI_RESET_PEER);
+    CHECK(action == PIK_CONTROL_ACTION_RESTART_WIFI);
+}
+
+static void test_restart_klipper_direction(void) {
+    pik_control_action_t action = 0;
+    reset_state();
+
+    pik_commands_on_command(PIK_CONTROL_ACTION_RESTART_KLIPPER, 90);
+    CHECK(send_ack_calls == 1);
+    CHECK(send_ack_status == PIK_CONTROL_ACK_OK);
+    CHECK(pik_commands_action_due(
+        now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
+    CHECK(action == PIK_CONTROL_ACTION_RESTART_KLIPPER);
+
+    reset_state();
+    pik_commands_init("test", false);
+    pik_commands_on_command(PIK_CONTROL_ACTION_RESTART_KLIPPER, 91);
+    CHECK(send_ack_calls == 1);
+    CHECK(send_ack_status == PIK_CONTROL_ACK_OK);
+    CHECK(!pik_commands_action_due(
+        now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
 }
 
 static void test_remote_action_not_scheduled_on_ack_failure(void) {
@@ -210,7 +232,7 @@ static void test_remote_action_not_scheduled_on_ack_failure(void) {
     reset_state();
     send_ack_ok = false;
 
-    pik_commands_on_command(PIK_CONTROL_ACTION_POWEROFF_PEER, 99);
+    pik_commands_on_command(PIK_CONTROL_ACTION_POWEROFF, 99);
 
     CHECK(send_ack_calls == 1);
     CHECK(!pik_commands_action_due(now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
@@ -220,23 +242,23 @@ static void test_remote_action_cannot_be_overwritten(void) {
     pik_control_action_t action = 0;
     reset_state();
 
-    pik_commands_on_command(PIK_CONTROL_ACTION_REBOOT_PEER, 1);
-    pik_commands_on_command(PIK_CONTROL_ACTION_POWEROFF_PEER, 2);
+    pik_commands_on_command(PIK_CONTROL_ACTION_REBOOT, 1);
+    pik_commands_on_command(PIK_CONTROL_ACTION_POWEROFF, 2);
 
     CHECK(send_ack_calls == 2);
     CHECK(send_ack_request == 2);
     CHECK(send_ack_status == PIK_CONTROL_ACK_INTERNAL_ERROR);
     CHECK(pik_commands_action_due(
         now_ms + PIK_REMOTE_ACTION_DELAY_MS, &action));
-    CHECK(action == PIK_CONTROL_ACTION_REBOOT_PEER);
+    CHECK(action == PIK_CONTROL_ACTION_REBOOT);
 }
 
-static void test_signal_restart_peer_ack(void) {
+static void test_signal_restart_pik1_ack(void) {
     reset_state();
 
-    pik_commands_request_restart_peer(true, now_ms);
+    pik_commands_request_restart_pik1(true, now_ms);
     CHECK(send_command_calls == 1);
-    CHECK(sent_action == PIK_CONTROL_ACTION_RESTART_PEER);
+    CHECK(sent_action == PIK_CONTROL_ACTION_RESTART_PIK1);
     CHECK(pik_commands_signal_pending());
     CHECK(!pik_commands_signal_done());
 
@@ -248,10 +270,10 @@ static void test_signal_restart_peer_ack(void) {
     CHECK(pik_commands_signal_done());
 }
 
-static void test_signal_restart_peer_timeout(void) {
+static void test_signal_restart_pik1_timeout(void) {
     reset_state();
 
-    pik_commands_request_restart_peer(true, now_ms);
+    pik_commands_request_restart_pik1(true, now_ms);
     pik_commands_check_acks(now_ms + PIK_COMMAND_ACK_TIMEOUT_MS);
     CHECK(!pik_commands_signal_pending());
     CHECK(pik_commands_signal_done());
@@ -269,7 +291,7 @@ static void test_local_command_roundtrip(void) {
     CHECK(peer >= 0);
     CHECK(dispatch_local_event(epfd));
 
-    CHECK(test_write_all(peer, "status-peer\n", 12));
+    CHECK(test_write_all(peer, "status\n", sizeof("status\n") - 1u));
     CHECK(dispatch_local_event(epfd));
     CHECK(send_command_calls == 1);
     CHECK(sent_action == PIK_CONTROL_ACTION_STATUS);
@@ -300,14 +322,14 @@ static void test_fragmented_local_command(void) {
     CHECK(peer >= 0);
     CHECK(dispatch_local_event(epfd));
 
-    CHECK(test_write_all(peer, "reboot-", 7));
+    CHECK(test_write_all(peer, "reb", sizeof("reb") - 1u));
     CHECK(dispatch_local_event(epfd));
     CHECK(send_command_calls == 0);
 
-    CHECK(test_write_all(peer, "peer\n", 5));
+    CHECK(test_write_all(peer, "oot\n", sizeof("oot\n") - 1u));
     CHECK(dispatch_local_event(epfd));
     CHECK(send_command_calls == 1);
-    CHECK(sent_action == PIK_CONTROL_ACTION_REBOOT_PEER);
+    CHECK(sent_action == PIK_CONTROL_ACTION_REBOOT);
 
     ack_available = true;
     ack_request = next_request_id;
@@ -333,7 +355,7 @@ static void test_local_error_ack_includes_reason(void) {
     CHECK(peer >= 0);
     CHECK(dispatch_local_event(epfd));
 
-    CHECK(test_write_all(peer, "reboot-peer\n", 12));
+    CHECK(test_write_all(peer, "reboot\n", sizeof("reboot\n") - 1u));
     CHECK(dispatch_local_event(epfd));
 
     ack_available = true;
@@ -362,7 +384,7 @@ static void test_local_ack_timeout(void) {
     CHECK(peer >= 0);
     CHECK(dispatch_local_event(epfd));
 
-    CHECK(test_write_all(peer, "status-peer\n", 12));
+    CHECK(test_write_all(peer, "status\n", sizeof("status\n") - 1u));
     CHECK(dispatch_local_event(epfd));
     pik_commands_check_acks(now_ms + PIK_COMMAND_ACK_TIMEOUT_MS);
     CHECK(read_reply(peer, reply, sizeof(reply)));
@@ -385,7 +407,7 @@ static void test_command_without_ready_peer_fails(void) {
     CHECK(peer >= 0);
     CHECK(dispatch_local_event(epfd));
 
-    CHECK(test_write_all(peer, "status-peer\n", 12));
+    CHECK(test_write_all(peer, "status\n", sizeof("status\n") - 1u));
     CHECK(dispatch_local_event(epfd));
     CHECK(read_reply(peer, reply, sizeof(reply)));
     CHECK(strcmp(reply, "ERR peer not ready\n") == 0);
@@ -403,11 +425,12 @@ int main(void) {
     test_parse_control_actions();
     test_status_ack_payload();
     test_remote_action_requires_ack_success();
-    test_wifi_reset_is_scheduled();
+    test_restart_wifi_is_scheduled();
+    test_restart_klipper_direction();
     test_remote_action_not_scheduled_on_ack_failure();
     test_remote_action_cannot_be_overwritten();
-    test_signal_restart_peer_ack();
-    test_signal_restart_peer_timeout();
+    test_signal_restart_pik1_ack();
+    test_signal_restart_pik1_timeout();
     test_local_command_roundtrip();
     test_fragmented_local_command();
     test_local_error_ack_includes_reason();
