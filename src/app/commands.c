@@ -88,34 +88,6 @@ int pik_commands_client_main(const char *cmd) {
     return strncmp(buf, "OK", 2) == 0 ? 0 : 1;
 }
 
-bool pik_commands_parse_action(const char *cmd, pik_control_action_t *action) {
-    if (strcmp(cmd, "restart-pik1") == 0) {
-        *action = PIK_CONTROL_ACTION_RESTART_PIK1;
-        return true;
-    }
-    if (strcmp(cmd, "reboot") == 0) {
-        *action = PIK_CONTROL_ACTION_REBOOT;
-        return true;
-    }
-    if (strcmp(cmd, "poweroff") == 0) {
-        *action = PIK_CONTROL_ACTION_POWEROFF;
-        return true;
-    }
-    if (strcmp(cmd, "status") == 0) {
-        *action = PIK_CONTROL_ACTION_STATUS;
-        return true;
-    }
-    if (strcmp(cmd, "restart-wifi") == 0) {
-        *action = PIK_CONTROL_ACTION_RESTART_WIFI;
-        return true;
-    }
-    if (strcmp(cmd, "restart-klipper") == 0) {
-        *action = PIK_CONTROL_ACTION_RESTART_KLIPPER;
-        return true;
-    }
-    return false;
-}
-
 static void local_control_close_client(void) {
     if (g_local.client_fd >= 0) {
         pik_epoll_del(g_local.epfd, g_local.client_fd);
@@ -275,7 +247,7 @@ static void local_control_accept(void) {
 
 static void local_control_process_command(int64_t now, bool command_busy) {
     pik_control_action_t action;
-    if (!pik_commands_parse_action(g_local.input, &action)) {
+    if (!pik_control_parse_action(g_local.input, &action)) {
         local_control_reply_and_close("ERR unknown command\n");
         return;
     }
@@ -408,13 +380,8 @@ void pik_commands_on_command(pik_control_action_t action,
     LOG("received command %s request=%u",
         pik_control_action_name(action), request_id);
     if (action == PIK_CONTROL_ACTION_STATUS) {
-        uint32_t known = PIK_CONTROL_SERVICE_SERIAL |
-                         PIK_CONTROL_SERVICE_TUNNEL;
-        const char *services = (g_ctl.service_flags & known) == known
-            ? "serial,tunnel"
-            : (g_ctl.service_flags & PIK_CONTROL_SERVICE_SERIAL) ? "serial"
-            : (g_ctl.service_flags & PIK_CONTROL_SERVICE_TUNNEL) ? "tunnel"
-            : "none";
+        char services[PIK_CONTROL_SERVICE_NAMES_MAX];
+        pik_control_service_names(g_ctl.service_flags, services, sizeof(services));
 
         char status[PIK_CTRL_ACK_MAX_PAYLOAD + 1u];
         int n = snprintf(status, sizeof(status),

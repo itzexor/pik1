@@ -71,26 +71,8 @@ bool pik_control_take_ack(uint32_t *request_id, pik_control_ack_status_t *status
     return true;
 }
 
-const char *pik_control_action_name(pik_control_action_t action) {
-    switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_PIK1: return "restart-pik1";
-    case PIK_CONTROL_ACTION_REBOOT: return "reboot";
-    case PIK_CONTROL_ACTION_POWEROFF: return "poweroff";
-    case PIK_CONTROL_ACTION_STATUS: return "status";
-    case PIK_CONTROL_ACTION_RESTART_WIFI: return "restart-wifi";
-    case PIK_CONTROL_ACTION_RESTART_KLIPPER: return "restart-klipper";
-    default: return "unknown";
-    }
-}
-
-const char *pik_control_ack_status_name(pik_control_ack_status_t status) {
-    switch (status) {
-    case PIK_CONTROL_ACK_OK: return "ok";
-    case PIK_CONTROL_ACK_UNKNOWN_ACTION: return "unknown-action";
-    case PIK_CONTROL_ACK_INTERNAL_ERROR: return "internal-error";
-    default: return "bad-status";
-    }
-}
+/* Name/parse lookups come from the real control_names.c: only the stateful
+ * control entry points above are stubbed. */
 
 static void reset_state(void) {
     now_ms = 100000;
@@ -150,20 +132,6 @@ static bool read_reply(int fd, char *buf, size_t cap) {
     }
     buf[len] = '\0';
     return len > 0;
-}
-
-static void test_parse_control_actions(void) {
-    pik_control_action_t action = 0;
-    reset_state();
-    CHECK(pik_commands_parse_action("status", &action));
-    CHECK(action == PIK_CONTROL_ACTION_STATUS);
-    CHECK(pik_commands_parse_action("restart-pik1", &action));
-    CHECK(action == PIK_CONTROL_ACTION_RESTART_PIK1);
-    CHECK(pik_commands_parse_action("restart-wifi", &action));
-    CHECK(action == PIK_CONTROL_ACTION_RESTART_WIFI);
-    CHECK(pik_commands_parse_action("restart-klipper", &action));
-    CHECK(action == PIK_CONTROL_ACTION_RESTART_KLIPPER);
-    CHECK(!pik_commands_parse_action("bogus", &action));
 }
 
 static void test_status_ack_payload(void) {
@@ -422,7 +390,6 @@ int main(void) {
     CHECK(sock && *sock);
     unlink(sock);
 
-    test_parse_control_actions();
     test_status_ack_payload();
     test_remote_action_requires_ack_success();
     test_restart_wifi_is_scheduled();

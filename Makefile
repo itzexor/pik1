@@ -21,8 +21,8 @@ COMMON_HDRS := src/common/util.h src/common/logging.h src/common/product.h
 LINK_SRCS   := src/link/frame.c src/link/link.c src/link/session.c
 LINK_HDRS   := src/link/frame.h src/link/link.h src/link/session.h \
                src/link/pik_proto.h
-SERVICE_SRCS := src/services/control.c src/services/serialmux.c \
-                src/services/tunnel.c
+SERVICE_SRCS := src/services/control.c src/services/control_names.c \
+                src/services/serialmux.c src/services/tunnel.c
 SERVICE_HDRS := src/services/control.h src/services/serialmux.h \
                 src/services/tunnel.h
 IO_SRCS := src/io/fd.c src/io/usb_host.c src/io/usb_gadget.c \
@@ -125,39 +125,39 @@ test-scripts:
 
 # Host build
 $(HOST_BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(HOST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(PIK1D_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 $(TEST_BUILD)/test_util: tests/test_util.c src/common/util.c src/common/util.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_util.c src/common/util.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 $(TEST_BUILD)/test_frame: tests/test_frame.c src/link/frame.c src/link/frame.h $(COBS_SRCS) $(COBS_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_frame.c src/link/frame.c $(COBS_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 $(TEST_BUILD)/test_logging: tests/test_logging.c src/common/logging.c src/common/logging.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_logging.c src/common/logging.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 $(TEST_BUILD)/test_control_names: tests/test_control_names.c $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_names.c $(TEST_RUNTIME_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 $(TEST_BUILD)/test_control_protocol: tests/test_control_protocol.c tests/test_harness.h tests/test_session_harness.h $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_control_protocol.c $(TEST_RUNTIME_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
-$(TEST_BUILD)/test_commands: tests/test_commands.c tests/test_harness.h src/app/commands.c src/app/commands.h src/common/logging.c src/common/logging.h src/io/fd.c src/io/fd.h | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_commands.c src/app/commands.c src/common/logging.c src/io/fd.c
+$(TEST_BUILD)/test_commands: tests/test_commands.c tests/test_harness.h src/app/commands.c src/app/commands.h src/services/control_names.c src/services/control.h src/common/logging.c src/common/logging.h src/io/fd.c src/io/fd.h | $(TEST_BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 $(TEST_BUILD)/test_serialmux_protocol: tests/test_serialmux_protocol.c tests/test_harness.h tests/test_session_harness.h $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_serialmux_protocol.c $(TEST_RUNTIME_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 $(TEST_BUILD)/test_tunnel_protocol: tests/test_tunnel_protocol.c tests/test_harness.h tests/test_session_harness.h $(TEST_RUNTIME_SRCS) $(TEST_RUNTIME_HDRS) | $(TEST_BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_tunnel_protocol.c $(TEST_RUNTIME_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
 
 # Device builds
 $(K1_BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(K1_BUILD)
-	$(K1_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
+	$(K1_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(filter %.c,$^)
 	-$(K1_STRIP) $@
 
 $(PI_BUILD)/pik1d: $(PIK1D_SRCS) $(PIK1D_HDRS) | $(PI_BUILD)
-	$(PI_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(PIK1D_SRCS)
+	$(PI_CC) $(CFLAGS) $(LDFLAGS) $(STATIC) -o $@ $(filter %.c,$^)
 	-$(PI_STRIP) $@
 
 $(BUILD) $(HOST_BUILD) $(K1_BUILD) $(PI_BUILD) $(TEST_BUILD):

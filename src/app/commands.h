@@ -28,7 +28,6 @@ void pik_commands_cleanup(void);
 bool pik_commands_owns_event(const void *ptr);
 void pik_commands_dispatch(void *ptr, int64_t now);
 
-bool pik_commands_parse_action(const char *cmd, pik_control_action_t *action);
 void pik_commands_mark_peer_initiated(void);
 
 void pik_commands_init(const char *side_name, bool pty_side);

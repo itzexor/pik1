@@ -46,52 +46,6 @@ static control_t g_ctrl;
 
 #define LOG(...) pik_log("ctrl", __VA_ARGS__)
 
-const char *pik_control_action_name(pik_control_action_t action) {
-    switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_PIK1: return "restart-pik1";
-    case PIK_CONTROL_ACTION_REBOOT: return "reboot";
-    case PIK_CONTROL_ACTION_POWEROFF: return "poweroff";
-    case PIK_CONTROL_ACTION_STATUS: return "status";
-    case PIK_CONTROL_ACTION_RESTART_WIFI: return "restart-wifi";
-    case PIK_CONTROL_ACTION_RESTART_KLIPPER: return "restart-klipper";
-    default: return "unknown";
-    }
-}
-
-const char *pik_control_ack_status_name(pik_control_ack_status_t status) {
-    switch (status) {
-    case PIK_CONTROL_ACK_OK: return "ok";
-    case PIK_CONTROL_ACK_UNKNOWN_ACTION: return "unknown-action";
-    case PIK_CONTROL_ACK_INTERNAL_ERROR: return "internal-error";
-    default: return "unknown-status";
-    }
-}
-
-static bool action_valid(pik_control_action_t action) {
-    switch (action) {
-    case PIK_CONTROL_ACTION_RESTART_PIK1:
-    case PIK_CONTROL_ACTION_REBOOT:
-    case PIK_CONTROL_ACTION_POWEROFF:
-    case PIK_CONTROL_ACTION_STATUS:
-    case PIK_CONTROL_ACTION_RESTART_WIFI:
-    case PIK_CONTROL_ACTION_RESTART_KLIPPER:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool ack_status_valid(pik_control_ack_status_t status) {
-    switch (status) {
-    case PIK_CONTROL_ACK_OK:
-    case PIK_CONTROL_ACK_UNKNOWN_ACTION:
-    case PIK_CONTROL_ACK_INTERNAL_ERROR:
-        return true;
-    default:
-        return false;
-    }
-}
-
 static void clear_pending_ack(void) {
     g_ctrl.ack_pending = false;
     g_ctrl.ack_request_id = 0;
@@ -115,15 +69,6 @@ static bool send_hello(void) {
     p[8] = (uint8_t)g_ctrl.role;
     snprintf((char *)p + 9, PIK_CTRL_RELEASE_LEN, "%s", PIK1_RELEASE_VERSION);
     return enqueue_frame(PIK_FRAME_CTRL_HELLO, p, sizeof(p));
-}
-
-static const char *tcp_role_name(pik_control_tcp_role_t role) {
-    switch (role) {
-    case PIK_CONTROL_TCP_NONE: return "none";
-    case PIK_CONTROL_TCP_LISTEN: return "listen";
-    case PIK_CONTROL_TCP_FORWARD: return "forward";
-    default: return "unknown";
-    }
 }
 
 static bool send_config(void) {
@@ -152,7 +97,7 @@ static bool handle_config(const uint8_t *p, size_t len) {
     }
 
     pik_control_tcp_role_t peer_tcp = (pik_control_tcp_role_t)p[0];
-    if (peer_tcp > PIK_CONTROL_TCP_FORWARD) {
+    if (!pik_control_tcp_role_valid(peer_tcp)) {
         LOG("bad CONFIG tcp role=%u", p[0]);
         return false;
     }
@@ -178,15 +123,15 @@ static bool handle_config(const uint8_t *p, size_t len) {
     if (g_ctrl.local_tcp_role == PIK_CONTROL_TCP_NONE &&
         peer_tcp != PIK_CONTROL_TCP_NONE) {
         LOG("warning: TCP tunnel is configured on peer as %s but not on this side",
-            tcp_role_name(peer_tcp));
+            pik_control_tcp_role_name(peer_tcp));
     } else if (g_ctrl.local_tcp_role != PIK_CONTROL_TCP_NONE &&
                peer_tcp == PIK_CONTROL_TCP_NONE) {
         LOG("warning: TCP tunnel is configured on this side as %s but not on peer",
-            tcp_role_name(g_ctrl.local_tcp_role));
+            pik_control_tcp_role_name(g_ctrl.local_tcp_role));
     } else if (g_ctrl.local_tcp_role != PIK_CONTROL_TCP_NONE &&
                g_ctrl.local_tcp_role == peer_tcp) {
         LOG("warning: TCP tunnel is configured as %s on both sides",
-            tcp_role_name(g_ctrl.local_tcp_role));
+            pik_control_tcp_role_name(g_ctrl.local_tcp_role));
     }
     return true;
 }
@@ -263,7 +208,7 @@ bool pik_control_on_frame(uint8_t type, const uint8_t *p, size_t len) {
         {
             pik_control_action_t action = (pik_control_action_t)p[4];
             uint32_t request_id = pik_get_u32le(p);
-            if (!action_valid(action)) {
+            if (!pik_control_action_valid(action)) {
                 LOG("rejecting unknown command action=%u request=%u", p[4], request_id);
                 return pik_control_send_ack(request_id, PIK_CONTROL_ACK_UNKNOWN_ACTION,
                                             NULL, 0);
@@ -285,7 +230,7 @@ bool pik_control_on_frame(uint8_t type, const uint8_t *p, size_t len) {
         }
         g_ctrl.ack_request_id = pik_get_u32le(p);
         g_ctrl.ack_status = (pik_control_ack_status_t)p[4];
-        if (!ack_status_valid(g_ctrl.ack_status)) {
+        if (!pik_control_ack_status_valid(g_ctrl.ack_status)) {
             LOG("bad ACK status=%u request=%u", p[4], g_ctrl.ack_request_id);
             return false;
         }
@@ -392,7 +337,7 @@ void pik_control_set_config(const uint8_t *channels, size_t n_channels,
 }
 
 bool pik_control_send_command(pik_control_action_t action, uint32_t *request_id) {
-    if (!g_ctrl.ready) return false;
+    if (!g_ctrl.ready || !pik_control_action_valid(action)) return false;
     uint8_t p[5];
     uint32_t id = g_ctrl.next_request_id++;
     if (g_ctrl.next_request_id == 0) g_ctrl.next_request_id = 1;

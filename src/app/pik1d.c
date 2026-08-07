@@ -44,6 +44,10 @@ typedef struct {
     pik_control_tcp_role_t tcp_role;
 } app_config_t;
 
+/* The listed commands are exactly what --control accepts: both come from the
+ * control action vocabulary. */
+#define ACTION_USAGE_LINE(sym, value, name) "  " name "\n"
+
 static _Noreturn void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
@@ -53,15 +57,12 @@ static _Noreturn void usage(const char *prog) {
         "  %s --ffs  pty:N:SYMLINK  [...] [forward:TARGET_HOST:PORT]\n"
         "\n"
         "Control commands:\n"
-        "  status\n"
-        "  restart-pik1\n"
-        "  restart-wifi\n"
-        "  restart-klipper\n"
-        "  reboot\n"
-        "  poweroff\n",
+        PIK_CONTROL_ACTION_LIST(ACTION_USAGE_LINE),
         prog, prog, prog, prog);
     exit(1);
 }
+
+#undef ACTION_USAGE_LINE
 
 static void parse_mcu_channel(const char *spec, ch_spec_t *s) {
     char ch_str[16], baud_str[16], extra;
