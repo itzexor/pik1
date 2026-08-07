@@ -49,6 +49,8 @@ typedef struct {
     pik_link_cfg_t cfg;
     bool     active;        /* transport has begun a session */
     bool     failed;
+    bool     quiet;         /* suppress routine transport lifecycle logs while
+                             * the owner is in a known-down retry loop */
     size_t   enc_max;       /* per-frame encoded ceiling incl. delimiter */
 
     uint32_t tx_head, tx_tail;

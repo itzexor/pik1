@@ -122,6 +122,32 @@ static void test_late_peer_hello_retry_sequence(void) {
     sfx_cleanup(&fx);
 }
 
+static void test_recovered_handshake_clears_retry_quiet(void) {
+    session_fixture_t fx;
+    sfx_frame_t f;
+    int64_t start;
+
+    CHECK(fixture_init(&fx, PIK_CONTROL_ROLE_PTY));
+    start = pik_session_link()->last_rx_ms;
+    CHECK(sfx_read_frame(&fx, &f));
+    CHECK(!pik_control_tick(start + 10001));
+    CHECK(pik_control_handshake_failures() == 1);
+
+    /* Mirrors pik1d starting a transport retry after the first timeout. */
+    pik_session_cleanup();
+    pik_session_link()->quiet = true;
+    pik_link_begin(pik_session_link(), start + 11001);
+    CHECK(pik_control_on_link_open());
+    CHECK(pik_session_link()->quiet);
+    CHECK(sfx_read_frame(&fx, &f));
+    CHECK(sfx_send_peer_hello(&fx, PIK_CONTROL_ROLE_MCU,
+                              PIK1_PROTOCOL_VERSION));
+    CHECK(sfx_dispatch_one(&fx, 1000));
+    CHECK(!pik_session_link()->quiet);
+    CHECK(pik_control_handshake_failures() == 0);
+    sfx_cleanup(&fx);
+}
+
 static void test_sequence_gap_naks_and_heals(void) {
     session_fixture_t fx;
     sfx_frame_t f;
@@ -409,6 +435,7 @@ int main(void) {
     test_missing_peer_handshake_times_out();
     test_stale_startup_input_is_flushed();
     test_late_peer_hello_retry_sequence();
+    test_recovered_handshake_clears_retry_quiet();
     test_sequence_gap_naks_and_heals();
     test_sequence_gap_budget_fails();
     test_stale_prehello_frames_discarded();

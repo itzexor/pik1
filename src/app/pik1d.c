@@ -396,6 +396,8 @@ int main(int argc, char **argv) {
         int64_t now = pik_now_ms();
 
         if (!session_active && now >= transport_retry_at) {
+            bool quiet_retry = pik_control_handshake_failures() > 0;
+            pik_session_link()->quiet = quiet_retry;
             if (g_app.transport->start(pik_session_link(), epfd, now) &&
                 pik_control_on_link_open()) {
                 transport_waiting_logged = false;
@@ -405,7 +407,7 @@ int main(int argc, char **argv) {
                 if (pik_control_handshake_failures() == 0)
                     LOG("session started: %s", g_app.transport->name);
             } else {
-                if (g_app.transport->wait_message) {
+                if (g_app.transport->wait_message && !quiet_retry) {
                     if (!transport_waiting_logged) {
                         LOG("%s", g_app.transport->wait_message);
                         transport_waiting_logged = true;

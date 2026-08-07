@@ -396,6 +396,7 @@ int64_t pik_link_deadline(const pik_link_t *lk) {
 void pik_link_cleanup(pik_link_t *lk) {
     lk->active = false;
     lk->failed = false;
+    lk->quiet = false;
     lk->tx_head = lk->tx_tail = 0;
     lk->rxbuf_len = 0;
     lk->tx_session = lk->rx_session = 0;

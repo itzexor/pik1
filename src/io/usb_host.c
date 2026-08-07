@@ -20,6 +20,9 @@
 #include <unistd.h>
 
 #define LOG(...) pik_log("usb", __VA_ARGS__)
+#define LOG_LIFECYCLE(...) do { \
+    if (!g_usb.lk || !g_usb.lk->quiet) LOG(__VA_ARGS__); \
+} while (0)
 
 #define USBFS_ROOT "/dev/bus/usb"
 #define SYS_USB_DEVICES "/sys/bus/usb/devices"
@@ -235,8 +238,8 @@ static bool open_matching_device(const char *vidpid, int *fd_out,
         *ep_out = found_out;
         *out_maxpacket = found_out_mps;
         closedir(d);
-        LOG("opened %s iface=%d in=0x%02x out=0x%02x out_mps=%u", devpath,
-            found_iface, found_in, found_out, found_out_mps);
+        LOG_LIFECYCLE("opened %s iface=%d in=0x%02x out=0x%02x out_mps=%u",
+                      devpath, found_iface, found_in, found_out, found_out_mps);
         return true;
     }
 
@@ -414,8 +417,8 @@ bool pik_usb_host_start(pik_link_t *lk, int epfd, int64_t now) {
         g_usb.zero_packet = (caps & USBDEVFS_CAP_ZERO_PACKET) != 0;
     else
         LOG("get usbfs capabilities: %s", strerror(errno));
-    LOG("usbfs caps=0x%x zero_packet=%s", caps,
-        g_usb.zero_packet ? "yes" : "no");
+    LOG_LIFECYCLE("usbfs caps=0x%x zero_packet=%s", caps,
+                  g_usb.zero_packet ? "yes" : "no");
 
     if (!pik_epoll_set(epfd, g_usb.fd, USB_EPOLL_EVENTS, &g_usb_tag)) {
         LOG("epoll add usbfs fd: %s", strerror(errno));
@@ -429,7 +432,7 @@ bool pik_usb_host_start(pik_link_t *lk, int epfd, int64_t now) {
             return false;
         }
     }
-    LOG("bulk transport ready: vidpid=%s", PIK1_USB_VIDPID);
+    LOG_LIFECYCLE("bulk transport ready: vidpid=%s", PIK1_USB_VIDPID);
     return true;
 }
 

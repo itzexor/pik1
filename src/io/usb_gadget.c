@@ -20,6 +20,9 @@
 #include <unistd.h>
 
 #define LOG(...) pik_log("ffs", __VA_ARGS__)
+#define LOG_LIFECYCLE(...) do { \
+    if (!g_ffs.lk || !g_ffs.lk->quiet) LOG(__VA_ARGS__); \
+} while (0)
 
 /* FunctionFS AIO completions signal through eventfd; also drain on a bounded
  * interval as a progress sanity check. */
@@ -239,7 +242,7 @@ static bool bind_udc(void) {
         return false;
     }
     close(fd);
-    LOG("bound gadget to UDC: %s", udc);
+    LOG_LIFECYCLE("bound gadget to UDC: %s", udc);
     return true;
 }
 
@@ -413,19 +416,19 @@ static bool handle_ep0(void) {
             switch (ev[i].type) {
             case FUNCTIONFS_ENABLE:
                 g_ffs.enabled = true;
-                LOG("endpoints enabled");
+                LOG_LIFECYCLE("endpoints enabled");
                 if (!submit_rx_reads() || !pump_tx())
                     return false;
                 break;
             case FUNCTIONFS_DISABLE:
                 g_ffs.enabled = false;
                 pik_link_fail(g_ffs.lk);
-                LOG("endpoints disabled");
+                LOG_LIFECYCLE("endpoints disabled");
                 break;
             case FUNCTIONFS_UNBIND:
                 g_ffs.enabled = false;
                 pik_link_fail(g_ffs.lk);
-                LOG("function unbound");
+                LOG_LIFECYCLE("function unbound");
                 break;
             case FUNCTIONFS_SETUP:
                 if (!handle_setup(&ev[i].u.setup)) {
@@ -500,7 +503,7 @@ bool pik_usb_gadget_start(pik_link_t *lk, int epfd, int64_t now) {
         pik_usb_gadget_cleanup();
         return false;
     }
-    LOG("FunctionFS transport ready at %s", PIK1_FFS_MOUNT);
+    LOG_LIFECYCLE("FunctionFS transport ready at %s", PIK1_FFS_MOUNT);
     return true;
 }
 
@@ -535,7 +538,7 @@ int64_t pik_usb_gadget_deadline(void) {
 
 void pik_usb_gadget_cleanup(void) {
     if (g_ffs.ep0 >= 0 || g_ffs.out_fd >= 0 || g_ffs.in_fd >= 0)
-        LOG("cleaning up FunctionFS transport");
+        LOG_LIFECYCLE("cleaning up FunctionFS transport");
     if (g_ffs.epfd >= 0) {
         if (g_ffs.ep0 >= 0) pik_epoll_del(g_ffs.epfd, g_ffs.ep0);
         if (g_ffs.event_fd >= 0) pik_epoll_del(g_ffs.epfd, g_ffs.event_fd);

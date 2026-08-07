@@ -166,6 +166,9 @@ static bool handle_hello(const uint8_t *p, size_t len) {
 
     if (!g_ctrl.ready) {
         g_ctrl.ready = true;
+        /* A completed handshake ends any known-down retry loop before the
+         * recovered session starts emitting normal lifecycle logs. */
+        pik_session_link()->quiet = false;
         if (g_ctrl.handshake_fails) {
             LOG("handshake recovered after %u failed attempts", g_ctrl.handshake_fails);
             g_ctrl.handshake_fails = 0;
