@@ -48,6 +48,7 @@ requirements.
   that used them will be disabled.
 
 ## Build and install
+### Build (Optional)
 
 Prebuilt endpoint binaries are tracked as `build/k1/pik1d` and
 `build/pi/pik1d`. To rebuild both:
@@ -67,7 +68,7 @@ Both endpoints must run the same protocol version, so deploy the K1 and Pi
 binaries as a pair. Both install targets copy the utilities under `scripts/`
 beside the daemon.
 
-### Raspberry Pi
+### Install Raspberry Pi
 
 1. Install [Simple AF for RPi](https://pellcorp.github.io/creality-wiki/rpi/).
 
@@ -116,7 +117,7 @@ beside the daemon.
    `restart_method: command` is required because the serial mux does not carry
    DTR or RTS.
 
-### K1
+### Install K1
 
 1. Install [Simple AF](https://pellcorp.github.io/creality-wiki/) on the K1.
 
@@ -155,7 +156,7 @@ Screen support is enabled by default. The K1 listens only on
 `127.0.0.1:7125`, where guppyscreen already expects Moonraker. The Pi side
 forwards that stream to Moonraker on the Pi.
 
-Do not bind the K1 listener to `0.0.0.0` unless remote access is intentional.
+Do not bind the K1 listener to `0.0.0.0` unless remote moonraker access is intentional.
 
 To omit the tunnel and disable the K1 screen services, use the same option on
 both devices:
