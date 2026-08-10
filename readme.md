@@ -5,8 +5,13 @@ USB connection. The Pi runs Klipper and Moonraker; the K1 remains the bridge
 for its physical MCUs and, optionally, its touchscreen.
 
 > This modifies the printer's normal software layout. Make sure you can
-> restore the K1 before proceeding. Creality publishes
-> [recovery images and instructions](https://github.com/CrealityOfficial/K1_Series_Annex/releases/tag/V1.0.0).
+> restore the K1 before proceeding.
+> 
+> Creality publishes [recovery instructions](https://github.com/CrealityOfficial/K1_Series_Annex/releases/tag/V1.0.0)
+> but only one board image ([CR4CU220812S11_1.3.3.5.ingenic](https://github.com/CrealityOfficial/K1_Series_Klipper/releases/tag/V1.3.3.5)).
+> 
+> S12 board revision is common. Additionally, some boards no longer have a micro usb header,
+> and K1 2025 boards are different on the hardware level and are entirely untested.
 
 Daemon architecture, protocol flow, scheduling, and failure behavior are
 documented in [DESIGN.md](DESIGN.md).
